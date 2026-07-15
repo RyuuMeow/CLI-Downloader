@@ -214,6 +214,8 @@ def is_process_alive(pid: int) -> bool:
 
     if pid <= 0:
         return False
+    if os.name == "nt":
+        return _windows_process_alive(pid)
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
@@ -223,6 +225,50 @@ def is_process_alive(pid: int) -> bool:
     except OSError:
         return False
     return True
+
+
+def _windows_process_alive(pid: int) -> bool:
+    """Probe a Windows PID without sending a console control event.
+
+    ``os.kill(pid, 0)`` is not a POSIX-style existence probe on Windows and can
+    surface ``WinError 87`` followed by ``SystemError`` for a valid external
+    process.  A query-only process handle is both non-mutating and reliable.
+    """
+
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        process_query_limited_information = 0x1000
+        still_active = 259
+        error_access_denied = 5
+        kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        kernel.OpenProcess.restype = wintypes.HANDLE
+        kernel.GetExitCodeProcess.argtypes = [
+            wintypes.HANDLE,
+            ctypes.POINTER(wintypes.DWORD),
+        ]
+        kernel.GetExitCodeProcess.restype = wintypes.BOOL
+        kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+        kernel.CloseHandle.restype = wintypes.BOOL
+
+        handle = kernel.OpenProcess(process_query_limited_information, False, pid)
+        if not handle:
+            # Access denied still proves that the PID exists. Other failures,
+            # including ERROR_INVALID_PARAMETER for an absent PID, do not.
+            return ctypes.get_last_error() == error_access_denied
+        try:
+            exit_code = wintypes.DWORD()
+            if not kernel.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
+                return False
+            return exit_code.value == still_active
+        finally:
+            kernel.CloseHandle(handle)
+    except (AttributeError, OSError, TypeError, ValueError):
+        # Status inspection must never crash a forwarding CLI. The owner lock
+        # remains the second source of truth and will classify stale metadata.
+        return False
 
 
 class ShellStatusService:

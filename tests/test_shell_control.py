@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import sys
 import tempfile
 import unittest
 from contextlib import redirect_stdout
@@ -29,6 +30,7 @@ from cli_downloader.core.shell_control import (
     ShellStatusKind,
     ShellStatusService,
     ShellStatusSnapshot,
+    is_process_alive,
     launch_visible_shell,
     resolve_shell_launch,
 )
@@ -59,6 +61,22 @@ def _metadata(
 
 
 class ShellStatusServiceTests(unittest.TestCase):
+    def test_current_process_is_alive_and_invalid_pids_are_not(self) -> None:
+        self.assertTrue(is_process_alive(os.getpid()))
+        self.assertFalse(is_process_alive(0))
+        self.assertFalse(is_process_alive(-1))
+
+    def test_external_process_probe_is_non_mutating_and_detects_exit(self) -> None:
+        process = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(30)"],
+        )
+        try:
+            self.assertTrue(is_process_alive(process.pid))
+        finally:
+            process.terminate()
+            process.wait(timeout=10)
+        self.assertFalse(is_process_alive(process.pid))
+
     def test_absent_owner_is_distinguished_from_starting_owner(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             scope = OwnerScope.from_data_root(directory)
