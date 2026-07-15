@@ -101,6 +101,8 @@
   "task.detail.files": "文件",
   "task.detail.attempts": "尝试次数",
   "task.detail.location": "位置",
+  "task.action.open_url": "打开 URL",
+  "task.action.open_folder": "打开文件夹",
   "task.detail.problem": "问题",
   "task.detail.origin": "来源",
   "task.detail.retry": "重试",

@@ -543,30 +543,31 @@ class TextualShellApp(App[int]):
                     id="command-row",
                 )
             with TabPane("Tasks", id="tasks"):
-                with Vertical(id="task-toolbar"):
-                    with Horizontal(id="task-navigation"):
-                        yield Static("Tasks", id="task-path")
-                        yield Static("", id="task-page-status")
-                        yield Button("←", id="task-back", disabled=True)
-                        yield Button("◀", id="task-page-prev", disabled=True)
-                        yield Button("▶", id="task-page-next", disabled=True)
-                    with Horizontal(id="task-actions"):
-                        yield Static("", id="task-action-spacer")
-                        yield Button("↗", id="task-source", disabled=True)
-                        yield Button("▤", id="task-folder", disabled=True)
-                        yield Button("‖", id="task-pause", disabled=True)
-                        yield Button("▶", id="task-resume", disabled=True)
-                        yield Button("■", id="task-cancel", disabled=True)
-                        yield Button("↺", id="task-retry", disabled=True)
-                        yield Button("✕", id="task-delete", disabled=True)
-                        yield Button("↻", id="refresh-tasks")
+                yield Horizontal(
+                    Static("Tasks", id="task-path"),
+                    Static("", id="task-page-status"),
+                    Button("←", id="task-back", disabled=True),
+                    Button("◀", id="task-page-prev", disabled=True),
+                    Button("▶", id="task-page-next", disabled=True),
+                    Button("‖", id="task-pause", disabled=True),
+                    Button("▶", id="task-resume", disabled=True),
+                    Button("■", id="task-cancel", disabled=True),
+                    Button("↺", id="task-retry", disabled=True),
+                    Button("✕", id="task-delete", disabled=True),
+                    Button("↻", id="refresh-tasks"),
+                    id="task-toolbar",
+                )
                 yield DataTable(id="task-table", classes="activity-table", cursor_type="row")
                 yield DataTable(
                     id="task-file-table",
                     classes="activity-table",
                     cursor_type="row",
                 )
-                yield Static(id="task-detail", classes="activity-detail")
+                with Horizontal(id="task-detail-row", classes="activity-detail"):
+                    yield Static(id="task-detail")
+                    with Vertical(id="task-detail-actions"):
+                        yield Button("Open URL", id="task-source", disabled=True)
+                        yield Button("Open Folder", id="task-folder", disabled=True)
             with TabPane("Settings", id="settings"):
                 yield Horizontal(
                     Static("Settings", id="settings-path"),
@@ -783,6 +784,8 @@ class TextualShellApp(App[int]):
             ("copy-command", "tooltip.copy_latest"),
         ):
             self.query_one(f"#{button_id}", Button).tooltip = translator(translation_key)
+        self.query_one("#task-source", Button).label = translator("task.action.open_url")
+        self.query_one("#task-folder", Button).label = translator("task.action.open_folder")
 
         self.query_one("#shell-input", Input).placeholder = translator("common.command")
         self.query_one("#settings-editor", Input).placeholder = translator("common.select_setting")
@@ -3234,6 +3237,7 @@ class TextualShellApp(App[int]):
         action_signature = (
             task_id,
             state,
+            self._task_level,
             self._task_source_url,
             self._task_folder,
             self._pending_task_delete,
@@ -3243,20 +3247,22 @@ class TextualShellApp(App[int]):
         self._task_action_signature = action_signature
         source = self.query_one("#task-source", Button)
         source.disabled = self._task_source_url is None
-        source.display = self._task_source_url is not None
+        source.display = node is not None
         folder = self.query_one("#task-folder", Button)
         folder.disabled = self._task_folder is None
-        folder.display = self._task_folder is not None
+        folder.display = node is not None
+        self.query_one("#task-detail-actions", Vertical).display = node is not None
+        allow_lifecycle_control = self._task_level == "roots"
         pause = self.query_one("#task-pause", Button)
         pause.disabled = state not in {
             TaskState.PREPARING,
             TaskState.QUEUED,
             TaskState.RUNNING,
         }
-        pause.display = not pause.disabled
+        pause.display = allow_lifecycle_control and not pause.disabled
         resume = self.query_one("#task-resume", Button)
         resume.disabled = state is not TaskState.PAUSED
-        resume.display = not resume.disabled
+        resume.display = allow_lifecycle_control and not resume.disabled
         cancel = self.query_one("#task-cancel", Button)
         cancel.disabled = state not in {
             TaskState.PREPARING,
@@ -3264,13 +3270,13 @@ class TextualShellApp(App[int]):
             TaskState.RUNNING,
             TaskState.PAUSED,
         }
-        cancel.display = not cancel.disabled
+        cancel.display = allow_lifecycle_control and not cancel.disabled
         retry = self.query_one("#task-retry", Button)
         retry.disabled = state not in {
             TaskState.FAILED,
             TaskState.PARTIALLY_COMPLETED,
         }
-        retry.display = not retry.disabled
+        retry.display = allow_lifecycle_control and not retry.disabled
         delete = self.query_one("#task-delete", Button)
         delete.disabled = state not in {
             TaskState.COMPLETED,
@@ -3279,8 +3285,9 @@ class TextualShellApp(App[int]):
             TaskState.CANCELLED,
             TaskState.SKIPPED,
         }
-        delete.display = not delete.disabled
+        delete.display = allow_lifecycle_control and not delete.disabled
         delete.label = "OK" if self._pending_task_delete == task_id else "×"
+        self.query_one("#refresh-tasks", Button).display = allow_lifecycle_control
 
     def _open_task_source(self) -> None:
         if self._task_source_url is not None:
@@ -3489,6 +3496,7 @@ class TextualShellApp(App[int]):
                 except Exception:
                     pass
         self._task_level = "files"
+        self._update_task_page_controls()
         task_label = self._shell.translator("task.path")
         parent_path = (
             f"{task_label} / {self._active_batch_name} / "
@@ -3532,11 +3540,13 @@ class TextualShellApp(App[int]):
         if file.failure is not None:
             lines.extend(_task_failure_lines(file.failure, self._shell.translator))
         self.query_one("#task-detail", Static).update("\n".join(lines))
-        if file.location is not None:
-            self._task_folder = str(Path(file.location).parent)
-            folder = self.query_one("#task-folder", Button)
-            folder.disabled = False
-            folder.display = True
+        self._task_folder = (
+            str(Path(file.location).parent) if file.location is not None else None
+        )
+        folder = self.query_one("#task-folder", Button)
+        folder.disabled = self._task_folder is None
+        folder.display = True
+        self.query_one("#task-detail-actions", Vertical).display = True
 
     def _task_back(self) -> None:
         service = self._task_service

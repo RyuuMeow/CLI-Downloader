@@ -101,6 +101,8 @@
   "task.detail.files": "檔案",
   "task.detail.attempts": "嘗試次數",
   "task.detail.location": "位置",
+  "task.action.open_url": "開啟 URL",
+  "task.action.open_folder": "開啟資料夾",
   "task.detail.problem": "問題",
   "task.detail.origin": "來源",
   "task.detail.retry": "重試",

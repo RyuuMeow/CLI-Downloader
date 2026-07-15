@@ -1147,6 +1147,8 @@ class TextualShellAppTest(IsolatedAsyncioTestCase):
             "Visible task",
             TaskProgress(0, 1),
             site_id="example",
+            source_url="https://example.test/batch",
+            output_files=("downloads/example/file.jpg",),
         )
         child = TaskNode(
             "child-visible",
@@ -1178,6 +1180,12 @@ class TextualShellAppTest(IsolatedAsyncioTestCase):
             self.assertGreater(pause.region.width, 0)
             self.assertGreater(refresh.region.width, 0)
             self.assertLess(refresh.region.right, app.screen.region.right + 1)
+            self.assertEqual(app.query_one("#task-source", Button).label, "Open URL")
+            self.assertEqual(app.query_one("#task-folder", Button).label, "Open Folder")
+            self.assertEqual(
+                app.query_one("#task-source", Button).parent.id,
+                "task-detail-actions",
+            )
 
             app.query_one("#task-table", DataTable).focus()
             await pilot.press("enter")
@@ -1189,6 +1197,14 @@ class TextualShellAppTest(IsolatedAsyncioTestCase):
             self.assertTrue(next_page.display)
             self.assertGreater(back.region.width, 0)
             self.assertLess(next_page.region.right, app.screen.region.right + 1)
+            self.assertFalse(pause.display)
+            self.assertFalse(refresh.display)
+            self.assertFalse(app.query_one("#task-cancel", Button).display)
+            self.assertFalse(app.query_one("#task-delete", Button).display)
+            app._select_task(child.task_id)
+            self.assertTrue(app.query_one("#task-source", Button).disabled)
+            self.assertTrue(app.query_one("#task-folder", Button).disabled)
+            self.assertTrue(app.query_one("#task-detail-actions").display)
 
     async def test_task_dynamic_labels_follow_selected_language(self) -> None:
         task = TaskNode(
@@ -1218,6 +1234,8 @@ class TextualShellAppTest(IsolatedAsyncioTestCase):
             self.assertIn("進度", detail)
             self.assertIn("網站", detail)
             self.assertIn("已完成", detail)
+            self.assertEqual(app.query_one("#task-source", Button).label, "開啟 URL")
+            self.assertEqual(app.query_one("#task-folder", Button).label, "開啟資料夾")
 
     async def test_empty_unified_task_explorer(self) -> None:
         service = SimpleNamespace(list_roots=lambda: ())
@@ -1310,10 +1328,13 @@ class TextualShellAppTest(IsolatedAsyncioTestCase):
             folder_button = app.query_one("#task-folder", Button)
             self.assertFalse(source_button.disabled)
             self.assertFalse(folder_button.disabled)
-            source_button.focus()
-            await pilot.press("enter")
-            folder_button.focus()
-            await pilot.press("enter")
+            self.assertTrue(source_button.display)
+            self.assertTrue(source_button.parent.display)
+            self.assertGreater(source_button.region.height, 0)
+            self.assertEqual(source_button.label, "Open URL")
+            self.assertEqual(folder_button.label, "Open Folder")
+            await pilot.click("#task-source")
+            await pilot.click("#task-folder")
             self.assertEqual(
                 opened_urls,
                 ["https://example.test/search"],
@@ -1334,6 +1355,12 @@ class TextualShellAppTest(IsolatedAsyncioTestCase):
             self.assertIn("Could not parse gallery", detail)
             self.assertIn("Site extension", detail)
             self.assertIn("[R] Retry    Available", detail)
+            self.assertTrue(app.query_one("#task-back", Button).display)
+            self.assertFalse(app.query_one("#task-page-prev", Button).display)
+            self.assertFalse(app.query_one("#task-pause", Button).display)
+            self.assertFalse(app.query_one("#refresh-tasks", Button).display)
+            self.assertFalse(source_button.disabled)
+            self.assertTrue(folder_button.disabled)
 
             await pilot.press("escape", "down", "enter")
             await pilot.pause()

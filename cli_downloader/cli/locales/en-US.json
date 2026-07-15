@@ -101,6 +101,8 @@
   "task.detail.files": "Files",
   "task.detail.attempts": "Attempts",
   "task.detail.location": "Location",
+  "task.action.open_url": "Open URL",
+  "task.action.open_folder": "Open Folder",
   "task.detail.problem": "Problem",
   "task.detail.origin": "Origin",
   "task.detail.retry": "Retry",
