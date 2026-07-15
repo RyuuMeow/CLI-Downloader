@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import sys
 from contextlib import contextmanager, nullcontext
 from collections.abc import Sequence
 from dataclasses import replace
@@ -32,6 +33,7 @@ from cli_downloader.cli._output import (
     _task_summary,
 )
 from cli_downloader.cli._download_ops import (
+    AcceptanceSink,
     _batch_details,
     _run_batch_retry,
     _run_generic_download,
@@ -59,7 +61,17 @@ from cli_downloader.core.batch import (
     BatchEntryStatus,
 )
 from cli_downloader.core.task_tree import TaskState
-from cli_downloader.core.owner_protocol import OwnerLifecycleState, OwnerMode
+from cli_downloader.core.owner_protocol import (
+    OWNER_PROTOCOL_VERSION,
+    OwnerCommand,
+    OwnerEventKind,
+    OwnerHandshake,
+    OwnerLifecycleState,
+    OwnerMode,
+    OwnerRequest,
+    OwnerResponseMode,
+    OwnerSource,
+)
 from cli_downloader.core.owner_scope import (
     OwnerDiscoveryMetadata,
     OwnerManager,
@@ -71,6 +83,7 @@ from cli_downloader.core.shell_control import (
     ShellStatusKind,
     ShellStatusSnapshot,
 )
+from cli_downloader.core.owner_transport import OwnerPipeClient, OwnerTransportError
 from cli_downloader.core.operations import (
     ListPageData,
     ResultKind,
@@ -150,6 +163,94 @@ def _emit_shell_status(snapshot: ShellStatusSnapshot, *, json_output: bool) -> N
         print(f"Protocol: {metadata.protocol_version}")
         print(f"Session: {metadata.session_id}")
         print(f"Recovery: {metadata.lifecycle_state.value}")
+
+
+def _forward_download_to_shell(args: argparse.Namespace) -> int | None:
+    """Forward a live download when this data-root already has a Shell owner.
+
+    ``None`` means no ready Shell was discovered and the caller may claim the
+    foreground owner.  A concrete exit code means the request was handled by
+    the Shell (including a structured IPC failure).
+    """
+
+    environment = diagnose_environment()
+    scope = OwnerScope.from_app_paths(environment.paths)
+    snapshot = ShellController(scope).status()
+    metadata = snapshot.metadata
+    if metadata is None or metadata.owner_mode is not OwnerMode.SHELL:
+        return None
+    if metadata.lifecycle_state not in {OwnerLifecycleState.READY, OwnerLifecycleState.RECOVERING}:
+        return None
+
+    response_mode = OwnerResponseMode.DETACH if args.detach else OwnerResponseMode.WAIT
+    session_id = f"cli-{uuid4().hex}"
+    payload: dict[str, object] = {"url": args.url, "force": bool(args.force)}
+    for name in ("profile", "strategy"):
+        value = getattr(args, name, None)
+        if value is not None:
+            payload[name] = value
+    if args.select:
+        payload["select"] = tuple(args.select)
+    request = OwnerRequest(
+        protocol_version=OWNER_PROTOCOL_VERSION,
+        request_id=uuid4().hex,
+        source=OwnerSource.CLI,
+        command=OwnerCommand.DOWNLOAD,
+        response_mode=response_mode,
+        payload=payload,
+        client_session_id=session_id,
+    )
+    handshake = OwnerHandshake(
+        protocol_version=OWNER_PROTOCOL_VERSION,
+        session_id=session_id,
+        mode=OwnerMode.FOREGROUND,
+        application_version=__version__,
+        capabilities=("download",),
+        required_capabilities=("download",),
+    )
+    try:
+        events = OwnerPipeClient(scope).request(request, handshake=handshake)
+    except OwnerTransportError as error:
+        _emit_owner_error(error, json_output=args.json)
+        return 1
+    if not events:
+        _emit_owner_error(
+            OwnerTransportError("owner returned no response events"),
+            json_output=args.json,
+        )
+        return 1
+    accepted = next((event for event in events if event.kind is OwnerEventKind.ACCEPTED), None)
+    if args.detach and accepted is not None:
+        payload = {"accepted": True, "request_id": request.request_id, **dict(accepted.payload)}
+        if args.json:
+            print(json.dumps(payload, ensure_ascii=False))
+        else:
+            task_id = payload.get("task_id") or "(pending)"
+            print(f"Accepted by Shell: {task_id} ({request.request_id})")
+        return 0
+    terminal = next((event for event in events if event.kind is OwnerEventKind.TERMINAL), None)
+    if terminal is None:
+        error = next((event for event in events if event.kind is OwnerEventKind.OWNER_DISCONNECTED), None)
+        _emit_owner_error(
+            OwnerTransportError(
+                str(dict(error.payload)) if error is not None else "owner disconnected before completion"
+            ),
+            json_output=args.json,
+        )
+        return 1
+    result = terminal.payload.get("result")
+    if isinstance(result, dict) and isinstance(result.get("output"), str):
+        output = result["output"]
+        if output:
+            sys.stdout.write(output)
+            if not output.endswith("\n"):
+                sys.stdout.write("\n")
+    elif args.json:
+        print(json.dumps(dict(terminal.payload), ensure_ascii=False))
+    else:
+        print(f"Shell download {terminal.payload.get('status', 'finished')}")
+    exit_code = terminal.payload.get("exit_code")
+    return int(exit_code) if isinstance(exit_code, int) else 0
 
 
 def _shell_launch_args(args: argparse.Namespace) -> tuple[str, ...]:
@@ -397,6 +498,17 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Create a new batch attempt even when a selected gallery is active or completed.",
     )
+    response_mode = download_parser.add_mutually_exclusive_group()
+    response_mode.add_argument(
+        "--detach",
+        action="store_true",
+        help="Submit to an active Shell owner and return after durable acceptance.",
+    )
+    response_mode.add_argument(
+        "--wait",
+        action="store_true",
+        help="Explicitly wait for the download result (the default).",
+    )
 
     operation_parser = subparsers.add_parser(
         "operation",
@@ -637,6 +749,7 @@ def main(
     progress: ProgressSink | None = None,
     download_limiter: GalleryDownloadLimiter | None = None,
     _owner_claimed: bool = False,
+    on_accept: AcceptanceSink | None = None,
 ) -> int:
     if argv is None:
         import sys
@@ -700,13 +813,14 @@ def main(
                 runtime=shell_runtime,
                 _owner_claimed=True,
             ),
-            background_runner=lambda shell_argv, cancellation, progress, download_limiter: main(
+            background_runner=lambda shell_argv, cancellation, progress, download_limiter, on_accept=None: main(
                 shell_argv,
                 runtime=shell_runtime,
                 cancellation=cancellation,
                 progress=progress,
                 download_limiter=download_limiter,
                 _owner_claimed=True,
+                on_accept=on_accept,
             ),
         )
 
@@ -763,6 +877,16 @@ def main(
             print(json.dumps(result, indent=None if render_mode is RenderMode.JSON else 2))
             return 0 if result["matched"] else 1
         try:
+            if not _owner_claimed:
+                forwarded = _forward_download_to_shell(args)
+                if forwarded is not None:
+                    return forwarded
+                if args.detach:
+                    _emit_owner_error(
+                        OwnerTransportError("--detach requires an active Shell owner"),
+                        json_output=args.json,
+                    )
+                    return 1
             with _owned_execution(owner_claimed=_owner_claimed):
                 return _run_generic_download(
                     args.url,
@@ -777,6 +901,7 @@ def main(
                     download_limiter=download_limiter,
                     task_id=None,
                     interactive_renderer=render_interactive_result,
+                    on_accept=on_accept,
                 )
         except OwnerError as error:
             _emit_owner_error(error, json_output=args.json)

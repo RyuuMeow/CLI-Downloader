@@ -144,6 +144,7 @@ class BatchService:
         title: str | None = None,
         strategy: DownloadStrategy = DownloadStrategy.AUTO,
         force: bool = False,
+        parent_id: str | None = None,
     ) -> ConfirmedBatchResult:
         selected = tuple(items)
         if self._store is None:
@@ -160,7 +161,7 @@ class BatchService:
             for item in selected:
                 if self._completion_store.is_completed(site_id, item.source_url):
                     duplicates[item.item_id] = DuplicateKind.COMPLETED
-        parent_id = uuid4().hex
+        parent_id = parent_id or uuid4().hex
 
         def _is_duplicate(item: ListItemData) -> bool:
             if force:

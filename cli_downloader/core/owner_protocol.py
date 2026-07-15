@@ -295,7 +295,7 @@ def _check_keys(value: Mapping[str, object], path: str, allowed: frozenset[str])
 
 
 _COMMAND_FIELDS: dict[OwnerCommand, frozenset[str]] = {
-    OwnerCommand.DOWNLOAD: frozenset({"url", "params", "settings", "setting_refs", "secret_refs", "strategy", "select", "confirmations"}),
+    OwnerCommand.DOWNLOAD: frozenset({"url", "params", "settings", "setting_refs", "secret_refs", "strategy", "select", "confirmations", "profile", "force"}),
     OwnerCommand.TASK_CONTROL: frozenset({"task_id", "action", "expected_revision"}),
     OwnerCommand.TASK_QUERY: frozenset({"task_id", "include_children"}),
     OwnerCommand.HISTORY_QUERY: frozenset({"task_id", "child"}),
@@ -325,6 +325,10 @@ def _validate_command_payload(command: OwnerCommand, payload: Mapping[str, Froze
                     _require_token(value, f"request.payload.{name}.{key}")
         if "strategy" in payload:
             _require_identifier(payload["strategy"], "request.payload.strategy")
+        if "profile" in payload:
+            _require_token(payload["profile"], "request.payload.profile", maximum=128)
+        if "force" in payload and not isinstance(payload["force"], bool):
+            raise _error("invalid_boolean", "request.payload.force", "must be a boolean")
         if "select" in payload:
             selections = payload["select"]
             if not isinstance(selections, tuple):
@@ -377,6 +381,37 @@ class OwnerHandshake:
             "capabilities": list(self.capabilities),
             "required_capabilities": list(self.required_capabilities),
         }
+
+    @classmethod
+    def from_dict(cls, value: object) -> "OwnerHandshake":
+        if not isinstance(value, Mapping):
+            raise _error("invalid_envelope", "handshake", "must be an object")
+        _check_keys(
+            value,
+            "handshake",
+            frozenset(
+                {
+                    "protocol_version",
+                    "session_id",
+                    "mode",
+                    "application_version",
+                    "capabilities",
+                    "required_capabilities",
+                }
+            ),
+        )
+        required = ("protocol_version", "session_id", "mode", "application_version")
+        for key in required:
+            if key not in value:
+                raise _error("missing_field", f"handshake.{key}", "is required")
+        return cls(
+            protocol_version=value["protocol_version"],
+            session_id=value["session_id"],
+            mode=_enum(value["mode"], OwnerMode, "handshake.mode"),
+            application_version=value["application_version"],
+            capabilities=value.get("capabilities", ()),
+            required_capabilities=value.get("required_capabilities", ()),
+        )
 
 
 @dataclass(frozen=True)
@@ -494,7 +529,7 @@ class OwnerRequest:
 
 def _event_payload(kind: OwnerEventKind, payload: Mapping[str, FrozenJsonValue]) -> None:
     if kind is OwnerEventKind.ACCEPTED:
-        _check_keys(payload, "event.payload", frozenset({"owner_session_id", "accepted_at", "task_id", "task_kind", "queued"}))
+        _check_keys(payload, "event.payload", frozenset({"owner_session_id", "owner_pid", "accepted_at", "task_id", "task_kind", "queued"}))
         for name in ("owner_session_id", "task_id", "task_kind"):
             if name in payload:
                 _require_token(payload[name], f"event.payload.{name}")
@@ -503,6 +538,8 @@ def _event_payload(kind: OwnerEventKind, payload: Mapping[str, FrozenJsonValue])
         _parse_datetime(payload["accepted_at"], "event.payload.accepted_at")
         if "queued" in payload and not isinstance(payload["queued"], bool):
             raise _error("invalid_boolean", "event.payload.queued", "must be a boolean")
+        if "owner_pid" in payload:
+            _require_positive_int(payload["owner_pid"], "event.payload.owner_pid")
         if "owner_session_id" not in payload:
             raise _error("missing_field", "event.payload.owner_session_id", "is required")
     elif kind is OwnerEventKind.PROGRESS:
@@ -588,12 +625,14 @@ class OwnerResponseEvent:
         _event_payload(self.kind, self.payload)
 
     @classmethod
-    def accepted(cls, request_id: str, sequence: int, *, owner_session_id: str, accepted_at: datetime, task_id: str | None = None, task_kind: str | None = None, queued: bool = True) -> "OwnerResponseEvent":
+    def accepted(cls, request_id: str, sequence: int, *, owner_session_id: str, accepted_at: datetime, task_id: str | None = None, task_kind: str | None = None, queued: bool = True, owner_pid: int | None = None) -> "OwnerResponseEvent":
         payload: dict[str, object] = {"owner_session_id": owner_session_id, "accepted_at": _utc_datetime(accepted_at, "event.payload.accepted_at").isoformat(), "queued": queued}
         if task_id is not None:
             payload["task_id"] = task_id
         if task_kind is not None:
             payload["task_kind"] = task_kind
+        if owner_pid is not None:
+            payload["owner_pid"] = owner_pid
         return cls(request_id, sequence, OwnerEventKind.ACCEPTED, payload)
 
     @classmethod

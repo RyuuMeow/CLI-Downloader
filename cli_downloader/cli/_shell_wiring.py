@@ -8,8 +8,14 @@ state.
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
+from contextlib import redirect_stdout
 from dataclasses import replace
+from datetime import UTC, datetime
+from io import StringIO
+import json
+import os
 from pathlib import Path
+from threading import Event, Thread
 
 from cli_downloader.application.task_hierarchy_service import TaskHierarchyService
 from cli_downloader.application.download_limiter import GalleryDownloadLimiter
@@ -34,6 +40,16 @@ from cli_downloader.core.batch import (
 )
 from cli_downloader.core.environment import diagnose_environment
 from cli_downloader.core.owner_protocol import OwnerLifecycleState, OwnerMode
+from cli_downloader.core.owner_protocol import (
+    OWNER_PROTOCOL_VERSION,
+    OwnerCommand,
+    OwnerDisconnectOutcome,
+    OwnerHandshake,
+    OwnerResponseEvent,
+    OwnerRequest,
+    OwnerTerminalStatus,
+    OwnerWaitPhase,
+)
 from cli_downloader.core.owner_scope import (
     OwnerDiscoveryMetadata,
     OwnerLease,
@@ -41,7 +57,8 @@ from cli_downloader.core.owner_scope import (
     OwnerScope,
     new_owner_session_id,
 )
-from cli_downloader.core.errors import OwnerScopeMismatchError
+from cli_downloader.core.errors import OwnerError, OwnerScopeMismatchError
+from cli_downloader.core.owner_transport import OwnerPipeServer
 from cli_downloader.core.operations import OperationResult
 from cli_downloader.core.task_tree import TaskKind
 from cli_downloader.integrations.browser_login import BrowserLoginService
@@ -61,7 +78,7 @@ def build_interactive_shell(
     plugins_dir: Path,
     runner: Callable[[Sequence[str]], int],
     background_runner: Callable[
-        [Sequence[str], object, ProgressSink, GalleryDownloadLimiter], int
+        [Sequence[str], object, ProgressSink, GalleryDownloadLimiter, object], int
     ],
     operation_runner: Callable[[str, Mapping[str, object]], object] | None = None,
     owner_lease: OwnerLease | None = None,
@@ -119,7 +136,7 @@ def _build_interactive_shell_impl(
     plugins_dir: Path,
     runner: Callable[[Sequence[str]], int],
     background_runner: Callable[
-        [Sequence[str], object, ProgressSink, GalleryDownloadLimiter], int
+        [Sequence[str], object, ProgressSink, GalleryDownloadLimiter, object], int
     ],
     operation_runner: Callable[[str, Mapping[str, object]], object] | None = None,
     owner_lease: OwnerLease | None = None,
@@ -197,19 +214,20 @@ def _build_interactive_shell_impl(
             download_limiter=shell_download_limiter,
         )
 
-    def run_background(shell_argv, cancellation, progress):
+    def run_background(shell_argv, cancellation, progress, on_accept=None):
         return background_runner(
             shell_argv,
             cancellation,
             progress,
             shell_download_limiter,
+            on_accept,
         )
 
     operation_callback = operation_runner or (
         lambda url, params: _load_shell_operation(runtime, url, params)
     )
 
-    return InteractiveShell(
+    shell = InteractiveShell(
         runner=runner,
         background_runner=run_background,
         task_service_loader=load_task_service,
@@ -226,7 +244,42 @@ def _build_interactive_shell_impl(
         runtime=runtime,
         plugins_dir=plugins_dir,
         cache_dir=environment.paths.cache_dir,
-    ).run()
+    )
+
+    owner_server = None
+    if owner_lease is not None and owner_session_id is not None:
+        owner_server = OwnerPipeServer(
+            owner_lease.scope,
+            handshake=OwnerHandshake(
+                protocol_version=OWNER_PROTOCOL_VERSION,
+                session_id=owner_session_id,
+                mode=OwnerMode.SHELL,
+                application_version=__version__,
+                capabilities=("download", "task_query", "task_control", "history_query", "shell_status"),
+            ),
+            handler=lambda request, emit: _handle_owner_download(
+                request,
+                emit,
+                run_background=run_background,
+                owner_session_id=owner_session_id,
+            ),
+        )
+        owner_server.start()
+        owner_lease.publish(
+            OwnerDiscoveryMetadata.for_current_process(
+                owner_lease.scope,
+                application_version=__version__,
+                owner_mode=OwnerMode.SHELL,
+                lifecycle_state=OwnerLifecycleState.READY,
+                session_id=owner_session_id,
+                capabilities=("download", "task_control", "task_query", "history_query", "shell_status"),
+            )
+        )
+    try:
+        return shell.run()
+    finally:
+        if owner_server is not None:
+            owner_server.stop()
 
 
 def _load_shell_operation(
@@ -257,8 +310,8 @@ def _load_shell_operation(
             params=merged_params,
             confirmations=_EXPLICIT_DOWNLOAD_CONFIRMATIONS,
         )
+    if url.startswith("plugin://"):
         return (plugin_id, result)
-
     entry = runtime.entry_for_url(url)
     result = _dispatch_operation(
         OperationDispatcher(runtime, config=config),
@@ -269,6 +322,163 @@ def _load_shell_operation(
     _record_list_browse(result, url=url, runtime=runtime)
     return (entry.plugin_id if entry is not None else "unknown", result)
 
+
+def _handle_owner_download(
+    request: OwnerRequest,
+    emit: Callable[[OwnerResponseEvent], None],
+    *,
+    run_background: Callable[..., int],
+    owner_session_id: str,
+) -> None:
+    """Run one externally submitted download inside the Shell owner.
+
+    The worker is deliberately independent from the requesting process.  A
+    detached client can close its pipe after the acceptance event and the Shell
+    continues the same background execution and durable task lifecycle.
+    """
+
+    if request.command is not OwnerCommand.DOWNLOAD:
+        raise ValueError(f"unsupported owner command: {request.command.value}")
+    payload = dict(request.payload)
+    url = payload.get("url")
+    if not isinstance(url, str):
+        raise ValueError("download request is missing its URL")
+    argv: list[str] = ["download", url, "--json"]
+    for name in ("profile", "strategy"):
+        value = payload.get(name)
+        if isinstance(value, str):
+            argv.extend((f"--{name}", value))
+    selections = payload.get("select", ())
+    if isinstance(selections, tuple):
+        for item_id in selections:
+            if isinstance(item_id, str):
+                argv.extend(("--select", item_id))
+    if payload.get("force") is True:
+        argv.append("--force")
+
+    sequence = 0
+    accepted = Event()
+    finished = Event()
+    cancellation = Event()
+    accepted_task: dict[str, str] = {}
+    pipe_closed = Event()
+
+    def push(event_factory: Callable[[int], OwnerResponseEvent]) -> bool:
+        nonlocal sequence
+        if pipe_closed.is_set():
+            return False
+        sequence += 1
+        try:
+            emit(event_factory(sequence))
+        except (OSError, EOFError, OwnerError):
+            pipe_closed.set()
+            return False
+        return True
+
+    def on_accept(task_id: str, task_kind: str) -> None:
+        if accepted.is_set():
+            return
+        accepted_task.update({"task_id": task_id, "task_kind": task_kind})
+        if push(
+            lambda current: OwnerResponseEvent.accepted(
+                request.request_id,
+                current,
+                owner_session_id=owner_session_id,
+                accepted_at=datetime.now(UTC),
+                task_id=task_id,
+                task_kind=task_kind,
+                queued=True,
+                owner_pid=os.getpid(),
+            )
+        ):
+            accepted.set()
+
+    def progress(reason: str, progress_payload: Mapping[str, object]) -> None:
+        if not accepted.is_set() or not accepted_task:
+            return
+        current = progress_payload.get("current")
+        total = progress_payload.get("total")
+        ratio = None
+        if isinstance(current, int) and isinstance(total, int) and total > 0:
+            ratio = min(1.0, max(0.0, current / total))
+        push(
+            lambda sequence_number: OwnerResponseEvent.progress(
+                request.request_id,
+                sequence_number,
+                task_id=accepted_task["task_id"],
+                status=reason,
+                progress=ratio,
+                file_count=current if isinstance(current, int) and current >= 0 else None,
+                message=str(progress_payload.get("message")) if progress_payload.get("message") else None,
+            )
+        )
+
+    def worker() -> None:
+        output = StringIO()
+        exit_code = 1
+        try:
+            with redirect_stdout(output):
+                exit_code = run_background(
+                    argv,
+                    cancellation,
+                    progress,
+                    on_accept,
+                )
+        except Exception as error:
+            output.write(json.dumps({"error": str(error)}))
+            exit_code = 1
+        if not accepted.is_set():
+            push(
+                lambda current: OwnerResponseEvent.owner_disconnected(
+                    request.request_id,
+                    current,
+                    phase=OwnerWaitPhase.ACCEPTANCE,
+                    outcome=OwnerDisconnectOutcome.NOT_ACCEPTED,
+                    last_sequence=current - 1,
+                    message="download did not create a durable Task; select a list item explicitly",
+                )
+            )
+            finished.set()
+            return
+        status = (
+            OwnerTerminalStatus.COMPLETED
+            if exit_code == 0
+            else OwnerTerminalStatus.CANCELLED
+            if exit_code == 130
+            else OwnerTerminalStatus.FAILED
+        )
+        push(
+            lambda current: OwnerResponseEvent.terminal(
+                request.request_id,
+                current,
+                status=status,
+                task_id=accepted_task.get("task_id"),
+                exit_code=exit_code,
+                result={"output": output.getvalue()},
+            )
+        )
+        finished.set()
+
+    Thread(target=worker, name=f"owner-download-{request.request_id[:8]}", daemon=True).start()
+    accepted_before_deadline = False
+    for _ in range(100):
+        if accepted.is_set():
+            accepted_before_deadline = True
+            break
+        if finished.wait(0.1):
+            break
+    if not accepted_before_deadline and not pipe_closed.is_set() and not finished.is_set():
+        push(
+            lambda current: OwnerResponseEvent.owner_disconnected(
+                request.request_id,
+                current,
+                phase=OwnerWaitPhase.ACCEPTANCE,
+                outcome=OwnerDisconnectOutcome.NOT_ACCEPTED,
+                last_sequence=current - 1,
+                message="owner did not create a durable Task before the acceptance deadline",
+            )
+        )
+        pipe_closed.set()
 
 def _recover_interrupted_downloads(
     task_store: StateTaskStore,

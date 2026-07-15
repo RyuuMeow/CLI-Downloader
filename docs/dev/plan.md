@@ -2,7 +2,7 @@
 
 Updated: 2026-07-15
 
-This document contains active work only. Completed P2, P3, P4, P5-02 through P5-13, and P5-18 tasks
+This document contains active work only. Completed P2, P3, P4, P5-02 through P5-14, and P5-18 tasks
 have been removed. The application is not released, so compatibility with removed legacy
 databases, imports, layouts, commands, and CLI argument forms remains out of scope.
 
@@ -10,10 +10,9 @@ databases, imports, layouts, commands, and CLI argument forms remains out of sco
 
 | Order | Task | Status | Depends on |
 | --- | --- | --- | --- |
-| 1 | P5-14 Forward Download Requests With Wait And Detach Modes | Planned | - |
-| 2 | P5-15 Route Task Control Through The Scheduler Owner | Planned | P5-14 |
-| 3 | P5-16 Harden IPC Recovery, Security, And Packaging | Planned | P5-14, P5-15 |
-| 4 | P5-17 Add The Agent-Control Workflow And End-To-End Verification | Planned | P5-14 through P5-16 |
+| 1 | P5-15 Route Task Control Through The Scheduler Owner | Planned | P5-14 |
+| 2 | P5-16 Harden IPC Recovery, Security, And Packaging | Planned | P5-14, P5-15 |
+| 3 | P5-17 Add The Agent-Control Workflow And End-To-End Verification | Planned | P5-14 through P5-16 |
 
 ## Direction And Boundaries
 
@@ -46,45 +45,22 @@ databases, imports, layouts, commands, and CLI argument forms remains out of sco
 - Tasks list projections are read models, not full execution graphs. A Batch row must not expand
   all children, assets, attempts, or filesystem state merely to render summary progress.
 
-## P5-14 Forward Download Requests With Wait And Detach Modes
+## Completed P5-14 Forward Download Requests With Wait And Detach Modes
 
-### Status
-
-Planned.
-
-### Scope
-
-- Add `--detach` to live `clid download`; keep foreground waiting as the default public behavior.
-  An optional explicit `--wait` alias may be added for scripts and documentation, but it must not
-  change the default.
-- When a Shell owner is ready, both modes submit typed download requests through IPC. Normal mode
-  waits for the Shell-owned terminal outcome; detach mode returns after durable acceptance.
-- When no Shell exists, normal mode acquires foreground ownership and executes the existing
-  blocking flow. Detach mode never spawns an invisible worker or silently falls back to blocking.
-- Refactor URL dispatch so an accepted direct Item or explicitly selected Batch receives a stable
-  Task or parent ID before the acknowledgement is returned. Persist a `preparing` record and source
-  arguments before plugin/network work begins.
-- For a list operation without explicit selection, return `requires_selection` and let the Shell
-  display the Operation page; do not fabricate a download Task. Agent usage continues to require
-  explicit repeated `--select` values.
-- A successful detached JSON response includes `accepted`, `request_id`, `task_id`, owner session,
-  owner PID, queued state, and whether the request created an Item or Batch. Duplicate completion
-  checks retain their existing `--force` policy.
-- A waiting client receives progress without owning the Task. An unexpected client disconnect does
-  not cancel Shell work. An explicit Ctrl+C sends the defined cancellation request; if delivery is
-  uncertain, output must tell the user to inspect and cancel by Task ID.
-- Show externally submitted commands in the Shell Console with their source and request ID, and
-  make the persisted Task visible in the Tasks page as soon as acceptance succeeds.
-
-### Acceptance Criteria
-
-- Tests cover all four rows of the Shell/detach behavior matrix for Item and explicitly selected
-  Batch downloads.
-- Detach returns only after durable state exists and never returns two Task IDs for one request ID.
-- The Shell and forwarded CLI report the same terminal status, failure origin, output paths, and
-  History identity as an in-Shell download.
-- JSON mode remains machine-readable: detached mode emits one acceptance document; waiting mode
-  emits a defined final document without mixing terminal-renderer output into stdout.
+- Added typed `OwnerPipeServer`/`OwnerPipeClient` transport with authenticated handshake, bounded
+  connection setup, request/event framing, and scope-derived endpoint metadata. Windows currently
+  uses authenticated loopback transport; Named Pipe ACL hardening remains in P5-16.
+- Added `clid download --detach` and explicit `--wait`. A ready Shell owns forwarded work; normal
+  mode waits for the owner terminal event, while detach returns only after an Item placeholder or
+  Batch parent is durably created. Without a Shell, detach is rejected rather than silently
+  starting an invisible worker; normal commands retain foreground ownership.
+- Forwarded payloads preserve URL, profile, strategy, selection, force, request ID, and response
+  mode. Direct Item reservations persist source/title metadata before plugin download work; selected
+  Batch acceptance is emitted immediately after its parent and entries are persisted.
+- Added acceptance/progress/terminal event handling, owner disconnect deadlines, and explicit
+  `owner_disconnected` for list operations without `--select`; no fabricated Task is returned.
+- Added protocol, transport, parser, and four-row Item/Batch × wait/detach tests, plus duplicate
+  Task-ID assertions. P5-15 will extend the same channel to task controls and richer Shell refresh.
 
 ## P5-15 Route Task Control Through The Scheduler Owner
 

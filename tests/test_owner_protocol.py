@@ -59,6 +59,21 @@ class OwnerRequestTests(unittest.TestCase):
         self.assertEqual(restored, request)
         self.assertEqual(json.loads(encoded)["command"], "download")
 
+    def test_download_request_carries_dispatch_options(self) -> None:
+        request = download_request(
+            payload={
+                "url": "https://example.test/gallery/42",
+                "profile": "pixiv-default",
+                "strategy": "torrent",
+                "select": ("item-1",),
+                "force": True,
+            }
+        )
+        restored = OwnerRequest.from_bytes(request.to_bytes())
+        self.assertEqual(restored.payload["profile"], "pixiv-default")
+        self.assertEqual(restored.payload["strategy"], "torrent")
+        self.assertTrue(restored.payload["force"])
+
     def test_request_rejects_raw_process_and_secret_values(self) -> None:
         for field in ("shell_command", "python", "cookies", "password"):
             with self.subTest(field=field):

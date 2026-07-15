@@ -10,8 +10,9 @@ from __future__ import annotations
 
 import asyncio
 import json
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from threading import Event
+from uuid import uuid4
 
 from cli_downloader.application.batch_execution_runner import CoordinatedBatchRunner
 from cli_downloader.application.batch_pipeline import BatchPipeline
@@ -68,6 +69,9 @@ from cli_downloader.storage.state_history_store import StateHistoryStore
 from cli_downloader.storage.state_task_store import StateTaskStore
 from cli_downloader.storage.paths import StorageLayout
 from cli_downloader.storage.task_store import TaskRecord, TaskStatus
+
+
+AcceptanceSink = Callable[[str, str], None]
 
 
 def _build_download_limiter(
@@ -332,6 +336,7 @@ def _run_generic_download(
     download_limiter: GalleryDownloadLimiter | None = None,
     task_id: str | None = None,
     interactive_renderer=None,
+    on_accept: AcceptanceSink | None = None,
 ) -> int:
     environment = diagnose_environment()
     loaded_config = ConfigLoader(
@@ -388,6 +393,7 @@ def _run_generic_download(
                 progress=progress,
                 download_limiter=download_limiter,
                 task_id=task_id,
+                on_accept=on_accept,
             )
         if result.result_kind is not ResultKind.LIST_PAGE:
             print(serialize_operation_result(result, output_mode))
@@ -413,6 +419,7 @@ def _run_generic_download(
                 cancellation=cancellation,
                 progress=progress,
                 download_limiter=download_limiter,
+                on_accept=on_accept,
             )
         if render_mode is not RenderMode.INTERACTIVE:
             print(serialize_operation_result(result, render_mode))
@@ -448,6 +455,7 @@ def _run_generic_download(
                 cancellation=cancellation,
                 progress=progress,
                 download_limiter=download_limiter,
+                on_accept=on_accept,
             )
         return 1
 
@@ -463,6 +471,7 @@ def _download_generic_gallery(
     progress: ProgressSink | None = None,
     download_limiter: GalleryDownloadLimiter | None = None,
     task_id: str | None = None,
+    on_accept: AcceptanceSink | None = None,
 ) -> int:
     data = result.data
     if not isinstance(data, GalleryData):
@@ -505,6 +514,20 @@ def _download_generic_gallery(
     operation_metadata = {
         "network_request_performed": bool(data.metadata.get("network_request_performed", True))
     }
+    task_id = task_id or uuid4().hex
+    if on_accept is not None:
+        task_store = StateTaskStore(StateDatabase(layout.state_db))
+        task_store.upsert(
+            TaskRecord(
+                task_id=task_id,
+                status=TaskStatus.PENDING,
+                site_id=data.site_id,
+                source_url=data.source_url,
+                title=data.title,
+                metadata={"owner_acceptance": True, "strategy": strategy.value},
+            )
+        )
+        on_accept(task_id, TaskKind.ITEM.value)
     if fetcher is None:
         print(serialize_operation_result(result, RenderMode.PLAIN))
         return 1
@@ -646,6 +669,7 @@ def _run_confirmed_list_batch(
     cancellation: Event | None,
     progress: ProgressSink | None,
     download_limiter: GalleryDownloadLimiter | None = None,
+    on_accept: AcceptanceSink | None = None,
 ) -> int:
     data = result.data
     if not isinstance(data, ListPageData):
@@ -669,6 +693,7 @@ def _run_confirmed_list_batch(
         cancellation=cancellation,
         progress=progress,
         download_limiter=download_limiter,
+        on_accept=on_accept,
     )
 
 
@@ -685,6 +710,7 @@ def _run_selected_list_batch(
     progress: ProgressSink | None,
     task_service: TaskHierarchyService | None = None,
     download_limiter: GalleryDownloadLimiter | None = None,
+    on_accept: AcceptanceSink | None = None,
 ) -> int:
     items = tuple(items)
     if not items:
@@ -794,6 +820,8 @@ def _run_selected_list_batch(
         )
     try:
         parent_id = creation.snapshot.parent.parent_id
+        if on_accept is not None:
+            on_accept(parent_id, TaskKind.BATCH.value)
         _report_progress(progress, "batch_created", {"parent_id": parent_id})
         run = asyncio.run(
             _run_cancellable_batch(
