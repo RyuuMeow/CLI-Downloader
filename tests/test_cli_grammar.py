@@ -34,6 +34,7 @@ class CliGrammarTest(TestCase):
         detached = parser.parse_args(["download", "https://example.test/item", "--detach"])
         self.assertTrue(detached.detach)
         self.assertFalse(detached.wait)
+        self.assertEqual(detached.selection_policy, "all")
 
         waiting = parser.parse_args(["download", "https://example.test/item", "--wait"])
         self.assertTrue(waiting.wait)

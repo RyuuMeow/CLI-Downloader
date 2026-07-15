@@ -456,6 +456,10 @@ def _handle_owner_download(
         for item_id in selections:
             if isinstance(item_id, str):
                 argv.extend(("--select", item_id))
+    selection_policy = payload.get("selection_policy", "all")
+    if selection_policy not in {"all", "explicit", "interactive"}:
+        raise ValueError("download request has an invalid selection policy")
+    argv.extend(("--selection-policy", selection_policy))
     if payload.get("force") is True:
         argv.append("--force")
 

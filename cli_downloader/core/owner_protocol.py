@@ -304,7 +304,7 @@ def _check_keys(value: Mapping[str, object], path: str, allowed: frozenset[str])
 
 
 _COMMAND_FIELDS: dict[OwnerCommand, frozenset[str]] = {
-    OwnerCommand.DOWNLOAD: frozenset({"url", "params", "settings", "setting_refs", "secret_refs", "strategy", "select", "confirmations", "profile", "force"}),
+    OwnerCommand.DOWNLOAD: frozenset({"url", "params", "settings", "setting_refs", "secret_refs", "strategy", "select", "selection_policy", "confirmations", "profile", "force"}),
     OwnerCommand.TASK_CONTROL: frozenset({"task_id", "action", "expected_revision"}),
     OwnerCommand.TASK_QUERY: frozenset({"task_id", "include_children"}),
     OwnerCommand.HISTORY_QUERY: frozenset({"task_id", "child"}),
@@ -336,6 +336,17 @@ def _validate_command_payload(command: OwnerCommand, payload: Mapping[str, Froze
             _require_identifier(payload["strategy"], "request.payload.strategy")
         if "profile" in payload:
             _require_token(payload["profile"], "request.payload.profile", maximum=128)
+        if "selection_policy" in payload:
+            policy = _require_identifier(
+                payload["selection_policy"],
+                "request.payload.selection_policy",
+            )
+            if policy not in {"all", "explicit", "interactive"}:
+                raise _error(
+                    "invalid_value",
+                    "request.payload.selection_policy",
+                    "must be all, explicit, or interactive",
+                )
         if "force" in payload and not isinstance(payload["force"], bool):
             raise _error("invalid_boolean", "request.payload.force", "must be a boolean")
         if "select" in payload:

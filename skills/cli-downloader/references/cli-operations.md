@@ -64,8 +64,13 @@ Then, with user authorization:
 ```text
 <cli> download <url> --json
 <cli> download <url> --profile <name> --strategy <auto|direct|torrent> --json
+<cli> download <list-url> --json
 <cli> download <list-url> --select <item-id> --select <item-id> --json
 ```
+
+A list or Batch URL without `--select` submits every item returned by that operation. Repeated
+`--select` values restrict the Batch to an explicit subset. The interactive Shell continues to
+present the plugin-provided selection page instead of applying the command-line default.
 
 Do not use `--force` unless the user intends to create a new attempt despite an active or completed duplicate.
 

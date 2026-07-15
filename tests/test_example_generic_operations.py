@@ -106,7 +106,12 @@ class ExampleGenericCLIFlowTests(unittest.TestCase):
                     ):
                         with redirect_stdout(stream):
                             exit_code = main(
-                                ["download", "https://example.test/list?page=1"],
+                                [
+                                    "download",
+                                    "https://example.test/list?page=1",
+                                    "--selection-policy",
+                                    "interactive",
+                                ],
                                 runtime=build_example_runtime(),
                             )
             payload = json.loads(stream.getvalue())

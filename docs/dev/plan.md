@@ -1,6 +1,6 @@
 # Development Plan
 
-Updated: 2026-07-15
+Updated: 2026-07-16
 
 This document keeps the active roadmap plus the latest P5 completion evidence. Completed P2, P3,
 P4, P5-02 through P5-15, and P5-18 task details remain summarized only where they explain current
@@ -43,6 +43,8 @@ imports, layouts, commands, and CLI argument forms remains out of scope.
   download timeout.
 - Tasks list projections are read models, not full execution graphs. A Batch row must not expand
   all children, assets, attempts, or filesystem state merely to render summary progress.
+- Command-line Batch URLs default to all items returned by the operation; repeated `--select`
+  values restrict the Batch to a subset. The Shell remains the only interactive selection surface.
 
 ## Completed P5-14 Forward Download Requests With Wait And Detach Modes
 
@@ -54,11 +56,11 @@ imports, layouts, commands, and CLI argument forms remains out of scope.
   mode waits for the owner terminal event, while detach returns only after an Item placeholder or
   Batch parent is durably created. Without a Shell, detach is rejected rather than silently
   starting an invisible worker; normal commands retain foreground ownership.
-- Forwarded payloads preserve URL, profile, strategy, selection, force, request ID, and response
+- Forwarded payloads preserve URL, profile, strategy, selection policy, selection, force, request ID, and response
   mode. Direct Item reservations persist source/title metadata before plugin download work; selected
   Batch acceptance is emitted immediately after its parent and entries are persisted.
-- Added acceptance/progress/terminal event handling, owner disconnect deadlines, and explicit
-  `owner_disconnected` for list operations without `--select`; no fabricated Task is returned.
+- Added acceptance/progress/terminal event handling and owner disconnect deadlines. List operations
+  carry an explicit all/explicit selection policy so their accepted Batch is never inferred from output mode.
 - Added protocol, transport, parser, and four-row Item/Batch × wait/detach tests, plus duplicate
   Task-ID assertions. P5-15 will extend the same channel to task controls and richer Shell refresh.
 
@@ -158,8 +160,8 @@ Completed.
 - Update the repository Agent Skill to check `clid shell status --json`, run
   `clid shell ensure --visible --wait-ready --json` when a visible Shell is absent, and use
   `clid download <url> --detach --json` only after explicit download authorization.
-- Continue to dry-run and inspect URL routing before a live submission. List results still require
-  explicit selections; the Agent may not guess a bulk download.
+- Continue to dry-run and inspect URL routing before a live submission. A list URL defaults to the
+  complete returned Batch, so the Agent must obtain authorization for that scope or pass explicit selections.
 - Read the accepted Task ID, verify it with `tasks show`, and use owner-routed pause, resume, cancel,
   retry, and Batch controls as needed.
 - Treat starting a visible Shell, downloading, deleting, plugin activation, and other mutations as

@@ -164,10 +164,13 @@ class OwnerForwardingTests(unittest.TestCase):
         self.assertEqual(events[0].kind, OwnerEventKind.ACCEPTED)
         self.assertEqual(events[0].payload["task_id"], "external-task")
 
-    def test_unselected_list_never_fabricates_a_task(self) -> None:
+    def test_unselected_list_forwards_all_selection_policy(self) -> None:
         events = []
+        calls = []
 
         def run_background(argv, cancellation, progress, on_accept):
+            calls.append(argv)
+            on_accept("batch-all", "batch")
             return 0
 
         request = OwnerRequest(
@@ -186,8 +189,10 @@ class OwnerForwardingTests(unittest.TestCase):
             owner_session_id="shell-session",
         )
 
-        self.assertEqual([event.kind for event in events], [OwnerEventKind.OWNER_DISCONNECTED])
-        self.assertNotIn("task_id", events[0].payload)
+        self.assertIn("--selection-policy", calls[0])
+        self.assertEqual(calls[0][calls[0].index("--selection-policy") + 1], "all")
+        self.assertEqual(events[0].kind, OwnerEventKind.ACCEPTED)
+        self.assertEqual(events[0].payload["task_id"], "batch-all")
 
 
 if __name__ == "__main__":

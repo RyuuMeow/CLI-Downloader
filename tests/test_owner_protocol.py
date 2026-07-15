@@ -66,13 +66,26 @@ class OwnerRequestTests(unittest.TestCase):
                 "profile": "pixiv-default",
                 "strategy": "torrent",
                 "select": ("item-1",),
+                "selection_policy": "explicit",
                 "force": True,
             }
         )
         restored = OwnerRequest.from_bytes(request.to_bytes())
         self.assertEqual(restored.payload["profile"], "pixiv-default")
         self.assertEqual(restored.payload["strategy"], "torrent")
+        self.assertEqual(restored.payload["selection_policy"], "explicit")
         self.assertTrue(restored.payload["force"])
+
+    def test_download_request_rejects_invalid_selection_policy(self) -> None:
+        with self.assertRaises(ContractValidationError) as context:
+            download_request(
+                payload={
+                    "url": "https://example.test/list",
+                    "selection_policy": "guess",
+                }
+            )
+
+        self.assertEqual(context.exception.code, "invalid_value")
 
     def test_request_rejects_raw_process_and_secret_values(self) -> None:
         for field in ("shell_command", "python", "cookies", "password"):

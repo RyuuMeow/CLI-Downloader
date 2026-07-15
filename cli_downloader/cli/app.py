@@ -34,6 +34,7 @@ from cli_downloader.cli._output import (
 )
 from cli_downloader.cli._download_ops import (
     AcceptanceSink,
+    ListSelectionPolicy,
     _batch_details,
     _run_batch_retry,
     _run_generic_download,
@@ -186,7 +187,14 @@ def _forward_download_to_shell(args: argparse.Namespace) -> int | None:
 
     response_mode = OwnerResponseMode.DETACH if args.detach else OwnerResponseMode.WAIT
     session_id = f"cli-{uuid4().hex}"
-    payload: dict[str, object] = {"url": args.url, "force": bool(args.force)}
+    selection_policy = (
+        ListSelectionPolicy.EXPLICIT.value if args.select else args.selection_policy
+    )
+    payload: dict[str, object] = {
+        "url": args.url,
+        "force": bool(args.force),
+        "selection_policy": selection_policy,
+    }
     for name in ("profile", "strategy"):
         value = getattr(args, name, None)
         if value is not None:
@@ -556,7 +564,13 @@ def build_parser() -> argparse.ArgumentParser:
         action="append",
         default=[],
         metavar="ITEM_ID",
-        help="Confirm a list item for batch download. Can be repeated.",
+        help="Restrict a list Batch to this item ID. Can be repeated; omitted means all returned items.",
+    )
+    download_parser.add_argument(
+        "--selection-policy",
+        choices=tuple(policy.value for policy in ListSelectionPolicy),
+        default=ListSelectionPolicy.ALL.value,
+        help=argparse.SUPPRESS,
     )
     download_parser.add_argument(
         "--force",
@@ -966,6 +980,11 @@ def main(
                     profile=args.profile,
                     strategy=args.strategy,
                     selected_item_ids=tuple(args.select),
+                    selection_policy=(
+                        ListSelectionPolicy.EXPLICIT
+                        if args.select
+                        else ListSelectionPolicy(args.selection_policy)
+                    ),
                     force=args.force,
                     cancellation=cancellation,
                     progress=progress,

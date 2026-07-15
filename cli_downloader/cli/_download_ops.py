@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import json
 from collections.abc import Callable, Mapping, Sequence
+from enum import Enum
 from threading import Event
 from uuid import uuid4
 
@@ -72,6 +73,14 @@ from cli_downloader.storage.task_store import TaskRecord, TaskStatus
 
 
 AcceptanceSink = Callable[[str, str], None]
+
+
+class ListSelectionPolicy(str, Enum):
+    """Choose how a command-line list result becomes a Batch."""
+
+    ALL = "all"
+    EXPLICIT = "explicit"
+    INTERACTIVE = "interactive"
 
 
 def _build_download_limiter(
@@ -330,6 +339,7 @@ def _run_generic_download(
     profile: str | None = None,
     strategy: str | None = None,
     selected_item_ids: tuple[str, ...] = (),
+    selection_policy: ListSelectionPolicy = ListSelectionPolicy.INTERACTIVE,
     force: bool = False,
     cancellation: Event | None = None,
     progress: ProgressSink | None = None,
@@ -411,6 +421,25 @@ def _run_generic_download(
             return _run_confirmed_list_batch(
                 result,
                 selected_item_ids,
+                source_url=url,
+                runtime=runtime,
+                render_mode=render_mode,
+                profile=profile,
+                force=force,
+                cancellation=cancellation,
+                progress=progress,
+                download_limiter=download_limiter,
+                on_accept=on_accept,
+            )
+        if selection_policy is ListSelectionPolicy.EXPLICIT:
+            return _print_batch_selection_error(
+                "At least one gallery must be selected.",
+                render_mode,
+            )
+        if selection_policy is ListSelectionPolicy.ALL:
+            return _run_confirmed_list_batch(
+                result,
+                tuple(item.item_id for item in data.items),
                 source_url=url,
                 runtime=runtime,
                 render_mode=render_mode,

@@ -64,7 +64,7 @@ Read [references/cli-operations.md](references/cli-operations.md) for exact task
 2. Run `download <url> --dry-run --json` to verify plugin routing and planned operation.
 3. If no plugin handles the URL, report that result and offer the plugin-creation workflow.
 4. If the plan is valid, run the live `download` command only when the user has authorized the download and its expected network and file writes.
-5. For list results, inspect candidates first and pass explicit repeated `--select <item-id>` values. Never guess a bulk selection.
+5. A live list or Batch URL without `--select` downloads every item returned by the operation. Inspect the dry-run result and obtain explicit authorization for that whole Batch; use repeated `--select <item-id>` values when the user wants only a subset.
 6. Read the resulting task ID from output, then verify it with `tasks show <task-id>` or `tasks list --json`.
 
 ## Create a website plugin
