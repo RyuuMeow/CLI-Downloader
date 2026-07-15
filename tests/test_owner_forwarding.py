@@ -134,6 +134,36 @@ class OwnerForwardingTests(unittest.TestCase):
                     self.assertEqual(len(terminal), 1)
                     self.assertEqual(terminal[0].payload["task_id"], f"{kind}-task")
 
+    def test_external_download_notifies_tasks_after_durable_acceptance(self) -> None:
+        events = []
+        notifications: list[str] = []
+
+        def run_background(argv, cancellation, progress, on_accept):
+            on_accept("external-task", "item")
+            return 0
+
+        request = OwnerRequest(
+            OWNER_PROTOCOL_VERSION,
+            "request-refresh",
+            OwnerSource.CLI,
+            OwnerCommand.DOWNLOAD,
+            OwnerResponseMode.DETACH,
+            {"url": "https://example.test/gallery/refresh"},
+            "client-session",
+        )
+
+        _handle_owner_download(
+            request,
+            events.append,
+            run_background=run_background,
+            owner_session_id="shell-session",
+            notify_tasks=lambda: notifications.append("refresh"),
+        )
+
+        self.assertEqual(notifications, ["refresh"])
+        self.assertEqual(events[0].kind, OwnerEventKind.ACCEPTED)
+        self.assertEqual(events[0].payload["task_id"], "external-task")
+
     def test_unselected_list_never_fabricates_a_task(self) -> None:
         events = []
 

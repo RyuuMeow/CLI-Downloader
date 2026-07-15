@@ -1320,6 +1320,33 @@ class TextualShellAppTest(IsolatedAsyncioTestCase):
                 str(app.query_one("#task-detail", Static).content),
             )
 
+    async def test_external_task_acceptance_refreshes_the_tasks_list(self) -> None:
+        tasks: list[TaskNode] = []
+        service = SimpleNamespace(list_roots=lambda: tuple(tasks))
+        shell = InteractiveShell(task_service_loader=lambda: service)
+        app = TextualShellApp(shell)
+
+        async with app.run_test() as pilot:
+            app.query_one(TabbedContent).active = "tasks"
+            await pilot.pause()
+            table = app.query_one("#task-table", DataTable)
+            self.assertEqual(table.row_count, 0)
+
+            tasks.append(
+                TaskNode(
+                    "external-task",
+                    TaskKind.ITEM,
+                    TaskState.QUEUED,
+                    "Externally submitted",
+                    TaskProgress(0, 1),
+                )
+            )
+            await asyncio.to_thread(shell.notify_external_tasks)
+            await pilot.pause()
+
+            self.assertEqual(table.row_count, 1)
+            self.assertIn("Externally submitted", str(table.get_row_at(0)[2]))
+
     async def test_unified_task_explorer_drills_into_batch_items_and_files(self) -> None:
         batch = TaskNode(
             "batch-1",

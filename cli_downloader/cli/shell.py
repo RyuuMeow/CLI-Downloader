@@ -258,7 +258,7 @@ class InteractiveShell:
     def set_external_refresh_callback(self, callback: Callable[[], None] | None) -> None:
         self._external_refresh_callback = callback
 
-    def notify_external_control(self) -> None:
+    def notify_external_tasks(self) -> None:
         callback = self._external_refresh_callback
         if callback is not None:
             callback()

@@ -329,7 +329,7 @@ def _build_interactive_shell_impl(
                 run_background=run_background,
                 owner_session_id=owner_session_id,
                 task_service_loader=load_task_service,
-                notify_control=shell.notify_external_control,
+                notify_tasks=shell.notify_external_tasks,
                 is_shutting_down=shutdown_requested.is_set,
             ),
         )
@@ -401,7 +401,7 @@ def _handle_owner_request(
     run_background: Callable[..., int],
     owner_session_id: str,
     task_service_loader: Callable[[], TaskHierarchyService],
-    notify_control: Callable[[], None] | None = None,
+    notify_tasks: Callable[[], None] | None = None,
     is_shutting_down: Callable[[], bool] | None = None,
 ) -> None:
     """Run one externally submitted download inside the Shell owner.
@@ -420,7 +420,7 @@ def _handle_owner_request(
             run_background=run_background,
             owner_session_id=owner_session_id,
             task_service=task_service_loader(),
-            notify_control=notify_control,
+            notify_tasks=notify_tasks,
         )
         return
     if request.command is not OwnerCommand.DOWNLOAD:
@@ -430,6 +430,7 @@ def _handle_owner_request(
         emit,
         run_background=run_background,
         owner_session_id=owner_session_id,
+        notify_tasks=notify_tasks,
     )
 
 
@@ -439,6 +440,7 @@ def _handle_owner_download(
     *,
     run_background: Callable[..., int],
     owner_session_id: str,
+    notify_tasks: Callable[[], None] | None = None,
 ) -> None:
     payload = dict(request.payload)
     url = payload.get("url")
@@ -484,6 +486,13 @@ def _handle_owner_download(
         if accepted.is_set():
             return
         accepted_task.update({"task_id": task_id, "task_kind": task_kind})
+        if notify_tasks is not None:
+            try:
+                notify_tasks()
+            except Exception:
+                # The durable Task remains authoritative if the UI is already
+                # shutting down or cannot accept a cross-thread refresh.
+                pass
         if push(
             lambda current: OwnerResponseEvent.accepted(
                 request.request_id,
@@ -610,7 +619,7 @@ def _handle_owner_control(
     run_background: Callable[..., int],
     owner_session_id: str,
     task_service: TaskHierarchyService,
-    notify_control: Callable[[], None] | None = None,
+    notify_tasks: Callable[[], None] | None = None,
 ) -> None:
     payload = dict(request.payload)
     task_id = payload.get("task_id")
@@ -710,8 +719,8 @@ def _handle_owner_control(
                 result={**serialised, "output": output.getvalue()} if isinstance(serialised, dict) else {"value": serialised},
             )
         )
-        if notify_control is not None:
-            notify_control()
+        if notify_tasks is not None:
+            notify_tasks()
     except Exception as error:
         emit(
             OwnerResponseEvent.terminal(
