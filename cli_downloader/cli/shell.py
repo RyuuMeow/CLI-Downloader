@@ -1017,6 +1017,7 @@ class TextualShellApp(App[int]):
             # id settles (notably during test mounts and fast startup).  Finish
             # one layout turn after the explicit request.
             self.call_after_refresh(self._prepare_tasks_tab)
+            self._schedule_task_column_resize()
         elif active_tab == "console" and self._task_tab_request_pending:
             # A TabbedContent mount can emit a stale Console event after the
             # caller already requested Tasks.  Keep the explicit request until
@@ -1042,6 +1043,7 @@ class TextualShellApp(App[int]):
             self._task_tab_request_pending = False
         self.refresh(layout=True)
         self._resize_task_columns()
+        self._schedule_task_column_resize()
         if self._task_nodes:
             self._task_focus_pending = True
             self.query_one("#task-table", DataTable).focus()
@@ -3014,6 +3016,14 @@ class TextualShellApp(App[int]):
         )
         table.refresh(layout=True)
 
+    def _schedule_task_column_resize(self) -> None:
+        """Resize after the Tasks pane and its scrollbars finish layout."""
+
+        self.call_after_refresh(
+            self.call_after_refresh,
+            self._resize_task_columns,
+        )
+
     def _resize_plugin_columns(self) -> None:
         if not hasattr(self, "_plugin_column_keys"):
             return
@@ -3169,6 +3179,7 @@ class TextualShellApp(App[int]):
         if layout_signature != self._task_layout_signature:
             self._task_layout_signature = layout_signature
             self._resize_task_columns()
+            self._schedule_task_column_resize()
         if level == "roots":
             self._active_batch_id = None
             self._active_batch_name = None

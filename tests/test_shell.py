@@ -745,7 +745,24 @@ class TextualShellAppTest(IsolatedAsyncioTestCase):
                     )
 
     async def test_tasks_table_fills_viewport_and_scrolls_only_when_narrow(self) -> None:
-        app = TextualShellApp(InteractiveShell(runtime=build_example_runtime()))
+        tasks = tuple(
+            TaskNode(
+                f"task-{index}",
+                TaskKind.ITEM,
+                TaskState.COMPLETED,
+                f"Task {index}",
+                TaskProgress(1, 1),
+                site_id="example",
+            )
+            for index in range(40)
+        )
+        service = SimpleNamespace(list_roots=lambda: tasks)
+        app = TextualShellApp(
+            InteractiveShell(
+                runtime=build_example_runtime(),
+                task_service_loader=lambda: service,
+            )
+        )
 
         async with app.run_test(size=(120, 30)) as pilot:
             await pilot.pause()
@@ -754,8 +771,6 @@ class TextualShellAppTest(IsolatedAsyncioTestCase):
                 await pilot.pause()
             table = app.query_one("#task-table", DataTable)
 
-            app._resize_task_columns()
-            await pilot.pause()
             wide_viewport = table.scrollable_content_region.width
             wide_rendered = sum(
                 column.get_render_width(table) for column in table.columns.values()
