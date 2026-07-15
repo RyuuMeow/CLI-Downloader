@@ -543,22 +543,23 @@ class TextualShellApp(App[int]):
                     id="command-row",
                 )
             with TabPane("Tasks", id="tasks"):
-                yield Horizontal(
-                    Static("Tasks", id="task-path"),
-                    Static("", id="task-page-status"),
-                    Button("←", id="task-back", disabled=True),
-                    Button("◀", id="task-page-prev", disabled=True),
-                    Button("▶", id="task-page-next", disabled=True),
-                    Button("↗", id="task-source", disabled=True),
-                    Button("▤", id="task-folder", disabled=True),
-                    Button("‖", id="task-pause", disabled=True),
-                    Button("▶", id="task-resume", disabled=True),
-                    Button("■", id="task-cancel", disabled=True),
-                    Button("↺", id="task-retry", disabled=True),
-                    Button("✕", id="task-delete", disabled=True),
-                    Button("↻", id="refresh-tasks"),
-                    id="task-toolbar",
-                )
+                with Vertical(id="task-toolbar"):
+                    with Horizontal(id="task-navigation"):
+                        yield Static("Tasks", id="task-path")
+                        yield Static("", id="task-page-status")
+                        yield Button("←", id="task-back", disabled=True)
+                        yield Button("◀", id="task-page-prev", disabled=True)
+                        yield Button("▶", id="task-page-next", disabled=True)
+                    with Horizontal(id="task-actions"):
+                        yield Static("", id="task-action-spacer")
+                        yield Button("↗", id="task-source", disabled=True)
+                        yield Button("▤", id="task-folder", disabled=True)
+                        yield Button("‖", id="task-pause", disabled=True)
+                        yield Button("▶", id="task-resume", disabled=True)
+                        yield Button("■", id="task-cancel", disabled=True)
+                        yield Button("↺", id="task-retry", disabled=True)
+                        yield Button("✕", id="task-delete", disabled=True)
+                        yield Button("↻", id="refresh-tasks")
                 yield DataTable(id="task-table", classes="activity-table", cursor_type="row")
                 yield DataTable(
                     id="task-file-table",

@@ -1139,6 +1139,57 @@ class TextualShellAppTest(IsolatedAsyncioTestCase):
             self.assertEqual(app.query_one(TabbedContent).active, "console")
             self.assertTrue(app.query_one("#shell-input", Input).has_focus)
 
+    async def test_task_hierarchy_and_controls_remain_visible_in_narrow_shell(self) -> None:
+        task = TaskNode(
+            "task-visible",
+            TaskKind.BATCH,
+            TaskState.RUNNING,
+            "Visible task",
+            TaskProgress(0, 1),
+            site_id="example",
+        )
+        child = TaskNode(
+            "child-visible",
+            TaskKind.ITEM,
+            TaskState.QUEUED,
+            "Visible child",
+            TaskProgress(0, 1),
+            parent_id=task.task_id,
+            site_id="example",
+        )
+        service = SimpleNamespace(
+            list_roots=lambda: (task,),
+            list_children=lambda _task_id: (child,),
+        )
+        app = TextualShellApp(InteractiveShell(task_service_loader=lambda: service))
+
+        async with app.run_test(size=(80, 30)) as pilot:
+            app.query_one(TabbedContent).active = "tasks"
+            await pilot.pause()
+
+            toolbar = app.query_one("#task-toolbar")
+            task_path = app.query_one("#task-path", Static)
+            pause = app.query_one("#task-pause", Button)
+            refresh = app.query_one("#refresh-tasks", Button)
+
+            self.assertTrue(toolbar.display)
+            self.assertGreater(toolbar.region.height, 0)
+            self.assertGreater(task_path.region.width, 0)
+            self.assertGreater(pause.region.width, 0)
+            self.assertGreater(refresh.region.width, 0)
+            self.assertLess(refresh.region.right, app.screen.region.right + 1)
+
+            app.query_one("#task-table", DataTable).focus()
+            await pilot.press("enter")
+            await pilot.pause()
+
+            back = app.query_one("#task-back", Button)
+            next_page = app.query_one("#task-page-next", Button)
+            self.assertTrue(back.display)
+            self.assertTrue(next_page.display)
+            self.assertGreater(back.region.width, 0)
+            self.assertLess(next_page.region.right, app.screen.region.right + 1)
+
     async def test_task_dynamic_labels_follow_selected_language(self) -> None:
         task = TaskNode(
             "task-zh",

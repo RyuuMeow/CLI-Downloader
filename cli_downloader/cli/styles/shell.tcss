@@ -39,8 +39,11 @@ Button:hover, Button:focus { color: #ffaa55; border: solid #e58a32; }
 .activity-refresh { width: auto; margin-bottom: 1; }
 .activity-table { height: 1fr; }
 .activity-detail { height: 2fr; padding: 1; overflow-y: auto; }
-#task-toolbar { height: 3; }
+#task-toolbar { height: 6; }
+#task-navigation, #task-actions { height: 3; }
 #task-path { width: 1fr; padding: 1; color: #999999; }
+#task-page-status { width: auto; padding: 1; color: #999999; }
+#task-action-spacer { width: 1fr; }
 #task-toolbar Button { width: 5; min-width: 5; margin-left: 1; }
 #task-detail { height: auto; min-height: 4; padding: 1; }
 #operation-host { height: 1fr; overflow-y: auto; }
