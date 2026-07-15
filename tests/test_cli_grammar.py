@@ -41,3 +41,8 @@ class CliGrammarTest(TestCase):
 
         with self.assertRaises(SystemExit):
             parser.parse_args(["download", "https://example.test/item", "--detach", "--wait"])
+
+    def test_task_pause_uses_positional_task_id(self) -> None:
+        args = build_parser().parse_args(["tasks", "pause", "task-1", "--json"])
+        self.assertEqual(args.task_id, "task-1")
+        self.assertTrue(args.json)

@@ -179,6 +179,8 @@ def _forward_download_to_shell(args: argparse.Namespace) -> int | None:
     metadata = snapshot.metadata
     if metadata is None or metadata.owner_mode is not OwnerMode.SHELL:
         return None
+    if snapshot.kind not in {ShellStatusKind.READY, ShellStatusKind.RECOVERING}:
+        return None
     if metadata.lifecycle_state not in {OwnerLifecycleState.READY, OwnerLifecycleState.RECOVERING}:
         return None
 
@@ -249,6 +251,67 @@ def _forward_download_to_shell(args: argparse.Namespace) -> int | None:
         print(json.dumps(dict(terminal.payload), ensure_ascii=False))
     else:
         print(f"Shell download {terminal.payload.get('status', 'finished')}")
+    exit_code = terminal.payload.get("exit_code")
+    return int(exit_code) if isinstance(exit_code, int) else 0
+
+
+def _forward_task_control_to_shell(
+    task_id: str,
+    action: str,
+    *,
+    json_output: bool,
+) -> int | None:
+    """Forward one live Task control to the current Shell owner."""
+
+    environment = diagnose_environment()
+    scope = OwnerScope.from_app_paths(environment.paths)
+    snapshot = ShellController(scope).status()
+    metadata = snapshot.metadata
+    if metadata is None or metadata.owner_mode is not OwnerMode.SHELL:
+        return None
+    if snapshot.kind not in {ShellStatusKind.READY, ShellStatusKind.RECOVERING}:
+        return None
+    if metadata.lifecycle_state not in {OwnerLifecycleState.READY, OwnerLifecycleState.RECOVERING}:
+        return None
+    session_id = f"cli-{uuid4().hex}"
+    request = OwnerRequest(
+        protocol_version=OWNER_PROTOCOL_VERSION,
+        request_id=uuid4().hex,
+        source=OwnerSource.CLI,
+        command=OwnerCommand.TASK_CONTROL,
+        response_mode=OwnerResponseMode.WAIT,
+        payload={"task_id": task_id, "action": action},
+        client_session_id=session_id,
+    )
+    handshake = OwnerHandshake(
+        protocol_version=OWNER_PROTOCOL_VERSION,
+        session_id=session_id,
+        mode=OwnerMode.FOREGROUND,
+        application_version=__version__,
+        capabilities=("task_control",),
+        required_capabilities=("task_control",),
+    )
+    try:
+        events = OwnerPipeClient(scope).request(request, handshake=handshake)
+    except OwnerTransportError as error:
+        _emit_owner_error(error, json_output=json_output)
+        return 1
+    terminal = next((event for event in events if event.kind is OwnerEventKind.TERMINAL), None)
+    if terminal is None:
+        _emit_owner_error(
+            OwnerTransportError("owner disconnected before control acknowledgement"),
+            json_output=json_output,
+        )
+        return 1
+    result = terminal.payload.get("result")
+    if json_output:
+        print(json.dumps(dict(result) if isinstance(result, dict) else dict(terminal.payload), ensure_ascii=False))
+    elif isinstance(result, dict) and isinstance(result.get("output"), str) and result["output"]:
+        sys.stdout.write(result["output"])
+        if not result["output"].endswith("\n"):
+            sys.stdout.write("\n")
+    else:
+        print(f"Task {task_id}: {action} acknowledged")
     exit_code = terminal.payload.get("exit_code")
     return int(exit_code) if isinstance(exit_code, int) else 0
 
@@ -606,6 +669,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     tasks_resume_parser.add_argument("task_id")
     tasks_resume_parser.add_argument("--json", action="store_true")
+    tasks_pause_parser = tasks_subparsers.add_parser(
+        "pause",
+        help="Pause an Item or Batch task through the active owner.",
+    )
+    tasks_pause_parser.add_argument("task_id")
+    tasks_pause_parser.add_argument("--json", action="store_true")
     tasks_show_parser = tasks_subparsers.add_parser(
         "show",
         help="Show user-facing details for one Item or Batch.",
@@ -974,6 +1043,14 @@ def main(
                 print(json.dumps(_batch_details(store, args.parent_id), indent=2))
                 return 0
             if args.batches_command == "retry":
+                if not _owner_claimed:
+                    forwarded = _forward_task_control_to_shell(
+                        args.parent_id,
+                        "retry",
+                        json_output=getattr(args, "json", False),
+                    )
+                    if forwarded is not None:
+                        return forwarded
                 with _owned_execution(owner_claimed=_owner_claimed):
                     return _run_batch_retry(
                         args.parent_id,
@@ -990,6 +1067,14 @@ def main(
                         progress=progress,
                     )
             if args.batches_command == "resume":
+                if not _owner_claimed:
+                    forwarded = _forward_task_control_to_shell(
+                        args.parent_id,
+                        "resume",
+                        json_output=getattr(args, "json", False),
+                    )
+                    if forwarded is not None:
+                        return forwarded
                 with _owned_execution(owner_claimed=_owner_claimed):
                     return _run_batch_retry(
                         args.parent_id,
@@ -1022,6 +1107,18 @@ def main(
                 return 0
         service = _build_task_hierarchy_service()
         task_id = getattr(args, "task_id", None)
+        if (
+            task_id
+            and args.tasks_command in {"pause", "resume", "retry", "cancel", "hard-retry"}
+            and not _owner_claimed
+        ):
+            forwarded = _forward_task_control_to_shell(
+                task_id,
+                "hard-retry" if args.tasks_command == "hard-retry" else args.tasks_command,
+                json_output=getattr(args, "json", False),
+            )
+            if forwarded is not None:
+                return forwarded
         if args.tasks_command in {None, "list"}:
             nodes = service.list_roots()
             if task_id:
@@ -1081,6 +1178,17 @@ def main(
                 confirmed=args.yes,
                 json_output=getattr(args, "json", False),
             )
+        if args.tasks_command == "pause":
+            if not task_id:
+                print(json.dumps({"error": "positional TASK_ID is required"}))
+                return 2
+            try:
+                result = service.pause(task_id)
+            except CLIDownloaderError as error:
+                print(json.dumps({"error": str(error)}, indent=2))
+                return 1
+            print(json.dumps(result.to_dict() if hasattr(result, "to_dict") else {"task_id": task_id, "action": "pause"}, indent=2))
+            return 0
         if not task_id:
             print(json.dumps({"error": "positional TASK_ID is required"}))
             return 2

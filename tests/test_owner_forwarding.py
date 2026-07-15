@@ -1,7 +1,7 @@
 import unittest
 from itertools import product
 
-from cli_downloader.cli._shell_wiring import _handle_owner_download
+from cli_downloader.cli._shell_wiring import _handle_owner_control, _handle_owner_download
 from cli_downloader.core.owner_protocol import (
     OWNER_PROTOCOL_VERSION,
     OwnerCommand,
@@ -10,9 +10,88 @@ from cli_downloader.core.owner_protocol import (
     OwnerResponseMode,
     OwnerSource,
 )
+from cli_downloader.core.task_tree import TaskKind, TaskNode, TaskProgress, TaskState
 
 
 class OwnerForwardingTests(unittest.TestCase):
+    def test_task_control_returns_acceptance_control_and_terminal(self) -> None:
+        events = []
+
+        class FakeTaskService:
+            def get(self, task_id):
+                return TaskNode(
+                    task_id=task_id,
+                    kind=TaskKind.ITEM,
+                    state=TaskState.RUNNING,
+                    title="fixture",
+                    progress=TaskProgress(),
+                )
+
+            def pause(self, task_id):
+                return {"task_id": task_id, "status": "paused"}
+
+        request = OwnerRequest(
+            OWNER_PROTOCOL_VERSION,
+            "control-request",
+            OwnerSource.CLI,
+            OwnerCommand.TASK_CONTROL,
+            OwnerResponseMode.WAIT,
+            {"task_id": "task-1", "action": "pause"},
+            "client-session",
+        )
+        _handle_owner_control(
+            request,
+            events.append,
+            run_background=lambda *_args: 0,
+            owner_session_id="shell-session",
+            task_service=FakeTaskService(),
+        )
+
+        self.assertEqual(
+            [event.kind for event in events],
+            [OwnerEventKind.ACCEPTED, OwnerEventKind.CONTROL, OwnerEventKind.TERMINAL],
+        )
+        self.assertTrue(events[1].payload["acknowledged"])
+        self.assertEqual(events[2].payload["status"], "completed")
+
+    def test_batch_resume_uses_owner_background_runner(self) -> None:
+        events = []
+        calls = []
+
+        class FakeBatchService:
+            def get(self, task_id):
+                return TaskNode(
+                    task_id=task_id,
+                    kind=TaskKind.BATCH,
+                    state=TaskState.PAUSED,
+                    title="fixture batch",
+                    progress=TaskProgress(),
+                )
+
+        def run_background(argv, cancellation, progress, on_accept):
+            calls.append(tuple(argv))
+            return 0
+
+        request = OwnerRequest(
+            OWNER_PROTOCOL_VERSION,
+            "batch-control-request",
+            OwnerSource.CLI,
+            OwnerCommand.TASK_CONTROL,
+            OwnerResponseMode.WAIT,
+            {"task_id": "batch-1", "action": "resume"},
+            "client-session",
+        )
+        _handle_owner_control(
+            request,
+            events.append,
+            run_background=run_background,
+            owner_session_id="shell-session",
+            task_service=FakeBatchService(),
+        )
+
+        self.assertEqual(calls, [("batches", "resume", "batch-1", "--json")])
+        self.assertEqual(events[-1].payload["status"], "completed")
+
     def test_shell_owner_matrix_keeps_one_task_id_per_request(self) -> None:
         for response_mode, kind in product(
             (OwnerResponseMode.WAIT, OwnerResponseMode.DETACH),

@@ -257,11 +257,13 @@ def _build_interactive_shell_impl(
                 application_version=__version__,
                 capabilities=("download", "task_query", "task_control", "history_query", "shell_status"),
             ),
-            handler=lambda request, emit: _handle_owner_download(
+            handler=lambda request, emit: _handle_owner_request(
                 request,
                 emit,
                 run_background=run_background,
                 owner_session_id=owner_session_id,
+                task_service_loader=load_task_service,
+                notify_control=shell.notify_external_control,
             ),
         )
         owner_server.start()
@@ -323,12 +325,14 @@ def _load_shell_operation(
     return (entry.plugin_id if entry is not None else "unknown", result)
 
 
-def _handle_owner_download(
+def _handle_owner_request(
     request: OwnerRequest,
     emit: Callable[[OwnerResponseEvent], None],
     *,
     run_background: Callable[..., int],
     owner_session_id: str,
+    task_service_loader: Callable[[], TaskHierarchyService],
+    notify_control: Callable[[], None] | None = None,
 ) -> None:
     """Run one externally submitted download inside the Shell owner.
 
@@ -337,8 +341,33 @@ def _handle_owner_download(
     continues the same background execution and durable task lifecycle.
     """
 
+    if request.command is OwnerCommand.TASK_CONTROL:
+        _handle_owner_control(
+            request,
+            emit,
+            run_background=run_background,
+            owner_session_id=owner_session_id,
+            task_service=task_service_loader(),
+            notify_control=notify_control,
+        )
+        return
     if request.command is not OwnerCommand.DOWNLOAD:
         raise ValueError(f"unsupported owner command: {request.command.value}")
+    _handle_owner_download(
+        request,
+        emit,
+        run_background=run_background,
+        owner_session_id=owner_session_id,
+    )
+
+
+def _handle_owner_download(
+    request: OwnerRequest,
+    emit: Callable[[OwnerResponseEvent], None],
+    *,
+    run_background: Callable[..., int],
+    owner_session_id: str,
+) -> None:
     payload = dict(request.payload)
     url = payload.get("url")
     if not isinstance(url, str):
@@ -479,6 +508,128 @@ def _handle_owner_download(
             )
         )
         pipe_closed.set()
+
+
+def _handle_owner_control(
+    request: OwnerRequest,
+    emit: Callable[[OwnerResponseEvent], None],
+    *,
+    run_background: Callable[..., int],
+    owner_session_id: str,
+    task_service: TaskHierarchyService,
+    notify_control: Callable[[], None] | None = None,
+) -> None:
+    payload = dict(request.payload)
+    task_id = payload.get("task_id")
+    action = payload.get("action")
+    if not isinstance(task_id, str) or not isinstance(action, str):
+        raise ValueError("task control requires task_id and action")
+    node = task_service.get(task_id)
+    task_kind = node.kind.value
+    sequence = 1
+    emit(
+        OwnerResponseEvent.accepted(
+            request.request_id,
+            sequence,
+            owner_session_id=owner_session_id,
+            owner_pid=os.getpid(),
+            accepted_at=datetime.now(UTC),
+            task_id=task_id,
+            task_kind=task_kind,
+            queued=False,
+        )
+    )
+    sequence += 1
+    try:
+        output = StringIO()
+        result: object
+        exit_code = 0
+        if action in {"pause", "cancel"}:
+            result = getattr(task_service, action)(task_id)
+        elif action in {"resume", "retry", "hard-retry"} and task_kind == TaskKind.BATCH.value:
+            subcommand = "resume" if action == "resume" else "retry"
+            with redirect_stdout(output):
+                exit_code = run_background(
+                    ("batches", subcommand, task_id, "--json"),
+                    Event(),
+                    lambda _reason, _payload: None,
+                    None,
+                )
+            result = {"task_id": task_id, "action": action, "output": output.getvalue()}
+        elif action == "resume":
+            with redirect_stdout(output):
+                exit_code = run_background(
+                    ("tasks", "resume", task_id, "--json"),
+                    Event(),
+                    lambda _reason, _payload: None,
+                    None,
+                )
+            result = {"task_id": task_id, "action": action, "output": output.getvalue()}
+        elif action == "hard-retry":
+            with redirect_stdout(output):
+                exit_code = run_background(
+                    ("tasks", "hard-retry", task_id, "--json"),
+                    Event(),
+                    lambda _reason, _payload: None,
+                    None,
+                )
+            result = {"task_id": task_id, "action": action, "output": output.getvalue()}
+        else:
+            result = task_service.retry(task_id)
+        revision = None
+        record = getattr(result, "record", None)
+        if record is None:
+            store = getattr(task_service, "_task_store", None)
+            record = store.get(task_id) if store is not None else None
+        if record is not None:
+            revision = getattr(record, "revision", None)
+        if hasattr(result, "to_dict"):
+            serialised = result.to_dict()
+        elif isinstance(result, Mapping):
+            serialised = dict(result)
+        else:
+            serialised = {"task_id": task_id, "action": action, "acknowledged": bool(result)}
+        emit(
+            OwnerResponseEvent.control(
+                request.request_id,
+                sequence,
+                task_id=task_id,
+                action=action,
+                acknowledged=exit_code == 0,
+                desired_control=(
+                    "pause"
+                    if action == "pause"
+                    else "cancel"
+                    if action == "cancel"
+                    else "run"
+                ),
+                revision=revision if isinstance(revision, int) and revision > 0 else None,
+            )
+        )
+        sequence += 1
+        emit(
+            OwnerResponseEvent.terminal(
+                request.request_id,
+                sequence,
+                status=OwnerTerminalStatus.COMPLETED if exit_code == 0 else OwnerTerminalStatus.FAILED,
+                task_id=task_id,
+                exit_code=exit_code,
+                result={**serialised, "output": output.getvalue()} if isinstance(serialised, dict) else {"value": serialised},
+            )
+        )
+        if notify_control is not None:
+            notify_control()
+    except Exception as error:
+        emit(
+            OwnerResponseEvent.terminal(
+                request.request_id,
+                sequence,
+                status=OwnerTerminalStatus.FAILED,
+                task_id=task_id,
+                exit_code=1,
+                error={"message": str(error)},
+            )
+        )
 
 def _recover_interrupted_downloads(
     task_store: StateTaskStore,

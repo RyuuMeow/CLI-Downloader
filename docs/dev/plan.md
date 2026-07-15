@@ -2,7 +2,7 @@
 
 Updated: 2026-07-15
 
-This document contains active work only. Completed P2, P3, P4, P5-02 through P5-14, and P5-18 tasks
+This document contains active work only. Completed P2, P3, P4, P5-02 through P5-15, and P5-18 tasks
 have been removed. The application is not released, so compatibility with removed legacy
 databases, imports, layouts, commands, and CLI argument forms remains out of scope.
 
@@ -10,9 +10,8 @@ databases, imports, layouts, commands, and CLI argument forms remains out of sco
 
 | Order | Task | Status | Depends on |
 | --- | --- | --- | --- |
-| 1 | P5-15 Route Task Control Through The Scheduler Owner | Planned | P5-14 |
-| 2 | P5-16 Harden IPC Recovery, Security, And Packaging | Planned | P5-14, P5-15 |
-| 3 | P5-17 Add The Agent-Control Workflow And End-To-End Verification | Planned | P5-14 through P5-16 |
+| 1 | P5-16 Harden IPC Recovery, Security, And Packaging | Planned | P5-14, P5-15 |
+| 2 | P5-17 Add The Agent-Control Workflow And End-To-End Verification | Planned | P5-14 through P5-16 |
 
 ## Direction And Boundaries
 
@@ -62,41 +61,22 @@ databases, imports, layouts, commands, and CLI argument forms remains out of sco
 - Added protocol, transport, parser, and four-row Item/Batch × wait/detach tests, plus duplicate
   Task-ID assertions. P5-15 will extend the same channel to task controls and richer Shell refresh.
 
-## P5-15 Route Task Control Through The Scheduler Owner
+## Completed P5-15 Route Task Control Through The Scheduler Owner
 
-### Status
-
-Planned.
-
-### Scope
-
-- Route live `tasks pause`, `tasks resume`, `tasks cancel`, `tasks retry`, `tasks hard-retry`,
-  `batches resume`, and `batches retry` through the ready owner whenever one exists.
-- Add any missing positional Task control commands needed by the Agent workflow while preserving
-  the rule that resource IDs follow an explicit action.
-- Keep read-only `tasks list/show`, `history`, `batches show`, config, and diagnostics safe to run
-  in separate processes against persisted state. They may query owner status for fresher context
-  but do not need ownership.
-- Resolve Item and Batch control inside the owner using the shared hierarchy, execution
-  coordinator, Scheduler, and torrent-control services. Clients may not instantiate replacement
-  pipelines for an owner-controlled Task.
-- Make control requests idempotent and return the resulting persisted revision, desired control,
-  acknowledged state, owner session, and structured conflict information.
-- Refresh the Shell Tasks view immediately after external acceptance or control acknowledgement;
-  retain periodic persistence refresh as recovery rather than the primary notification mechanism.
-- Foreground owners expose control for their active Task but reject unrelated detached submissions.
-  If no owner exists, controls that only change durable non-running state may execute locally;
-  controls that start work must first acquire ownership.
-
-### Acceptance Criteria
-
-- An Agent can submit, inspect, pause, resume, cancel, retry, and observe one Task without touching
-  SQLite directly or constructing a second Scheduler.
-- Item, Batch parent, Batch child, direct, and torrent controls preserve the existing lifecycle and
-  desired-control rules.
-- Competing control requests resolve through revisions and deterministic conflict responses rather
-  than order-dependent duplicated actions.
-- Shell UI state and external JSON results converge on the same persisted Task projection.
+- Added owner `TASK_CONTROL` dispatch for `pause`, `resume`, `cancel`, `retry`, and `hard-retry`,
+  plus Batch `resume`/`retry`. External commands keep positional Task IDs; `tasks pause TASK_ID`
+  is now available and read-only commands remain local.
+- The Shell resolves controls through its shared `TaskHierarchyService`. Item resume and hard retry
+  reuse the existing owner-owned CLI flow, while Batch resume/retry reuse the persisted Batch
+  pipeline. No replacement Scheduler or download pipeline is created by the client.
+- Control responses now contain ordered acceptance, control acknowledgement, persisted revision when
+  available, desired control, owner session/PID, and a terminal result. Owner request caching replays
+  completed responses for duplicate request IDs without invoking the handler twice.
+- Textual Shell registers an external-control refresh callback, so Tasks projections are refreshed
+  immediately after an owner acknowledgement while the existing periodic refresh remains recovery.
+- Added Item and Batch control tests, parser coverage, owner transport duplicate replay coverage,
+  and local fallback behavior. Named Pipe ACL, crash-safe request persistence, and multi-process
+  reconnect hardening remain in P5-16.
 
 ## P5-16 Harden IPC Recovery, Security, And Packaging
 

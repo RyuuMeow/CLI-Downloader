@@ -140,6 +140,73 @@ class OwnerPipeTransportTests(unittest.TestCase):
             self.assertEqual(len(events), 1)
             self.assertEqual(events[0].kind.value, "accepted")
 
+    def test_duplicate_request_replays_cached_events_without_reinvoking_handler(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            scope = OwnerScope.from_data_root(directory)
+            calls = []
+
+            def handler(request, emit):
+                calls.append(request.request_id)
+                emit(
+                    OwnerResponseEvent.accepted(
+                        request.request_id,
+                        1,
+                        owner_session_id="owner-session",
+                        accepted_at=datetime.now(UTC),
+                        task_id="task-1",
+                        task_kind="item",
+                    )
+                )
+                emit(
+                    OwnerResponseEvent.terminal(
+                        request.request_id,
+                        2,
+                        status=OwnerTerminalStatus.COMPLETED,
+                        task_id="task-1",
+                        exit_code=0,
+                    )
+                )
+
+            server = OwnerPipeServer(
+                scope,
+                handshake=OwnerHandshake(
+                    OWNER_PROTOCOL_VERSION,
+                    "owner-session",
+                    OwnerMode.SHELL,
+                    "0.1.5",
+                    ("download",),
+                ),
+                handler=handler,
+            )
+            server.start()
+            try:
+                session = "client-session"
+                request = OwnerRequest(
+                    OWNER_PROTOCOL_VERSION,
+                    "duplicate-request",
+                    OwnerSource.CLI,
+                    OwnerCommand.DOWNLOAD,
+                    OwnerResponseMode.WAIT,
+                    {"url": "https://example.test/gallery/1"},
+                    session,
+                )
+                handshake = OwnerHandshake(
+                    OWNER_PROTOCOL_VERSION,
+                    session,
+                    OwnerMode.FOREGROUND,
+                    "0.1.5",
+                    ("download",),
+                    ("download",),
+                )
+                first = OwnerPipeClient(scope).request(request, handshake=handshake)
+                second = OwnerPipeClient(scope).request(request, handshake=handshake)
+            finally:
+                server.stop()
+
+            self.assertEqual(len(calls), 1)
+            self.assertEqual([event.kind.value for event in first], ["accepted", "terminal"])
+            self.assertEqual([event.kind.value for event in second], ["accepted", "terminal"])
+
 
 if __name__ == "__main__":
     unittest.main()

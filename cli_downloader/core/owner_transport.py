@@ -25,6 +25,8 @@ from cli_downloader.core.owner_protocol import (
     OwnerResponseEvent,
     OwnerResponseMode,
     OwnerResponseStream,
+    OwnerRequestLedger,
+    RequestDisposition,
     negotiate_handshake,
 )
 from cli_downloader.core.owner_scope import OwnerScope
@@ -88,6 +90,9 @@ class OwnerPipeServer:
         self._stop = Event()
         self._thread: Thread | None = None
         self._connection_threads: list[Thread] = []
+        self.ledger = OwnerRequestLedger()
+        self._response_cache: dict[str, tuple[OwnerResponseEvent, ...]] = {}
+        self._response_lock = Lock()
 
     @property
     def running(self) -> bool:
@@ -166,13 +171,39 @@ class OwnerPipeServer:
             request = OwnerRequest.from_bytes(connection.recv_bytes())
             if client_handshake.session_id != request.client_session_id:
                 raise OwnerTransportError("request session does not match handshake session")
+            registration = self.ledger.register(request)
+            if registration.disposition is RequestDisposition.CONFLICT:
+                raise OwnerTransportError("request_id is already used with a different payload")
+            if registration.disposition is RequestDisposition.DUPLICATE:
+                cached = self._response_cache.get(request.request_id, ())
+                if not cached:
+                    raise OwnerTransportError("request is already in progress; inspect by Task ID")
+                for event in cached:
+                    send(event.to_bytes())
+                return
             stream = OwnerResponseStream(request.request_id)
+            response_events: list[OwnerResponseEvent] = []
 
             def emit(event: OwnerResponseEvent) -> None:
                 stream.push(event)
+                response_events.append(event)
+                if event.kind.value == "accepted":
+                    task_id = event.payload.get("task_id")
+                    self.ledger.mark_accepted(
+                        event.request_id,
+                        task_id=task_id if isinstance(task_id, str) else None,
+                    )
+                elif event.kind.value == "terminal":
+                    status = event.payload.get("status")
+                    if isinstance(status, str):
+                        from cli_downloader.core.owner_protocol import OwnerTerminalStatus
+
+                        self.ledger.mark_terminal(event.request_id, status=OwnerTerminalStatus(status))
                 send(event.to_bytes())
 
             self.handler(request, emit)
+            with self._response_lock:
+                self._response_cache[request.request_id] = tuple(response_events)
         except Exception as error:  # endpoint failures must not take down Shell
             try:
                 send(

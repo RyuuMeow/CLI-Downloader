@@ -227,6 +227,7 @@ class InteractiveShell:
         self._task_service_loader = task_service_loader
         self._operation_runner = operation_runner
         self._batch_selection_runner = batch_selection_runner
+        self._external_refresh_callback: Callable[[], None] | None = None
         self._settings_registry = settings_registry or SettingsRegistry()
         self._config_loader = config_loader
         self._translator = TranslationService()
@@ -248,6 +249,14 @@ class InteractiveShell:
 
     def set_language(self, language: str) -> None:
         self._translator = TranslationService(language)
+
+    def set_external_refresh_callback(self, callback: Callable[[], None] | None) -> None:
+        self._external_refresh_callback = callback
+
+    def notify_external_control(self) -> None:
+        callback = self._external_refresh_callback
+        if callback is not None:
+            callback()
 
     def run_batch_selection(
         self,
@@ -433,6 +442,7 @@ class TextualShellApp(App[int]):
         self.register_theme(CLI_DOWNLOADER_THEME)
         self.theme = CLI_DOWNLOADER_THEME.name
         self._shell = shell
+        shell.set_external_refresh_callback(lambda: self.call_from_thread(self._refresh_tasks))
         self._history: list[str] = []
         self._history_index = 0
         self._command_blocks: list[ShellCommandBlock] = []
