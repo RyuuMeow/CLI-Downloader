@@ -2,7 +2,7 @@
 
 Updated: 2026-07-15
 
-This document contains active work only. Completed P2, P3, P4, and P5-02 through P5-11 tasks
+This document contains active work only. Completed P2, P3, P4, and P5-02 through P5-12 tasks
 have been removed. The application is not released, so compatibility with removed legacy
 databases, imports, layouts, commands, and CLI argument forms remains out of scope.
 
@@ -10,13 +10,12 @@ databases, imports, layouts, commands, and CLI argument forms remains out of sco
 
 | Order | Task | Status | Depends on |
 | --- | --- | --- | --- |
-| 1 | P5-12 Enforce One Download Owner Across Processes | Planned | P5-11 |
-| 2 | P5-13 Add Shell Status, Start, And Ensure Commands | Planned | P5-12 |
-| 3 | P5-18 Scale Tasks UI And Batch Projections | Planned | - |
-| 4 | P5-14 Forward Download Requests With Wait And Detach Modes | Planned | P5-12, P5-13, P5-18 |
-| 5 | P5-15 Route Task Control Through The Scheduler Owner | Planned | P5-14 |
-| 6 | P5-16 Harden IPC Recovery, Security, And Packaging | Planned | P5-12 through P5-15 |
-| 7 | P5-17 Add The Agent-Control Workflow And End-To-End Verification | Planned | P5-13 through P5-16 |
+| 1 | P5-13 Add Shell Status, Start, And Ensure Commands | Planned | P5-12 |
+| 2 | P5-18 Scale Tasks UI And Batch Projections | Planned | - |
+| 3 | P5-14 Forward Download Requests With Wait And Detach Modes | Planned | P5-13, P5-18 |
+| 4 | P5-15 Route Task Control Through The Scheduler Owner | Planned | P5-14 |
+| 5 | P5-16 Harden IPC Recovery, Security, And Packaging | Planned | P5-13 through P5-15 |
+| 6 | P5-17 Add The Agent-Control Workflow And End-To-End Verification | Planned | P5-13 through P5-16 |
 
 ## Direction And Boundaries
 
@@ -48,51 +47,6 @@ databases, imports, layouts, commands, and CLI argument forms remains out of sco
   download timeout.
 - Tasks list projections are read models, not full execution graphs. A Batch row must not expand
   all children, assets, attempts, or filesystem state merely to render summary progress.
-
-## P5-12 Enforce One Download Owner Across Processes
-
-### Status
-
-Planned.
-
-### Scope
-
-- Add an OS-released ownership lock so only one process can construct live download workers,
-  Batch pipelines, torrent monitoring, and the process-wide Scheduler for one user data root.
-- Derive one canonical owner scope from the resolved user data root. Normalise the absolute Windows
-  path, case, separators, trailing separators, and resolvable junction or symlink identity before
-  hashing it; do not use the executable or current working directory as the ownership boundary.
-- Use the same product namespace, current-user identity, data-root fingerprint, and protocol
-  generation to derive the OS lock, discovery record, and IPC endpoint identity. Never let those
-  three resources disagree about which store an owner controls.
-- Require ownership before live `download`, Item resume, Batch resume or retry, startup recovery,
-  or any operation that starts executable download work. Planning and read-only inspection do not
-  claim ownership.
-- Make the Shell acquire ownership before recovery. It must finish stale-lease reconciliation and
-  plugin/runtime setup before publishing `ready` or accepting mutating commands.
-- Let a Shell owner host the full command service. Let a foreground owner publish status and task
-  control capability while rejecting detached submissions and additional download work.
-- Persist only non-secret owner discovery metadata such as mode, PID, process start identity,
-  protocol version, application version, endpoint identity, and readiness state. Treat the OS lock
-  and live handshake as authoritative; stale metadata alone never proves an owner is alive.
-- A second Shell must not run recovery or build another Scheduler. It reports the existing owner
-  and exits cleanly; a future focus-existing-window action remains optional.
-- Keep every Task run claim and `active_run_id` check inside the existing durable execution
-  coordinator. The process lock protects the Scheduler boundary but does not replace per-Task
-  generation and revision checks.
-
-### Acceptance Criteria
-
-- Concurrent process tests prove that only one contender becomes owner and that a crashed process
-  releases ownership without manual cleanup.
-- Two Installer, Portable, or source runtimes resolving the same data root intentionally contend
-  for one owner scope. Runtimes resolving different data roots receive independent scopes even
-  when launched by the same Windows user.
-- Starting a Shell while a foreground download owns execution does not start a second Scheduler.
-- Two distinct `clid` processes cannot bypass global or per-site limits by constructing independent
-  pipelines.
-- Existing single-process Shell and foreground-download behavior remains functional after all live
-  execution paths require ownership.
 
 ## P5-13 Add Shell Status, Start, And Ensure Commands
 

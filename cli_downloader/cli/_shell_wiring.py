@@ -33,6 +33,15 @@ from cli_downloader.core.batch import (
     DownloadChildStatus,
 )
 from cli_downloader.core.environment import diagnose_environment
+from cli_downloader.core.owner_protocol import OwnerLifecycleState, OwnerMode
+from cli_downloader.core.owner_scope import (
+    OwnerDiscoveryMetadata,
+    OwnerLease,
+    OwnerManager,
+    OwnerScope,
+    new_owner_session_id,
+)
+from cli_downloader.core.errors import OwnerScopeMismatchError
 from cli_downloader.core.operations import OperationResult
 from cli_downloader.core.task_tree import TaskKind
 from cli_downloader.integrations.browser_login import BrowserLoginService
@@ -43,6 +52,7 @@ from cli_downloader.storage.state_database import StateDatabase
 from cli_downloader.storage.state_history_store import StateHistoryStore
 from cli_downloader.storage.state_task_store import StateTaskStore
 from cli_downloader.storage.task_store import TaskDesiredControl, TaskStatus
+from cli_downloader.about import __version__
 
 
 def build_interactive_shell(
@@ -54,6 +64,66 @@ def build_interactive_shell(
         [Sequence[str], object, ProgressSink, GalleryDownloadLimiter], int
     ],
     operation_runner: Callable[[str, Mapping[str, object]], object] | None = None,
+    owner_lease: OwnerLease | None = None,
+) -> int:
+    """Claim the Scheduler owner before recovery and run the visible Shell."""
+
+    environment = diagnose_environment()
+    scope = OwnerScope.from_app_paths(environment.paths)
+    session_id = new_owner_session_id()
+    owns_lease = owner_lease is None
+    lease = owner_lease
+    if lease is None:
+        metadata = OwnerDiscoveryMetadata.for_current_process(
+            scope,
+            application_version=__version__,
+            owner_mode=OwnerMode.SHELL,
+            lifecycle_state=OwnerLifecycleState.RECOVERING,
+            session_id=session_id,
+            capabilities=("download", "task_control", "task_query", "history_query", "shell_status"),
+        )
+        lease = OwnerManager(scope).acquire(metadata)
+    elif lease.scope != scope:
+        raise OwnerScopeMismatchError("owner lease belongs to a different data-root scope")
+
+    assert lease is not None
+    try:
+        return _build_interactive_shell_impl(
+            runtime=runtime,
+            plugins_dir=plugins_dir,
+            runner=runner,
+            background_runner=background_runner,
+            operation_runner=operation_runner,
+            owner_lease=lease,
+            owner_session_id=session_id,
+        )
+    finally:
+        if owns_lease:
+            stopping = OwnerDiscoveryMetadata.for_current_process(
+                scope,
+                application_version=__version__,
+                owner_mode=OwnerMode.SHELL,
+                lifecycle_state=OwnerLifecycleState.STOPPING,
+                session_id=session_id,
+                capabilities=("download", "task_control", "task_query", "history_query", "shell_status"),
+            )
+            try:
+                lease.publish(stopping)
+            finally:
+                lease.release()
+
+
+def _build_interactive_shell_impl(
+    *,
+    runtime: ApplicationRuntime,
+    plugins_dir: Path,
+    runner: Callable[[Sequence[str]], int],
+    background_runner: Callable[
+        [Sequence[str], object, ProgressSink, GalleryDownloadLimiter], int
+    ],
+    operation_runner: Callable[[str, Mapping[str, object]], object] | None = None,
+    owner_lease: OwnerLease | None = None,
+    owner_session_id: str | None = None,
 ) -> int:
     """Build and run the interactive shell for an already-loaded runtime."""
 
@@ -73,6 +143,19 @@ def build_interactive_shell(
     batch_store = StateBatchStore(StateDatabase(layout.state_db))
     history_store = StateHistoryStore(StateDatabase(layout.state_db))
     startup_commands = _recover_interrupted_downloads(task_store, batch_store, history_store)
+    if owner_lease is not None:
+        ready_scope = owner_lease.scope
+        ready_session = owner_session_id or new_owner_session_id()
+        owner_lease.publish(
+            OwnerDiscoveryMetadata.for_current_process(
+                ready_scope,
+                application_version=__version__,
+                owner_mode=OwnerMode.SHELL,
+                lifecycle_state=OwnerLifecycleState.READY,
+                session_id=ready_session,
+                capabilities=("download", "task_control", "task_query", "history_query", "shell_status"),
+            )
+        )
     browser_login = BrowserLoginService(
         profile_root=environment.paths.cache_dir / "browser-auth"
     )

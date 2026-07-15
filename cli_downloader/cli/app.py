@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+from contextlib import contextmanager, nullcontext
 from collections.abc import Sequence
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
@@ -50,7 +51,7 @@ from cli_downloader.cli.textual_renderer import render_interactive_result
 from cli_downloader.config.loader import ConfigLoader
 from cli_downloader.core.environment import diagnose_environment, installed_plugins_root
 from cli_downloader.about import __version__
-from cli_downloader.core.errors import CLIDownloaderError
+from cli_downloader.core.errors import CLIDownloaderError, OwnerError
 from cli_downloader.core.events import TaskEvent
 from cli_downloader.core.history_records import DownloadHistoryRecord
 from cli_downloader.core.batch import (
@@ -58,6 +59,13 @@ from cli_downloader.core.batch import (
     BatchEntryStatus,
 )
 from cli_downloader.core.task_tree import TaskState
+from cli_downloader.core.owner_protocol import OwnerLifecycleState, OwnerMode
+from cli_downloader.core.owner_scope import (
+    OwnerDiscoveryMetadata,
+    OwnerManager,
+    OwnerScope,
+    new_owner_session_id,
+)
 from cli_downloader.core.operations import (
     ListPageData,
     ResultKind,
@@ -87,6 +95,40 @@ _route_url_through_manifests = _inspect_ops.route_url_through_manifests
 _with_default_strategy = _inspect_ops.with_default_strategy
 _recover_interrupted_downloads = _shell_wiring._recover_interrupted_downloads
 build_interactive_shell = _shell_wiring.build_interactive_shell
+
+
+@contextmanager
+def _owned_execution(*, owner_claimed: bool, owner_mode: OwnerMode = OwnerMode.FOREGROUND):
+    """Claim the process-wide execution scope for a live foreground action."""
+
+    if owner_claimed:
+        with nullcontext():
+            yield
+        return
+
+    environment = diagnose_environment()
+    scope = OwnerScope.from_app_paths(environment.paths)
+    metadata = OwnerDiscoveryMetadata.for_current_process(
+        scope,
+        application_version=__version__,
+        owner_mode=owner_mode,
+        lifecycle_state=OwnerLifecycleState.BUSY,
+        session_id=new_owner_session_id(),
+        capabilities=("download", "task_control", "task_query", "history_query"),
+    )
+    with OwnerManager(scope).acquire(metadata):
+        yield
+
+
+def _emit_owner_error(error: OwnerError, *, json_output: bool) -> None:
+    payload = {
+        "error": str(error),
+        "code": getattr(error, "code", "owner_error"),
+    }
+    if json_output:
+        print(json.dumps(payload, indent=2))
+    else:
+        print(f"Owner error [{payload['code']}]: {payload['error']}")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -469,6 +511,7 @@ def main(
     cancellation: Event | None = None,
     progress: ProgressSink | None = None,
     download_limiter: GalleryDownloadLimiter | None = None,
+    _owner_claimed: bool = False,
 ) -> int:
     if argv is None:
         import sys
@@ -525,13 +568,18 @@ def main(
         return build_interactive_shell(
             runtime=shell_runtime,
             plugins_dir=plugins_dir,
-            runner=lambda shell_argv: main(shell_argv, runtime=shell_runtime),
+            runner=lambda shell_argv: main(
+                shell_argv,
+                runtime=shell_runtime,
+                _owner_claimed=True,
+            ),
             background_runner=lambda shell_argv, cancellation, progress, download_limiter: main(
                 shell_argv,
                 runtime=shell_runtime,
                 cancellation=cancellation,
                 progress=progress,
                 download_limiter=download_limiter,
+                _owner_claimed=True,
             ),
         )
 
@@ -587,20 +635,25 @@ def main(
             result["render_mode"] = render_mode.value
             print(json.dumps(result, indent=None if render_mode is RenderMode.JSON else 2))
             return 0 if result["matched"] else 1
-        return _run_generic_download(
-            args.url,
-            runtime=get_runtime(),
-            render_mode=render_mode,
-            profile=args.profile,
-            strategy=args.strategy,
-            selected_item_ids=tuple(args.select),
-            force=args.force,
-            cancellation=cancellation,
-            progress=progress,
-            download_limiter=download_limiter,
-            task_id=None,
-            interactive_renderer=render_interactive_result,
-        )
+        try:
+            with _owned_execution(owner_claimed=_owner_claimed):
+                return _run_generic_download(
+                    args.url,
+                    runtime=get_runtime(),
+                    render_mode=render_mode,
+                    profile=args.profile,
+                    strategy=args.strategy,
+                    selected_item_ids=tuple(args.select),
+                    force=args.force,
+                    cancellation=cancellation,
+                    progress=progress,
+                    download_limiter=download_limiter,
+                    task_id=None,
+                    interactive_renderer=render_interactive_result,
+                )
+        except OwnerError as error:
+            _emit_owner_error(error, json_output=args.json)
+            return 1
 
     if args.command == "operation":
         render_mode = select_render_mode(json_requested=args.json)
@@ -669,36 +722,41 @@ def main(
                 print(json.dumps(_batch_details(store, args.parent_id), indent=2))
                 return 0
             if args.batches_command == "retry":
-                return _run_batch_retry(
-                    args.parent_id,
-                    runtime=get_runtime(),
-                    store=store,
-                    layout=layout,
-                    render_mode=render_mode,
-                    config=ConfigLoader(
-                        paths=environment.paths,
-                        registry=get_runtime().settings_registry,
-                    ).load(),
-                    profile=args.profile,
-                    cancellation=cancellation,
-                    progress=progress,
-                )
+                with _owned_execution(owner_claimed=_owner_claimed):
+                    return _run_batch_retry(
+                        args.parent_id,
+                        runtime=get_runtime(),
+                        store=store,
+                        layout=layout,
+                        render_mode=render_mode,
+                        config=ConfigLoader(
+                            paths=environment.paths,
+                            registry=get_runtime().settings_registry,
+                        ).load(),
+                        profile=args.profile,
+                        cancellation=cancellation,
+                        progress=progress,
+                    )
             if args.batches_command == "resume":
-                return _run_batch_retry(
-                    args.parent_id,
-                    runtime=get_runtime(),
-                    store=store,
-                    layout=layout,
-                    render_mode=render_mode,
-                    config=ConfigLoader(
-                        paths=environment.paths,
-                        registry=get_runtime().settings_registry,
-                    ).load(),
-                    profile=args.profile,
-                    cancellation=cancellation,
-                    progress=progress,
-                    resume=True,
-                )
+                with _owned_execution(owner_claimed=_owner_claimed):
+                    return _run_batch_retry(
+                        args.parent_id,
+                        runtime=get_runtime(),
+                        store=store,
+                        layout=layout,
+                        render_mode=render_mode,
+                        config=ConfigLoader(
+                            paths=environment.paths,
+                            registry=get_runtime().settings_registry,
+                        ).load(),
+                        profile=args.profile,
+                        cancellation=cancellation,
+                        progress=progress,
+                        resume=True,
+                    )
+        except OwnerError as error:
+            _emit_owner_error(error, json_output=getattr(args, "json", False))
+            return 1
         except CLIDownloaderError as error:
             print(json.dumps({"error": str(error)}, indent=2))
             return 1
@@ -752,12 +810,17 @@ def main(
             if not task_id:
                 print(json.dumps({"error": "positional TASK_ID is required"}))
                 return 2
-            return _hard_retry_task(
-                task_id,
-                site_registry=get_runtime().site_registry,
-                runtime=get_runtime(),
-                json_output=getattr(args, "json", False),
-            )
+            try:
+                with _owned_execution(owner_claimed=_owner_claimed):
+                    return _hard_retry_task(
+                        task_id,
+                        site_registry=get_runtime().site_registry,
+                        runtime=get_runtime(),
+                        json_output=getattr(args, "json", False),
+                    )
+            except OwnerError as error:
+                _emit_owner_error(error, json_output=getattr(args, "json", False))
+                return 1
         if args.tasks_command == "cancel":
             return _cancel_tasks(
                 service,
@@ -769,33 +832,43 @@ def main(
         if not task_id:
             print(json.dumps({"error": "positional TASK_ID is required"}))
             return 2
-        task_store = _build_task_store()
-        lifecycle = TaskLifecycleService(task_store=task_store)
         try:
-            if args.tasks_command == "retry":
-                result = lifecycle.retry(task_id)
-            elif args.tasks_command == "resume":
-                result = lifecycle.resume(task_id)
-            else:
-                parser.print_help()
+            owner_context = (
+                _owned_execution(owner_claimed=_owner_claimed)
+                if args.tasks_command == "resume"
+                else nullcontext()
+            )
+            with owner_context:
+                task_store = _build_task_store()
+                lifecycle = TaskLifecycleService(task_store=task_store)
+                try:
+                    if args.tasks_command == "retry":
+                        result = lifecycle.retry(task_id)
+                    elif args.tasks_command == "resume":
+                        result = lifecycle.resume(task_id)
+                    else:
+                        parser.print_help()
+                        return 0
+                except CLIDownloaderError as error:
+                    print(json.dumps({"error": str(error)}, indent=2))
+                    return 1
+                if args.tasks_command == "resume":
+                    record = task_store.get(task_id)
+                    if record is not None and record.kind.value == "item" and record.source_url:
+                        return _run_generic_download(
+                            record.source_url,
+                            runtime=get_runtime(),
+                            render_mode=RenderMode.JSON
+                            if getattr(args, "json", False)
+                            else RenderMode.PLAIN,
+                            download_limiter=download_limiter,
+                            task_id=task_id,
+                        )
+                print(json.dumps(result.to_dict(), indent=2))
                 return 0
-        except CLIDownloaderError as error:
-            print(json.dumps({"error": str(error)}, indent=2))
+        except OwnerError as error:
+            _emit_owner_error(error, json_output=getattr(args, "json", False))
             return 1
-        if args.tasks_command == "resume":
-            record = task_store.get(task_id)
-            if record is not None and record.kind.value == "item" and record.source_url:
-                return _run_generic_download(
-                    record.source_url,
-                    runtime=get_runtime(),
-                    render_mode=RenderMode.JSON
-                    if getattr(args, "json", False)
-                    else RenderMode.PLAIN,
-                    download_limiter=download_limiter,
-                    task_id=task_id,
-                )
-        print(json.dumps(result.to_dict(), indent=2))
-        return 0
 
     if args.command == "history":
         env = diagnose_environment()
