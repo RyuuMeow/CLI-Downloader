@@ -2976,33 +2976,42 @@ class TextualShellApp(App[int]):
             return
         table = self.query_one("#task-table", DataTable)
 
-        # Use screen width since table might not be laid out yet when switching tabs
-        total_width = self.size.width - 2
-        if total_width <= 0:
+        viewport_width = table.scrollable_content_region.width
+        if viewport_width <= 0:
+            # The Tasks pane is mounted lazily. Recalculate from its actual
+            # viewport after activation; this fallback only covers first mount.
+            viewport_width = self.size.width - 2
+        if viewport_width <= 0:
             return
 
-        other_width = 0
-        # DataTable columns have 2 chars padding by default
-        padding = 2 * len(self._task_column_keys)
+        row_label_width = getattr(table, "_row_label_column_width", 0)
+        padding = 2 * table.cell_padding * len(self._task_column_keys)
+        available = max(0, viewport_width - row_label_width - padding)
 
+        fixed_widths: dict[str, int] = {}
         for name, key in self._task_column_keys.items():
             if name == "name":
                 continue
 
             column = table.columns[key]
-            column.auto_width = True
-            column.width = None
             label_len = (
                 len(column.label.plain)
                 if hasattr(column.label, "plain")
                 else len(str(column.label))
             )
-            other_width += max(column.content_width, label_len)
+            fixed_widths[name] = max(column.content_width, label_len)
+            column.auto_width = False
+            column.width = fixed_widths[name]
 
         name_col = table.columns[self._task_column_keys["name"]]
         name_col.auto_width = False
-        name_col.width = max(8, total_width - other_width - padding)
+        name_col.width = max(8, available - sum(fixed_widths.values()))
 
+        table.virtual_size = Size(
+            row_label_width
+            + sum(column.get_render_width(table) for column in table.columns.values()),
+            table.virtual_size.height,
+        )
         table.refresh(layout=True)
 
     def _resize_plugin_columns(self) -> None:

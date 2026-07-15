@@ -37,7 +37,7 @@ Button { background: #222222; color: #e8e8e8; border: solid #3a3a3a; }
 Button:hover, Button:focus { color: #ffaa55; border: solid #e58a32; }
 #operation-status { height: 1; padding: 0 1; color: #999999; }
 .activity-refresh { width: auto; margin-bottom: 1; }
-.activity-table { height: 1fr; }
+.activity-table { height: 1fr; overflow-x: auto; overflow-y: auto; }
 .activity-detail { height: 2fr; padding: 1; overflow-y: auto; }
 #task-toolbar { height: 3; }
 #task-path { width: 1fr; padding: 1; color: #999999; }

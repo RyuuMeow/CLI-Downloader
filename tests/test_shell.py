@@ -744,6 +744,35 @@ class TextualShellAppTest(IsolatedAsyncioTestCase):
                         _PLUGIN_STATUS_MIN_WIDTH,
                     )
 
+    async def test_tasks_table_fills_viewport_and_scrolls_only_when_narrow(self) -> None:
+        app = TextualShellApp(InteractiveShell(runtime=build_example_runtime()))
+
+        async with app.run_test(size=(120, 30)) as pilot:
+            await pilot.pause()
+            app.query_one(TabbedContent).active = "tasks"
+            for _ in range(2):
+                await pilot.pause()
+            table = app.query_one("#task-table", DataTable)
+
+            app._resize_task_columns()
+            await pilot.pause()
+            wide_viewport = table.scrollable_content_region.width
+            wide_rendered = sum(
+                column.get_render_width(table) for column in table.columns.values()
+            )
+            self.assertEqual(wide_rendered, wide_viewport)
+
+            await pilot.resize_terminal(45, 30)
+            await pilot.pause()
+            app._resize_task_columns()
+            await pilot.pause()
+            narrow_viewport = table.scrollable_content_region.width
+            narrow_rendered = sum(
+                column.get_render_width(table) for column in table.columns.values()
+            )
+            self.assertGreater(narrow_rendered, narrow_viewport)
+            self.assertGreater(table.virtual_size.width, narrow_viewport)
+
     async def test_embedded_example_list_retains_state_paginates_and_downloads(self) -> None:
         runtime = build_example_runtime()
         dispatcher = OperationDispatcher(runtime)
