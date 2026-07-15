@@ -140,6 +140,31 @@ class _FinishedBatchPipeline:
 
 
 class TaskHierarchyServiceTest(TestCase):
+    def test_available_folder_uses_item_metadata_and_bounded_batch_assets(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            tasks = StateTaskStore(root / "state.sqlite3")
+            batches = StateBatchStore(root / "state.sqlite3")
+            tasks.upsert(
+                TaskRecord(
+                    "item-1",
+                    TaskStatus.COMPLETED,
+                    kind=TaskKind.ITEM,
+                    metadata={"output_files": ["downloads/item-1/001.jpg"]},
+                )
+            )
+            entry = _entry("entry-1")
+            batches.create_batch(BatchParent("batch-1", (entry.entry_id,)), (entry,))
+            _attach_partial(batches, entry)
+            service = TaskHierarchyService(task_store=tasks, batch_store=batches)
+
+            self.assertEqual(
+                service.get_available_folder("item-1"),
+                str(Path("downloads") / "item-1"),
+            )
+            self.assertEqual(service.get_available_folder("entry-1"), "output")
+            self.assertEqual(service.get_available_folder("batch-1"), "output")
+
     def test_large_batch_root_projection_does_not_materialise_children(self) -> None:
         class GuardBatchStore(ProductionStateBatchStore):
             def list_entries(self, _parent_id):

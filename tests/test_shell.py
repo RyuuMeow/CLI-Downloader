@@ -42,6 +42,7 @@ from cli_downloader.core.task_tree import (
     TaskKind,
     TaskNode,
     TaskProgress,
+    TaskRootSummary,
     TaskState,
 )
 from tests.example_site import build_example_runtime
@@ -1205,6 +1206,77 @@ class TextualShellAppTest(IsolatedAsyncioTestCase):
             self.assertTrue(app.query_one("#task-source", Button).disabled)
             self.assertTrue(app.query_one("#task-folder", Button).disabled)
             self.assertTrue(app.query_one("#task-detail-actions").display)
+
+    async def test_root_item_folder_and_selection_are_restored_after_back(self) -> None:
+        task = TaskNode(
+            "item-root",
+            TaskKind.ITEM,
+            TaskState.COMPLETED,
+            "Root item",
+            TaskProgress(1, 1),
+            site_id="example",
+            source_url="https://example.test/item-root",
+        )
+
+        class Service:
+            def list_root_summaries(self):
+                return (
+                    TaskRootSummary(
+                        task.task_id,
+                        task.kind,
+                        task.state,
+                        task.title,
+                        task.progress,
+                        site_id=task.site_id,
+                        source_url=task.source_url,
+                    ),
+                )
+
+            def get(self, task_id):
+                self.assert_task(task_id)
+                return task
+
+            def list_files(self, task_id):
+                self.assert_task(task_id)
+                return ()
+
+            def get_available_folder(self, task_id):
+                self.assert_task(task_id)
+                return "downloads/item-root"
+
+            @staticmethod
+            def assert_task(task_id):
+                if task_id != task.task_id:
+                    raise TaskNotFoundError(task_id)
+
+        app = TextualShellApp(InteractiveShell(task_service_loader=Service))
+
+        async with app.run_test(size=(80, 30)) as pilot:
+            app.query_one(TabbedContent).active = "tasks"
+            for _ in range(20):
+                await pilot.pause()
+                if app.query_one("#task-table", DataTable).row_count == 1:
+                    break
+            table = app.query_one("#task-table", DataTable)
+            table.focus()
+            app._select_task(task.task_id)
+            self.assertFalse(app.query_one("#task-folder", Button).disabled)
+
+            await pilot.press("enter")
+            await pilot.pause()
+            self.assertEqual(app._task_level, "files")
+
+            await pilot.press("escape")
+            for _ in range(20):
+                await pilot.pause()
+                if app._task_level == "roots" and app._task_refresh_thread is None:
+                    break
+
+            self.assertEqual(app._active_task_id, task.task_id)
+            self.assertTrue(table.has_focus)
+            selected_key = tuple(str(key.value) for key in table.rows)[table.cursor_row]
+            self.assertEqual(selected_key, task.task_id)
+            self.assertFalse(app.query_one("#task-folder", Button).disabled)
 
     async def test_task_dynamic_labels_follow_selected_language(self) -> None:
         task = TaskNode(

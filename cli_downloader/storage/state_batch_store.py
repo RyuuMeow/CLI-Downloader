@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from dataclasses import replace
 from datetime import datetime
+from pathlib import Path
 
 from cli_downloader.core.batch import (
     AssetRecord,
@@ -187,6 +188,45 @@ class StateBatchStore:
             completed_bytes=int(byte_row[2] or 0),
             total_bytes=(int(byte_row[3] or 0) if asset_count > 0 and missing_total == 0 else None),
         )
+
+    def find_available_folder(self, task_id: str) -> str | None:
+        """Return one persisted output folder without materialising a Batch graph."""
+
+        with StateUnitOfWork(self._database) as unit_of_work:
+            row = unit_of_work.connection.execute(
+                """
+                SELECT
+                    json_extract(asset.payload_json, '$.final_path'),
+                    json_extract(asset.payload_json, '$.partial_path'),
+                    json_extract(
+                        asset.payload_json,
+                        '$.metadata.torrent_checkpoint.output_dir'
+                    )
+                FROM execution_assets AS asset
+                JOIN execution_children AS child ON child.child_id = asset.child_id
+                WHERE (child.task_id = ? OR child.entry_id = ?)
+                  AND COALESCE(
+                      NULLIF(json_extract(asset.payload_json, '$.final_path'), ''),
+                      NULLIF(json_extract(asset.payload_json, '$.partial_path'), ''),
+                      NULLIF(json_extract(
+                          asset.payload_json,
+                          '$.metadata.torrent_checkpoint.output_dir'
+                      ), '')
+                  ) IS NOT NULL
+                ORDER BY asset.rowid
+                LIMIT 1
+                """,
+                (task_id, task_id),
+            ).fetchone()
+        if row is None:
+            return None
+        final_path, partial_path, torrent_output_dir = row
+        file_path = final_path or partial_path
+        if isinstance(file_path, str) and file_path:
+            return str(Path(file_path).parent)
+        if isinstance(torrent_output_dir, str) and torrent_output_dir:
+            return torrent_output_dir
+        return None
 
     def list_child_summaries(
         self,

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Mapping
 
 from cli_downloader.application.batch_pipeline import BatchPipeline
@@ -167,6 +168,16 @@ class TaskHierarchyService:
                 return self._standalone_node(record)
             raise TaskNotFoundError(f"batch execution not found: {task_id}")
         raise TaskNotFoundError(f"task not found: {task_id}")
+
+    def get_available_folder(self, task_id: str) -> str | None:
+        """Resolve a persisted folder for one selected Task using bounded reads."""
+
+        record = self._task_store.get(task_id)
+        if record is not None and record.kind is TaskKind.ITEM:
+            folder = _folder_from_task_metadata(record.metadata)
+            if folder is not None:
+                return folder
+        return self._batch_store.find_available_folder(task_id)
 
     def list_files(self, task_id: str) -> tuple[TaskFileNode, ...]:
         entry = self._batch_store.get_entry(task_id)
@@ -775,6 +786,26 @@ def _uses_shared_state_stores(task_store: object, batch_store: object) -> bool:
         and isinstance(batch_store, StateBatchStore)
         and task_store.database.path == batch_store.database.path
     )
+
+
+def _folder_from_task_metadata(metadata: Mapping[str, object]) -> str | None:
+    output_files = metadata.get("output_files")
+    if isinstance(output_files, (list, tuple)):
+        path = next(
+            (value for value in output_files if isinstance(value, str) and value),
+            None,
+        )
+        if path is not None:
+            return str(Path(path).parent)
+    checkpoints = metadata.get("torrent_checkpoints")
+    if isinstance(checkpoints, Mapping):
+        for checkpoint in checkpoints.values():
+            if not isinstance(checkpoint, Mapping):
+                continue
+            output_dir = checkpoint.get("output_dir")
+            if isinstance(output_dir, str) and output_dir:
+                return output_dir
+    return None
 
 
 def _non_negative_int(value: object) -> int | None:

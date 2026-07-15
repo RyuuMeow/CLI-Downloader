@@ -3230,6 +3230,14 @@ class TextualShellApp(App[int]):
     def _set_task_actions(self, node: TaskNode | None = None) -> None:
         self._task_source_url = node.source_url if node is not None else None
         self._task_folder = _folder_for_task(node)
+        folder_resolver = getattr(self._task_service, "get_available_folder", None)
+        if node is not None and self._task_folder is None and callable(folder_resolver):
+            try:
+                self._task_folder = folder_resolver(node.task_id)
+            except Exception:
+                # Folder discovery is a contextual convenience. A stale Task
+                # or transient read failure must not break row selection.
+                self._task_folder = None
         task_id = node.task_id if node is not None else None
         if self._pending_task_delete != task_id:
             self._pending_task_delete = None
@@ -3566,15 +3574,21 @@ class TextualShellApp(App[int]):
                     page_offset=0,
                 )
         elif self._task_level in {"files", "items"} and service:
+            return_task_id = (
+                self._active_task_id
+                if self._task_level == "files" and self._active_batch_id is None
+                else None
+            )
             self._active_batch_id = None
             self._active_batch_name = None
             self._task_page_offset = 0
             self._task_focus_pending = True
             if callable(getattr(service, "list_root_summaries", None)):
                 self._task_level = "roots"
-                self._active_task_id = None
+                self._active_task_id = return_task_id
                 self._refresh_tasks()
             else:
+                self._active_task_id = return_task_id
                 self._show_task_nodes(tuple(reversed(service.list_roots())), level="roots")
 
 
