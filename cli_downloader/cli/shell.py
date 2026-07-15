@@ -214,6 +214,7 @@ class InteractiveShell:
         config_loader: ConfigLoader | None = None,
         url_opener: ExternalOpener | None = None,
         folder_opener: ExternalOpener | None = None,
+        file_opener: ExternalOpener | None = None,
         browser_auth_runner: BrowserAuthRunner | None = None,
         browser_auth_validator: BrowserAuthValidator | None = None,
         startup_commands: Sequence[Sequence[str]] = (),
@@ -235,6 +236,7 @@ class InteractiveShell:
         self._translator = TranslationService()
         self._url_opener = url_opener or _open_url
         self._folder_opener = folder_opener or _open_folder
+        self._file_opener = file_opener or _open_file
         self._browser_auth_runner = browser_auth_runner
         self._browser_auth_validator = browser_auth_validator
         self._startup_commands = tuple(tuple(command) for command in startup_commands)
@@ -491,6 +493,7 @@ class TextualShellApp(App[int]):
         self._active_batch_name: str | None = None
         self._task_source_url: str | None = None
         self._task_folder: str | None = None
+        self._task_file_path: str | None = None
         self._pending_task_delete: str | None = None
         self._operation_thread: Thread | None = None
         self._operation_cancel: Event | None = None
@@ -767,8 +770,12 @@ class TextualShellApp(App[int]):
                 column.label = Text(translator(translation_key))
             table.refresh(layout=True)
 
+        task_primary_is_file = self._task_level == "files"
         for button_id, translation_key in (
-            ("task-source", "tooltip.open_source"),
+            (
+                "task-source",
+                "tooltip.open_file" if task_primary_is_file else "tooltip.open_source",
+            ),
             ("task-folder", "tooltip.open_folder"),
             ("task-back", "tooltip.back"),
             ("task-pause", "tooltip.pause"),
@@ -784,7 +791,9 @@ class TextualShellApp(App[int]):
             ("copy-command", "tooltip.copy_latest"),
         ):
             self.query_one(f"#{button_id}", Button).tooltip = translator(translation_key)
-        self.query_one("#task-source", Button).label = translator("task.action.open_url")
+        self.query_one("#task-source", Button).label = translator(
+            "task.action.open_file" if task_primary_is_file else "task.action.open_url"
+        )
         self.query_one("#task-folder", Button).label = translator("task.action.open_folder")
 
         self.query_one("#shell-input", Input).placeholder = translator("common.command")
@@ -3228,7 +3237,12 @@ class TextualShellApp(App[int]):
         self._set_task_actions(node)
 
     def _set_task_actions(self, node: TaskNode | None = None) -> None:
-        self._task_source_url = node.source_url if node is not None else None
+        self._task_file_path = None
+        self._task_source_url = (
+            node.source_url
+            if node is not None and self._task_level != "files"
+            else None
+        )
         self._task_folder = _folder_for_task(node)
         folder_resolver = getattr(self._task_service, "get_available_folder", None)
         if node is not None and self._task_folder is None and callable(folder_resolver):
@@ -3248,19 +3262,15 @@ class TextualShellApp(App[int]):
             self._task_level,
             self._task_source_url,
             self._task_folder,
+            self._task_file_path,
             self._pending_task_delete,
         )
         if action_signature == self._task_action_signature:
             return
         self._task_action_signature = action_signature
-        source = self.query_one("#task-source", Button)
-        source.disabled = self._task_source_url is None
-        source.display = node is not None
-        folder = self.query_one("#task-folder", Button)
-        folder.disabled = self._task_folder is None
-        folder.display = node is not None
-        self.query_one("#task-detail-actions", Vertical).display = node is not None
+        self._update_task_detail_action_buttons(node is not None)
         allow_lifecycle_control = self._task_level == "roots"
+
         pause = self.query_one("#task-pause", Button)
         pause.disabled = state not in {
             TaskState.PREPARING,
@@ -3297,7 +3307,26 @@ class TextualShellApp(App[int]):
         delete.label = "OK" if self._pending_task_delete == task_id else "×"
         self.query_one("#refresh-tasks", Button).display = allow_lifecycle_control
 
+    def _update_task_detail_action_buttons(self, visible: bool) -> None:
+        source = self.query_one("#task-source", Button)
+        if self._task_level == "files":
+            source.label = self._shell.translator("task.action.open_file")
+            source.tooltip = self._shell.translator("tooltip.open_file")
+            source.disabled = self._task_file_path is None
+        else:
+            source.label = self._shell.translator("task.action.open_url")
+            source.tooltip = self._shell.translator("tooltip.open_source")
+            source.disabled = self._task_source_url is None
+        source.display = visible
+        folder = self.query_one("#task-folder", Button)
+        folder.disabled = self._task_folder is None
+        folder.display = visible
+        self.query_one("#task-detail-actions", Vertical).display = visible
+
     def _open_task_source(self) -> None:
+        if self._task_level == "files" and self._task_file_path is not None:
+            self._open_external(self._shell._file_opener, self._task_file_path, "file")
+            return
         if self._task_source_url is not None:
             self._open_external(self._shell._url_opener, self._task_source_url, "source")
 
@@ -3551,10 +3580,10 @@ class TextualShellApp(App[int]):
         self._task_folder = (
             str(Path(file.location).parent) if file.location is not None else None
         )
-        folder = self.query_one("#task-folder", Button)
-        folder.disabled = self._task_folder is None
-        folder.display = True
-        self.query_one("#task-detail-actions", Vertical).display = True
+        self._task_file_path = file.location
+        self._task_source_url = None
+        self._task_action_signature = None
+        self._update_task_detail_action_buttons(True)
 
     def _task_back(self) -> None:
         service = self._task_service
@@ -4166,4 +4195,11 @@ def _open_folder(folder: str) -> None:
     path = Path(folder).resolve()
     if not path.is_dir():
         raise OSError(f"folder does not exist: {path}")
+    os.startfile(path)
+
+
+def _open_file(file_path: str) -> None:
+    path = Path(file_path).resolve()
+    if not path.is_file():
+        raise OSError(f"file does not exist: {path}")
     os.startfile(path)

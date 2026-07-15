@@ -1380,11 +1380,13 @@ class TextualShellAppTest(IsolatedAsyncioTestCase):
         )
         opened_urls: list[str] = []
         opened_folders: list[str] = []
+        opened_files: list[str] = []
         app = TextualShellApp(
             InteractiveShell(
                 task_service_loader=lambda: service,
                 url_opener=opened_urls.append,
                 folder_opener=opened_folders.append,
+                file_opener=opened_files.append,
             )
         )
 
@@ -1405,8 +1407,9 @@ class TextualShellAppTest(IsolatedAsyncioTestCase):
             self.assertGreater(source_button.region.height, 0)
             self.assertEqual(source_button.label, "Open URL")
             self.assertEqual(folder_button.label, "Open Folder")
-            await pilot.click("#task-source")
-            await pilot.click("#task-folder")
+            source_button.press()
+            folder_button.press()
+            await pilot.pause()
             self.assertEqual(
                 opened_urls,
                 ["https://example.test/search"],
@@ -1431,8 +1434,9 @@ class TextualShellAppTest(IsolatedAsyncioTestCase):
             self.assertFalse(app.query_one("#task-page-prev", Button).display)
             self.assertFalse(app.query_one("#task-pause", Button).display)
             self.assertFalse(app.query_one("#refresh-tasks", Button).display)
-            self.assertFalse(source_button.disabled)
+            self.assertTrue(source_button.disabled)
             self.assertTrue(folder_button.disabled)
+            self.assertEqual(source_button.label, "Open File")
 
             await pilot.press("escape", "down", "enter")
             await pilot.pause()
@@ -1445,6 +1449,15 @@ class TextualShellAppTest(IsolatedAsyncioTestCase):
             self.assertIn("Downloader", detail)
             self.assertNotIn("Child", detail)
             self.assertNotIn("Asset", detail)
+            self.assertFalse(source_button.disabled)
+            self.assertFalse(folder_button.disabled)
+            self.assertEqual(source_button.label, "Open File")
+            source_button.press()
+            folder_button.press()
+            await pilot.pause()
+            self.assertEqual(opened_files, ["downloads/image-02.part"])
+            self.assertEqual(opened_folders, ["downloads", "downloads"])
+            self.assertEqual(opened_urls, ["https://example.test/search"])
 
             await pilot.press("escape", "escape", "escape")
             self.assertEqual(tabs.active, "console")
