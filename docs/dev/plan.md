@@ -2,7 +2,7 @@
 
 Updated: 2026-07-15
 
-This document contains active work only. Completed P2, P3, P4, and P5-02 through P5-12 tasks
+This document contains active work only. Completed P2, P3, P4, and P5-02 through P5-13 tasks
 have been removed. The application is not released, so compatibility with removed legacy
 databases, imports, layouts, commands, and CLI argument forms remains out of scope.
 
@@ -10,12 +10,11 @@ databases, imports, layouts, commands, and CLI argument forms remains out of sco
 
 | Order | Task | Status | Depends on |
 | --- | --- | --- | --- |
-| 1 | P5-13 Add Shell Status, Start, And Ensure Commands | Planned | P5-12 |
-| 2 | P5-18 Scale Tasks UI And Batch Projections | Planned | - |
-| 3 | P5-14 Forward Download Requests With Wait And Detach Modes | Planned | P5-13, P5-18 |
-| 4 | P5-15 Route Task Control Through The Scheduler Owner | Planned | P5-14 |
-| 5 | P5-16 Harden IPC Recovery, Security, And Packaging | Planned | P5-13 through P5-15 |
-| 6 | P5-17 Add The Agent-Control Workflow And End-To-End Verification | Planned | P5-13 through P5-16 |
+| 1 | P5-18 Scale Tasks UI And Batch Projections | Planned | - |
+| 2 | P5-14 Forward Download Requests With Wait And Detach Modes | Planned | P5-18 |
+| 3 | P5-15 Route Task Control Through The Scheduler Owner | Planned | P5-14 |
+| 4 | P5-16 Harden IPC Recovery, Security, And Packaging | Planned | P5-14, P5-15 |
+| 5 | P5-17 Add The Agent-Control Workflow And End-To-End Verification | Planned | P5-14 through P5-16 |
 
 ## Direction And Boundaries
 
@@ -47,41 +46,6 @@ databases, imports, layouts, commands, and CLI argument forms remains out of sco
   download timeout.
 - Tasks list projections are read models, not full execution graphs. A Batch row must not expand
   all children, assets, attempts, or filesystem state merely to render summary progress.
-
-## P5-13 Add Shell Status, Start, And Ensure Commands
-
-### Status
-
-Planned.
-
-### Public Commands
-
-- Keep `clid shell` and double-clicking `CLI-Downloader.exe` as the normal visible Shell entry.
-- Add `clid shell status [--json]` to report `running`, `ready`, owner mode, PID, process start
-  identity, version, protocol version, session ID, capabilities, and recovery state.
-- Add `clid shell start --visible [--wait-ready] [--timeout SECONDS] [--json]` to launch a new
-  visible Shell window only when no owner exists.
-- Add `clid shell ensure --visible --wait-ready [--timeout SECONDS] [--json]` as an idempotent
-  status-then-start operation suitable for an Agent.
-- Resolve the correct launch command inside Core: packaged builds launch the current
-  `CLI-Downloader.exe`; source checkouts launch the active Python runtime with
-  `-m cli_downloader shell`. Do not ask an Agent to construct `Start-Process` arguments or infer
-  Installer versus Portable paths.
-- On Windows, create a genuinely visible new console window. `--wait-ready` succeeds only after
-  the owner endpoint is reachable, recovery has finished, plugins are loaded, and the Scheduler
-  advertises that it can accept commands.
-- If a foreground owner exists, `start` and `ensure` return `owner_busy` with owner details instead
-  of opening a misleading second Shell.
-
-### Acceptance Criteria
-
-- `status` distinguishes absent, starting, recovering, ready, stopping, foreground-busy, stale,
-  and incompatible owners with stable JSON error codes.
-- Repeating `ensure` never launches duplicate Shell windows.
-- Timeout, launch failure, early process exit, incompatible protocol, and stale discovery metadata
-  produce actionable diagnostics and nonzero exit codes.
-- Portable and source-mode tests confirm that the resolved launch command points to the correct
-  runtime without depending on the current working directory.
 
 ## P5-14 Forward Download Requests With Wait And Detach Modes
 

@@ -66,6 +66,11 @@ from cli_downloader.core.owner_scope import (
     OwnerScope,
     new_owner_session_id,
 )
+from cli_downloader.core.shell_control import (
+    ShellController,
+    ShellStatusKind,
+    ShellStatusSnapshot,
+)
 from cli_downloader.core.operations import (
     ListPageData,
     ResultKind,
@@ -131,6 +136,61 @@ def _emit_owner_error(error: OwnerError, *, json_output: bool) -> None:
         print(f"Owner error [{payload['code']}]: {payload['error']}")
 
 
+def _emit_shell_status(snapshot: ShellStatusSnapshot, *, json_output: bool) -> None:
+    if json_output:
+        print(json.dumps(snapshot.to_dict(), indent=2))
+        return
+    print(f"Shell: {snapshot.kind.value}")
+    print(f"Status: {snapshot.message}")
+    metadata = snapshot.metadata
+    if metadata is not None:
+        print(f"Owner mode: {metadata.owner_mode.value}")
+        print(f"PID: {metadata.pid}")
+        print(f"Version: {metadata.application_version}")
+        print(f"Protocol: {metadata.protocol_version}")
+        print(f"Session: {metadata.session_id}")
+        print(f"Recovery: {metadata.lifecycle_state.value}")
+
+
+def _shell_launch_args(args: argparse.Namespace) -> tuple[str, ...]:
+    values: list[str] = []
+    for plugin_root in getattr(args, "plugin_root", ()):
+        values.extend(("--plugin-root", plugin_root))
+    if getattr(args, "runtime_enable_external_code", False):
+        values.append("--enable-external-code")
+    return tuple(values)
+
+
+def _run_shell_command(args: argparse.Namespace) -> int:
+    environment = diagnose_environment()
+    scope = OwnerScope.from_app_paths(environment.paths)
+    controller = ShellController(scope)
+    command = getattr(args, "shell_command", None)
+    if command == "status":
+        snapshot = controller.status()
+        _emit_shell_status(snapshot, json_output=args.json)
+        return 1 if snapshot.kind is ShellStatusKind.INCOMPATIBLE else 0
+
+    timeout = max(0.01, float(getattr(args, "timeout", 10.0)))
+    if command == "ensure":
+        result = controller.ensure(
+            timeout=timeout,
+            extra_args=_shell_launch_args(args),
+        )
+    else:
+        result = controller.start(
+            wait_ready=bool(getattr(args, "wait_ready", False)),
+            timeout=timeout,
+            extra_args=_shell_launch_args(args),
+        )
+    if getattr(args, "json", False):
+        print(json.dumps(result.to_dict(), indent=2))
+    else:
+        _emit_shell_status(result.status, json_output=False)
+        print(result.message)
+    return result.exit_code
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="clid",
@@ -179,9 +239,74 @@ def build_parser() -> argparse.ArgumentParser:
         "sites",
         help="List registered site adapters.",
     )
-    subparsers.add_parser(
+    shell_parser = subparsers.add_parser(
         "shell",
         help="Start the interactive shell.",
+    )
+    shell_subparsers = shell_parser.add_subparsers(dest="shell_command")
+    shell_status_parser = shell_subparsers.add_parser(
+        "status",
+        help="Inspect the current Shell owner without starting one.",
+    )
+    shell_status_parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit stable machine-readable status.",
+    )
+    shell_start_parser = shell_subparsers.add_parser(
+        "start",
+        help="Start a visible Shell when no owner is active.",
+    )
+    shell_start_parser.add_argument(
+        "--visible",
+        action="store_true",
+        required=True,
+        help="Open the Shell in a new visible console window.",
+    )
+    shell_start_parser.add_argument(
+        "--wait-ready",
+        action="store_true",
+        help="Wait until the Shell advertises that it is ready.",
+    )
+    shell_start_parser.add_argument(
+        "--timeout",
+        type=float,
+        default=10.0,
+        metavar="SECONDS",
+        help="Maximum readiness wait (default: 10).",
+    )
+    shell_start_parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit stable machine-readable result.",
+    )
+    shell_ensure_parser = shell_subparsers.add_parser(
+        "ensure",
+        help="Idempotently start a visible Shell and wait until it is ready.",
+    )
+    shell_ensure_parser.add_argument(
+        "--visible",
+        action="store_true",
+        required=True,
+        help="Open the Shell in a new visible console window when needed.",
+    )
+    shell_ensure_parser.add_argument(
+        "--wait-ready",
+        action="store_true",
+        required=True,
+        help="Wait until recovery and plugin loading have completed.",
+    )
+    shell_ensure_parser.add_argument(
+        "--timeout",
+        type=float,
+        default=10.0,
+        metavar="SECONDS",
+        help="Maximum readiness wait (default: 10).",
+    )
+    shell_ensure_parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit stable machine-readable result.",
     )
     plugins_parser = subparsers.add_parser(
         "plugins",
@@ -563,6 +688,8 @@ def main(
         return 0
 
     if args.command == "shell":
+        if getattr(args, "shell_command", None) is not None:
+            return _run_shell_command(args)
         shell_runtime = get_runtime()
         plugins_dir = Path(args.plugin_root[0]) if args.plugin_root else installed_plugins_root()
         return build_interactive_shell(

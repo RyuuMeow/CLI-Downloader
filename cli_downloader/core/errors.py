@@ -88,3 +88,15 @@ class OwnerScopeMismatchError(OwnerError):
     """Raised when metadata does not belong to the current owner scope."""
 
     code = "owner_scope_mismatch"
+
+
+class OwnerLaunchError(OwnerError):
+    """Raised when a visible Shell process cannot be started."""
+
+    code = "owner_launch_error"
+
+
+class OwnerReadyTimeoutError(OwnerError):
+    """Raised when a launched Shell does not advertise readiness in time."""
+
+    code = "owner_ready_timeout"

@@ -516,6 +516,19 @@ class OwnerDiscoveryStore:
         except (OSError, UnicodeError, json.JSONDecodeError, ContractValidationError) as error:
             raise OwnerDiscoveryError(f"cannot read owner metadata: {error}") from error
 
+    def read_for_scope(self) -> OwnerDiscoveryMetadata | None:
+        """Read metadata and reject records from another owner scope."""
+
+        metadata = self.read()
+        if metadata is not None:
+            self._validate_scope(metadata)
+        return metadata
+
+    def validate(self, metadata: OwnerDiscoveryMetadata) -> None:
+        """Validate that metadata belongs to this store's scope."""
+
+        self._validate_scope(metadata)
+
     def write(self, metadata: OwnerDiscoveryMetadata) -> None:
         self._validate_scope(metadata)
         self.path.parent.mkdir(parents=True, exist_ok=True)
