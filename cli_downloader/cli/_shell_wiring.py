@@ -15,7 +15,7 @@ from io import StringIO
 import json
 import os
 from pathlib import Path
-from threading import Event, Thread
+from threading import Event, Lock, Thread
 
 from cli_downloader.application.task_hierarchy_service import TaskHierarchyService
 from cli_downloader.application.download_limiter import GalleryDownloadLimiter
@@ -46,6 +46,7 @@ from cli_downloader.core.owner_protocol import (
     OwnerDisconnectOutcome,
     OwnerHandshake,
     OwnerResponseEvent,
+    OwnerResponseMode,
     OwnerRequest,
     OwnerTerminalStatus,
     OwnerWaitPhase,
@@ -256,6 +257,7 @@ def _build_interactive_shell_impl(
                 mode=OwnerMode.SHELL,
                 application_version=__version__,
                 capabilities=("download", "task_query", "task_control", "history_query", "shell_status"),
+                scope_fingerprint=owner_lease.scope.scope_fingerprint,
             ),
             handler=lambda request, emit: _handle_owner_request(
                 request,
@@ -388,6 +390,8 @@ def _handle_owner_download(
     sequence = 0
     accepted = Event()
     finished = Event()
+    heartbeat_stop = Event()
+    sequence_lock = Lock()
     cancellation = Event()
     accepted_task: dict[str, str] = {}
     pipe_closed = Event()
@@ -396,9 +400,11 @@ def _handle_owner_download(
         nonlocal sequence
         if pipe_closed.is_set():
             return False
-        sequence += 1
+        with sequence_lock:
+            sequence += 1
+            current_sequence = sequence
         try:
-            emit(event_factory(sequence))
+            emit(event_factory(current_sequence))
         except (OSError, EOFError, OwnerError):
             pipe_closed.set()
             return False
@@ -421,6 +427,19 @@ def _handle_owner_download(
             )
         ):
             accepted.set()
+            Thread(target=heartbeat, name=f"owner-heartbeat-{request.request_id[:8]}", daemon=True).start()
+
+    def heartbeat() -> None:
+        while not heartbeat_stop.wait(5.0):
+            if finished.is_set() or not push(
+                lambda current: OwnerResponseEvent.heartbeat(
+                    request.request_id,
+                    current,
+                    owner_session_id=owner_session_id,
+                    emitted_at=datetime.now(UTC),
+                )
+            ):
+                return
 
     def progress(reason: str, progress_payload: Mapping[str, object]) -> None:
         if not accepted.is_set() or not accepted_task:
@@ -468,6 +487,7 @@ def _handle_owner_download(
                 )
             )
             finished.set()
+            heartbeat_stop.set()
             return
         status = (
             OwnerTerminalStatus.COMPLETED
@@ -487,6 +507,7 @@ def _handle_owner_download(
             )
         )
         finished.set()
+        heartbeat_stop.set()
 
     Thread(target=worker, name=f"owner-download-{request.request_id[:8]}", daemon=True).start()
     accepted_before_deadline = False
@@ -508,6 +529,8 @@ def _handle_owner_download(
             )
         )
         pipe_closed.set()
+    if request.response_mode is OwnerResponseMode.WAIT:
+        finished.wait()
 
 
 def _handle_owner_control(

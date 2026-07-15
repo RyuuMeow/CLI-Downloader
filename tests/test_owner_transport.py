@@ -1,4 +1,6 @@
+import json
 import tempfile
+import time
 import unittest
 from datetime import UTC, datetime
 
@@ -12,9 +14,10 @@ from cli_downloader.core.owner_protocol import (
     OwnerResponseMode,
     OwnerSource,
     OwnerTerminalStatus,
+    OwnerWaitPolicy,
 )
 from cli_downloader.core.owner_scope import OwnerScope
-from cli_downloader.core.owner_transport import OwnerPipeClient, OwnerPipeServer
+from cli_downloader.core.owner_transport import OwnerPipeClient, OwnerPipeServer, OwnerTransportError
 
 
 class OwnerPipeTransportTests(unittest.TestCase):
@@ -206,6 +209,161 @@ class OwnerPipeTransportTests(unittest.TestCase):
             self.assertEqual(len(calls), 1)
             self.assertEqual([event.kind.value for event in first], ["accepted", "terminal"])
             self.assertEqual([event.kind.value for event in second], ["accepted", "terminal"])
+
+    def test_duplicate_request_replays_after_owner_restart(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            scope = OwnerScope.from_data_root(directory)
+            calls = []
+            session = "client-session"
+            request = OwnerRequest(
+                OWNER_PROTOCOL_VERSION,
+                "restart-request",
+                OwnerSource.CLI,
+                OwnerCommand.DOWNLOAD,
+                OwnerResponseMode.WAIT,
+                {"url": "https://example.test/gallery/3"},
+                session,
+            )
+            handshake = OwnerHandshake(
+                OWNER_PROTOCOL_VERSION,
+                session,
+                OwnerMode.FOREGROUND,
+                "0.1.5",
+                ("download",),
+                ("download",),
+            )
+
+            def handler(request, emit):
+                calls.append(request.request_id)
+                emit(
+                    OwnerResponseEvent.accepted(
+                        request.request_id,
+                        1,
+                        owner_session_id="owner-session",
+                        accepted_at=datetime.now(UTC),
+                        task_id="task-3",
+                        task_kind="item",
+                    )
+                )
+                emit(
+                    OwnerResponseEvent.terminal(
+                        request.request_id,
+                        2,
+                        status=OwnerTerminalStatus.COMPLETED,
+                        task_id="task-3",
+                        exit_code=0,
+                    )
+                )
+
+            owner_handshake = OwnerHandshake(
+                OWNER_PROTOCOL_VERSION,
+                "owner-session",
+                OwnerMode.SHELL,
+                "0.1.5",
+                ("download",),
+            )
+            first_server = OwnerPipeServer(scope, handshake=owner_handshake, handler=handler)
+            first_server.start()
+            try:
+                OwnerPipeClient(scope).request(request, handshake=handshake)
+            finally:
+                first_server.stop()
+
+            second_server = OwnerPipeServer(scope, handshake=owner_handshake, handler=handler)
+            second_server.start()
+            try:
+                replay = OwnerPipeClient(scope).request(request, handshake=handshake)
+            finally:
+                second_server.stop()
+
+            self.assertEqual(calls, ["restart-request"])
+            self.assertEqual([event.kind.value for event in replay], ["accepted", "terminal"])
+
+    def test_silent_owner_becomes_structured_disconnect(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            scope = OwnerScope.from_data_root(directory)
+
+            def handler(request, emit):
+                emit(
+                    OwnerResponseEvent.accepted(
+                        request.request_id,
+                        1,
+                        owner_session_id="owner-session",
+                        accepted_at=datetime.now(UTC),
+                        task_id="task-silent",
+                        task_kind="item",
+                    )
+                )
+                time.sleep(0.2)
+
+            server = OwnerPipeServer(
+                scope,
+                handshake=OwnerHandshake(
+                    OWNER_PROTOCOL_VERSION,
+                    "owner-session",
+                    OwnerMode.SHELL,
+                    "0.1.5",
+                    ("download",),
+                ),
+                handler=handler,
+            )
+            server.start()
+            try:
+                session = "client-session"
+                request = OwnerRequest(
+                    OWNER_PROTOCOL_VERSION,
+                    "silent-request",
+                    OwnerSource.CLI,
+                    OwnerCommand.DOWNLOAD,
+                    OwnerResponseMode.WAIT,
+                    {"url": "https://example.test/gallery/4"},
+                    session,
+                )
+                events = OwnerPipeClient(
+                    scope,
+                    wait_policy=OwnerWaitPolicy(response_idle_timeout=0.05),
+                ).request(
+                    request,
+                    handshake=OwnerHandshake(
+                        OWNER_PROTOCOL_VERSION,
+                        session,
+                        OwnerMode.FOREGROUND,
+                        "0.1.5",
+                        ("download",),
+                        ("download",),
+                    ),
+                )
+            finally:
+                server.stop()
+
+            self.assertEqual(events[-1].kind.value, "owner_disconnected")
+            self.assertEqual(events[-1].payload["outcome"], "accepted_completion_unknown")
+
+    def test_endpoint_metadata_scope_mismatch_is_rejected_before_connect(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            scope = OwnerScope.from_data_root(directory)
+
+            server = OwnerPipeServer(
+                scope,
+                handshake=OwnerHandshake(
+                    OWNER_PROTOCOL_VERSION,
+                    "owner-session",
+                    OwnerMode.SHELL,
+                    "0.1.5",
+                ),
+                handler=lambda _request, _emit: None,
+            )
+            server.start()
+            try:
+                metadata = json.loads(server._metadata_path.read_text(encoding="utf-8"))
+                metadata["scope_fingerprint"] = "f" * 64
+                server._metadata_path.write_text(
+                    json.dumps(metadata), encoding="utf-8"
+                )
+                with self.assertRaises(OwnerTransportError):
+                    OwnerPipeClient(scope)._load_endpoint()
+            finally:
+                server.stop()
 
 
 if __name__ == "__main__":

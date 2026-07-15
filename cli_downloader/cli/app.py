@@ -209,6 +209,7 @@ def _forward_download_to_shell(args: argparse.Namespace) -> int | None:
         application_version=__version__,
         capabilities=("download",),
         required_capabilities=("download",),
+        scope_fingerprint=scope.scope_fingerprint,
     )
     try:
         events = OwnerPipeClient(scope).request(request, handshake=handshake)
@@ -290,6 +291,7 @@ def _forward_task_control_to_shell(
         application_version=__version__,
         capabilities=("task_control",),
         required_capabilities=("task_control",),
+        scope_fingerprint=scope.scope_fingerprint,
     )
     try:
         events = OwnerPipeClient(scope).request(request, handshake=handshake)

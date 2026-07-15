@@ -122,6 +122,45 @@ class HandshakeTests(unittest.TestCase):
 
         self.assertEqual(context.exception.code, "unsupported_capability")
 
+    def test_scope_fingerprint_mismatch_is_rejected(self) -> None:
+        client = OwnerHandshake(
+            1,
+            "client-1",
+            OwnerMode.FOREGROUND,
+            "0.1.5",
+            ("download",),
+            ("download",),
+            "a" * 64,
+        )
+        owner = OwnerHandshake(
+            1,
+            "owner-1",
+            OwnerMode.SHELL,
+            "0.1.5",
+            ("download",),
+            (),
+            "b" * 64,
+        )
+        with self.assertRaises(ContractValidationError) as context:
+            negotiate_handshake(client, owner)
+        self.assertEqual(context.exception.code, "scope_mismatch")
+
+    def test_scope_fingerprint_cannot_be_omitted_by_only_one_peer(self) -> None:
+        client = OwnerHandshake(
+            1,
+            "client-1",
+            OwnerMode.FOREGROUND,
+            "0.1.5",
+            (),
+            (),
+            "a" * 64,
+        )
+        owner = OwnerHandshake(1, "owner-1", OwnerMode.SHELL, "0.1.5")
+
+        with self.assertRaises(ContractValidationError) as context:
+            negotiate_handshake(client, owner)
+        self.assertEqual(context.exception.code, "scope_mismatch")
+
     def test_lifecycle_states_are_explicit(self) -> None:
         self.assertEqual(OwnerLifecycleState.READY.value, "ready")
         self.assertNotIn(OwnerLifecycleState.READY, {OwnerLifecycleState.STARTING, OwnerLifecycleState.BUSY})

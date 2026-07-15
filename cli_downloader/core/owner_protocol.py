@@ -30,6 +30,7 @@ _MAX_JSON_DEPTH = 16
 _MAX_MAP_ITEMS = 256
 _MAX_SEQUENCE_ITEMS = 1024
 _IDENTIFIER_PATTERN = re.compile(r"^[a-z0-9][a-z0-9_.-]{0,127}$")
+_FINGERPRINT_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 
 JsonScalar: TypeAlias = str | int | float | bool | None
 JsonValue: TypeAlias = JsonScalar | list["JsonValue"] | dict[str, "JsonValue"]
@@ -141,6 +142,14 @@ def _require_token(value: object, path: str, *, maximum: int = 128) -> str:
 def _require_identifier(value: object, path: str) -> str:
     if not isinstance(value, str) or not _IDENTIFIER_PATTERN.fullmatch(value):
         raise _error("invalid_identifier", path, "must use lowercase letters, numbers, dots, underscores, or hyphens")
+    return value
+
+
+def _optional_fingerprint(value: object, path: str) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str) or not _FINGERPRINT_PATTERN.fullmatch(value):
+        raise _error("invalid_fingerprint", path, "must be a lowercase SHA-256 fingerprint")
     return value
 
 
@@ -363,6 +372,7 @@ class OwnerHandshake:
     application_version: str
     capabilities: tuple[str, ...] = ()
     required_capabilities: tuple[str, ...] = ()
+    scope_fingerprint: str | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "protocol_version", _protocol_version(self.protocol_version, "handshake.protocol_version"))
@@ -371,6 +381,7 @@ class OwnerHandshake:
         object.__setattr__(self, "application_version", _require_text(self.application_version, "handshake.application_version", maximum=64))
         object.__setattr__(self, "capabilities", _freeze_identifiers(self.capabilities, "handshake.capabilities"))
         object.__setattr__(self, "required_capabilities", _freeze_identifiers(self.required_capabilities, "handshake.required_capabilities"))
+        object.__setattr__(self, "scope_fingerprint", _optional_fingerprint(self.scope_fingerprint, "handshake.scope_fingerprint"))
 
     def to_dict(self) -> dict[str, JsonValue]:
         return {
@@ -380,6 +391,7 @@ class OwnerHandshake:
             "application_version": self.application_version,
             "capabilities": list(self.capabilities),
             "required_capabilities": list(self.required_capabilities),
+            "scope_fingerprint": self.scope_fingerprint,
         }
 
     @classmethod
@@ -397,6 +409,7 @@ class OwnerHandshake:
                     "application_version",
                     "capabilities",
                     "required_capabilities",
+                    "scope_fingerprint",
                 }
             ),
         )
@@ -411,6 +424,7 @@ class OwnerHandshake:
             application_version=value["application_version"],
             capabilities=value.get("capabilities", ()),
             required_capabilities=value.get("required_capabilities", ()),
+            scope_fingerprint=value.get("scope_fingerprint"),
         )
 
 
@@ -439,6 +453,10 @@ class OwnerHandshakeResult:
 def negotiate_handshake(client: OwnerHandshake, owner: OwnerHandshake) -> OwnerHandshakeResult:
     if client.protocol_version != owner.protocol_version:
         raise _error("protocol_mismatch", "handshake.protocol_version", "client and owner protocol versions differ")
+    if (client.scope_fingerprint is None) != (owner.scope_fingerprint is None):
+        raise _error("scope_mismatch", "handshake.scope_fingerprint", "client and owner must identify the same data-root scope")
+    if client.scope_fingerprint is not None and client.scope_fingerprint != owner.scope_fingerprint:
+        raise _error("scope_mismatch", "handshake.scope_fingerprint", "client and owner data roots differ")
     client_capabilities = set(client.capabilities)
     owner_capabilities = set(owner.capabilities)
     missing = sorted((set(client.required_capabilities) - owner_capabilities) | (set(owner.required_capabilities) - client_capabilities))

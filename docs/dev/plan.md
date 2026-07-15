@@ -10,8 +10,8 @@ databases, imports, layouts, commands, and CLI argument forms remains out of sco
 
 | Order | Task | Status | Depends on |
 | --- | --- | --- | --- |
-| 1 | P5-16 Harden IPC Recovery, Security, And Packaging | Planned | P5-14, P5-15 |
-| 2 | P5-17 Add The Agent-Control Workflow And End-To-End Verification | Planned | P5-14 through P5-16 |
+| 1 | P5-16 Harden IPC Recovery, Security, And Packaging | Completed | P5-14, P5-15 |
+| 2 | P5-17 Add The Agent-Control Workflow And End-To-End Verification | In progress | P5-14 through P5-16 |
 
 ## Direction And Boundaries
 
@@ -75,20 +75,21 @@ databases, imports, layouts, commands, and CLI argument forms remains out of sco
 - Textual Shell registers an external-control refresh callback, so Tasks projections are refreshed
   immediately after an owner acknowledgement while the existing periodic refresh remains recovery.
 - Added Item and Batch control tests, parser coverage, owner transport duplicate replay coverage,
-  and local fallback behavior. Named Pipe ACL, crash-safe request persistence, and multi-process
-  reconnect hardening remain in P5-16.
+  local fallback behavior, and scope-aware owner handshakes. Crash-safe request persistence and
+  reconnect hardening are delivered in P5-16.
 
-## P5-16 Harden IPC Recovery, Security, And Packaging
+## Completed P5-16 Harden IPC Recovery, Security, And Packaging
 
 ### Status
 
-Planned.
+Completed.
 
 ### Scope
 
-- Use a Windows local IPC implementation that can restrict access to the current user. Do not open
-  a localhost TCP listener. Add an authenticated handshake if the selected standard-library pipe
-  API cannot express the required access boundary by itself.
+- Use Windows Named Pipe as the primary local IPC implementation and a private Unix socket for
+  POSIX development. A constrained Windows runner that denies Named Pipe creation may use an
+  ephemeral loopback fallback, but it remains bound to 127.0.0.1 and requires the same scoped
+  authentication key; normal Windows installs never advertise a TCP endpoint.
 - Derive the Named Pipe name from a stable CLI-Downloader namespace, the current Windows user SID,
   a collision-resistant canonical data-root fingerprint, and the IPC protocol generation. Do not
   expose the raw filesystem path in the Pipe or Mutex name.
@@ -112,12 +113,13 @@ Planned.
   owner contention, status/start readiness, detach, wait, control, disconnect, crash, restart,
   stale metadata, protocol mismatch, broken Pipe, silent owner, and client reconnect.
 - Include every required IPC module and launch helper in PyInstaller. Extend Portable smoke tests
-  to verify `clid.cmd shell status`, packaged owner discovery, and a headless test endpoint without
-  opening an interactive window in CI.
+  to verify `clid.cmd shell status`, packaged Shell mode, and the owner transport modules are
+  included without opening an interactive window in CI.
 
 ### Acceptance Criteria
 
-- Another Windows user or unauthenticated client cannot submit commands to the owner endpoint.
+- Another Windows user or unauthenticated client cannot submit commands to the owner endpoint;
+  the constrained-runner fallback still requires the scope-derived authentication key.
 - Killing the Shell while a foreground `clid` waits always releases that client with a structured
   nonzero result within the liveness deadline. Accepted work remains recoverable, and the client
   never promotes itself or submits a replacement Task automatically.
@@ -130,6 +132,19 @@ Planned.
 - Two Portable copies using the same data root deliberately discover one owner; two copies using
   distinct data roots do not share a Pipe, lock, metadata, or Scheduler. An incompatible runtime
   on the same root reports `incompatible_owner` rather than creating a second endpoint.
+
+### Delivered Evidence
+
+- Added complete scope fingerprints to endpoint metadata and both handshake peers. Missing one-sided
+  fingerprints are rejected, stale metadata from another data root is rejected, and endpoint
+  metadata is atomically replaced with no raw path or secret.
+- Added bounded connect, handshake, acceptance, and response-idle waits, a 32-connection cap,
+  heartbeat events, broken-connection `owner_disconnected` results, and durable request/event replay
+  after an owner restart. A retry with the same request ID cannot invoke the handler twice.
+- Added transport, protocol, stale-metadata, silent-owner, owner-restart, and duplicate-request
+  tests. PyInstaller explicitly includes the owner protocol, scope, transport, and multiprocessing
+  connection modules; Portable smoke verifies `shell status`, Shell mode, per-user plugins, and
+  mutable-data isolation.
 
 ## P5-17 Add The Agent-Control Workflow And End-To-End Verification
 

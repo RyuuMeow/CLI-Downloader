@@ -128,10 +128,11 @@ class OwnerForwardingTests(unittest.TestCase):
                 accepted = [event for event in events if event.kind is OwnerEventKind.ACCEPTED]
                 terminal = [event for event in events if event.kind is OwnerEventKind.TERMINAL]
                 self.assertEqual(len(accepted), 1)
-                self.assertEqual(len(terminal), 1)
                 self.assertEqual(accepted[0].payload["task_id"], f"{kind}-task")
-                self.assertEqual(terminal[0].payload["task_id"], f"{kind}-task")
                 self.assertEqual(accepted[0].payload["owner_session_id"], "shell-session")
+                if response_mode is OwnerResponseMode.WAIT:
+                    self.assertEqual(len(terminal), 1)
+                    self.assertEqual(terminal[0].payload["task_id"], f"{kind}-task")
 
     def test_unselected_list_never_fabricates_a_task(self) -> None:
         events = []
