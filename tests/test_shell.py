@@ -767,8 +767,7 @@ class TextualShellAppTest(IsolatedAsyncioTestCase):
         async with app.run_test(size=(120, 30)) as pilot:
             await pilot.pause()
             app.query_one(TabbedContent).active = "tasks"
-            for _ in range(2):
-                await pilot.pause()
+            await pilot.pause()
             table = app.query_one("#task-table", DataTable)
 
             wide_viewport = table.scrollable_content_region.width

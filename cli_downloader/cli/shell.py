@@ -25,6 +25,7 @@ from textual.suggester import Suggester
 from textual.containers import Horizontal, Vertical
 from textual.geometry import Size
 from textual.css.query import NoMatches
+from textual.message import Message
 from textual.widgets import (
     Button,
     DataTable,
@@ -445,6 +446,16 @@ class InteractiveShell:
         )
 
 
+class TaskDataTable(DataTable):
+    """Report the table's own non-bubbling Resize event to the Shell."""
+
+    class ViewportChanged(Message):
+        pass
+
+    def on_resize(self, _event: events.Resize) -> None:
+        self.post_message(self.ViewportChanged())
+
+
 class TextualShellApp(App[int]):
     CSS = SHELL_CSS
 
@@ -485,6 +496,7 @@ class TextualShellApp(App[int]):
         self._task_refresh_pending = False
         self._task_focus_pending = True
         self._task_layout_signature: tuple[object, ...] | None = None
+        self._task_viewport_width: int | None = None
         self._task_detail_signature: tuple[object, ...] | None = None
         self._task_action_signature: tuple[object, ...] | None = None
         self._task_tab_request_pending = False
@@ -560,7 +572,11 @@ class TextualShellApp(App[int]):
                     Button("↻", id="refresh-tasks"),
                     id="task-toolbar",
                 )
-                yield DataTable(id="task-table", classes="activity-table", cursor_type="row")
+                yield TaskDataTable(
+                    id="task-table",
+                    classes="activity-table",
+                    cursor_type="row",
+                )
                 yield DataTable(
                     id="task-file-table",
                     classes="activity-table",
@@ -825,6 +841,18 @@ class TextualShellApp(App[int]):
         self._resize_task_columns()
         self._resize_plugin_columns()
 
+    def on_task_data_table_viewport_changed(
+        self,
+        event: TaskDataTable.ViewportChanged,
+    ) -> None:
+        event.stop()
+        table = self.query_one("#task-table", TaskDataTable)
+        viewport_width = table.scrollable_content_region.width
+        if viewport_width <= 0 or viewport_width == self._task_viewport_width:
+            return
+        self._task_viewport_width = viewport_width
+        self._resize_task_columns()
+
     def on_input_submitted(self, event: Input.Submitted) -> None:
         if event.input.id == "plugin-install-url":
             self._install_plugin()
@@ -1017,7 +1045,6 @@ class TextualShellApp(App[int]):
             # id settles (notably during test mounts and fast startup).  Finish
             # one layout turn after the explicit request.
             self.call_after_refresh(self._prepare_tasks_tab)
-            self._schedule_task_column_resize()
         elif active_tab == "console" and self._task_tab_request_pending:
             # A TabbedContent mount can emit a stale Console event after the
             # caller already requested Tasks.  Keep the explicit request until
@@ -1043,7 +1070,6 @@ class TextualShellApp(App[int]):
             self._task_tab_request_pending = False
         self.refresh(layout=True)
         self._resize_task_columns()
-        self._schedule_task_column_resize()
         if self._task_nodes:
             self._task_focus_pending = True
             self.query_one("#task-table", DataTable).focus()
@@ -3016,14 +3042,6 @@ class TextualShellApp(App[int]):
         )
         table.refresh(layout=True)
 
-    def _schedule_task_column_resize(self) -> None:
-        """Resize after the Tasks pane and its scrollbars finish layout."""
-
-        self.call_after_refresh(
-            self.call_after_refresh,
-            self._resize_task_columns,
-        )
-
     def _resize_plugin_columns(self) -> None:
         if not hasattr(self, "_plugin_column_keys"):
             return
@@ -3179,7 +3197,6 @@ class TextualShellApp(App[int]):
         if layout_signature != self._task_layout_signature:
             self._task_layout_signature = layout_signature
             self._resize_task_columns()
-            self._schedule_task_column_resize()
         if level == "roots":
             self._active_batch_id = None
             self._active_batch_name = None
