@@ -748,11 +748,12 @@ class TextualShellAppTest(IsolatedAsyncioTestCase):
         tasks = tuple(
             TaskNode(
                 f"task-{index}",
-                TaskKind.ITEM,
+                TaskKind.BATCH if index == 0 else TaskKind.ITEM,
                 TaskState.COMPLETED,
                 f"Task {index}",
-                TaskProgress(1, 1),
+                TaskProgress(165, 165) if index == 0 else TaskProgress(1, 1),
                 site_id="example",
+                details={"created_at": "2026-07-16T12:34:56+08:00"},
             )
             for index in range(40)
         )
@@ -775,6 +776,22 @@ class TextualShellAppTest(IsolatedAsyncioTestCase):
                 column.get_render_width(table) for column in table.columns.values()
             )
             self.assertEqual(wide_rendered, wide_viewport)
+            self.assertGreaterEqual(
+                table.columns[app._task_column_keys["type"]].width,
+                len("Batch") + 2,
+            )
+            self.assertGreaterEqual(
+                table.columns[app._task_column_keys["progress"]].width,
+                len("165/165 files"),
+            )
+            self.assertGreaterEqual(
+                table.columns[app._task_column_keys["status"]].width,
+                len("Completed"),
+            )
+            self.assertGreaterEqual(
+                table.columns[app._task_column_keys["created"]].width,
+                len("2026-07-16 12:34"),
+            )
 
             await pilot.resize_terminal(45, 30)
             await pilot.pause()

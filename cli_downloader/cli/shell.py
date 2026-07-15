@@ -17,6 +17,7 @@ from time import monotonic
 from typing import TextIO
 from urllib.parse import urlsplit
 
+from rich.cells import cell_len
 from rich.text import Text
 from textual import events
 from textual.app import App, ComposeResult
@@ -3016,18 +3017,42 @@ class TextualShellApp(App[int]):
         padding = 2 * table.cell_padding * len(self._task_column_keys)
         available = max(0, viewport_width - row_label_width - padding)
 
+        nodes = tuple(self._task_nodes.values())
+        fixed_values: dict[str, tuple[object, ...]] = {
+            "number": tuple(_number_cell(index) for index in range(1, len(nodes) + 1)),
+            "type": tuple(
+                _task_kind_label(node.kind, self._shell.translator) for node in nodes
+            ),
+            "site": tuple(_display_name(node.site_id or "unknown") for node in nodes),
+            "progress": tuple(
+                _task_progress(node, self._shell.translator) for node in nodes
+            ),
+            "status": tuple(
+                _display_status(node.state.value, self._shell.translator) for node in nodes
+            ),
+            "created": tuple(
+                _short_datetime(node.details.get("created_at")) for node in nodes
+            ),
+        }
         fixed_widths: dict[str, int] = {}
         for name, key in self._task_column_keys.items():
             if name == "name":
                 continue
 
             column = table.columns[key]
-            label_len = (
-                len(column.label.plain)
+            label_width = (
+                column.label.cell_len
                 if hasattr(column.label, "plain")
-                else len(str(column.label))
+                else cell_len(str(column.label))
             )
-            fixed_widths[name] = max(column.content_width, label_len)
+            content_width = max(
+                (_task_cell_width(value) for value in fixed_values[name]),
+                default=0,
+            )
+            # DataTable calculates ``content_width`` lazily after rendering.
+            # Derive it from the current read model so the first Tasks visit
+            # cannot use header-only widths and clip Status/Created/Type.
+            fixed_widths[name] = max(content_width, label_width)
             column.auto_width = False
             column.width = fixed_widths[name]
 
@@ -4076,6 +4101,10 @@ def _scheduler_waiting_label(
 
 def _number_cell(index: int) -> Text:
     return Text(str(index), style="#777777")
+
+
+def _task_cell_width(value: object) -> int:
+    return value.cell_len if isinstance(value, Text) else cell_len(str(value))
 
 
 def _plugin_cell(value: object) -> Text:
