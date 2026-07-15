@@ -2,7 +2,7 @@
 
 Updated: 2026-07-15
 
-This document contains active work only. Completed P2, P3, P4, and P5-02 through P5-10 tasks
+This document contains active work only. Completed P2, P3, P4, and P5-02 through P5-11 tasks
 have been removed. The application is not released, so compatibility with removed legacy
 databases, imports, layouts, commands, and CLI argument forms remains out of scope.
 
@@ -10,14 +10,13 @@ databases, imports, layouts, commands, and CLI argument forms remains out of sco
 
 | Order | Task | Status | Depends on |
 | --- | --- | --- | --- |
-| 1 | P5-11 Define The Scheduler Owner And IPC Contract | Planned | - |
-| 2 | P5-12 Enforce One Download Owner Across Processes | Planned | P5-11 |
-| 3 | P5-13 Add Shell Status, Start, And Ensure Commands | Planned | P5-12 |
-| 4 | P5-18 Scale Tasks UI And Batch Projections | Planned | - |
-| 5 | P5-14 Forward Download Requests With Wait And Detach Modes | Planned | P5-12, P5-13, P5-18 |
-| 6 | P5-15 Route Task Control Through The Scheduler Owner | Planned | P5-14 |
-| 7 | P5-16 Harden IPC Recovery, Security, And Packaging | Planned | P5-12 through P5-15 |
-| 8 | P5-17 Add The Agent-Control Workflow And End-To-End Verification | Planned | P5-13 through P5-16 |
+| 1 | P5-12 Enforce One Download Owner Across Processes | Planned | P5-11 |
+| 2 | P5-13 Add Shell Status, Start, And Ensure Commands | Planned | P5-12 |
+| 3 | P5-18 Scale Tasks UI And Batch Projections | Planned | - |
+| 4 | P5-14 Forward Download Requests With Wait And Detach Modes | Planned | P5-12, P5-13, P5-18 |
+| 5 | P5-15 Route Task Control Through The Scheduler Owner | Planned | P5-14 |
+| 6 | P5-16 Harden IPC Recovery, Security, And Packaging | Planned | P5-12 through P5-15 |
+| 7 | P5-17 Add The Agent-Control Workflow And End-To-End Verification | Planned | P5-13 through P5-16 |
 
 ## Direction And Boundaries
 
@@ -49,68 +48,6 @@ databases, imports, layouts, commands, and CLI argument forms remains out of sco
   download timeout.
 - Tasks list projections are read models, not full execution graphs. A Batch row must not expand
   all children, assets, attempts, or filesystem state merely to render summary progress.
-
-## P5-11 Define The Scheduler Owner And IPC Contract
-
-### Status
-
-Planned.
-
-### Scope
-
-- Introduce a platform-neutral Scheduler-owner boundary with a Windows implementation based on a
-  per-user ownership primitive and a local command channel. Keep Windows naming and process APIs
-  out of application services.
-- Scope owner identity to the resolved CLI-Downloader user data root so production, Portable,
-  development, and isolated-test stores cannot accidentally control one another.
-- Define owner modes for `shell` and `foreground`, plus lifecycle states for `starting`,
-  `recovering`, `ready`, `stopping`, `busy`, and `incompatible`.
-- Define a versioned, length-bounded IPC envelope containing protocol version, request ID, source,
-  command kind, typed arguments, response mode, timestamps, and structured error information.
-- Use an explicit command enum and validated payload models. Never send a raw Shell command,
-  arbitrary Python target, secret configuration value, cookie, or executable string across IPC.
-- Define capability negotiation so an older client can distinguish unsupported commands from an
-  unavailable or incompatible owner.
-- Deduplicate retries by request ID. Reconnecting after an uncertain acknowledgement must return
-  the existing accepted result rather than create a second Task.
-- Define a streamed response lifecycle with `accepted`, progress or control events, heartbeat,
-  and exactly one terminal result. Heartbeats prove owner liveness; they are not persisted as Task
-  progress and do not extend connection or acknowledgement deadlines.
-- Separate short connection, handshake, acknowledgement, and response-idle deadlines from the
-  overall command duration. A valid download may run for hours without a default total timeout,
-  but a client must detect a broken or silent owner within a bounded liveness window.
-- Define `owner_disconnected` with the request ID, known Task ID, last owner session, and an outcome
-  of either `not_accepted`, `accepted_completion_unknown`, or `terminal_result_lost`. A waiting
-  client exits nonzero instead of hanging, silently becoming the new owner, or resubmitting work.
-- Keep client cancellation distinct from owner loss. Closing a waiting terminal does not cancel
-  Shell-owned work; explicit Ctrl+C follows the typed cancellation contract and reports when its
-  delivery or acknowledgement is uncertain.
-
-### Command Behavior Matrix
-
-| Shell owner | Command | Required result |
-| --- | --- | --- |
-| Running | `download <url>` | Forward to Shell and wait for the terminal result. |
-| Running | `download <url> --detach` | Forward to Shell and return after durable acceptance. |
-| Not running | `download <url>` | Foreground CLI acquires ownership, blocks, and returns the terminal result. |
-| Not running | `download <url> --detach` | Fail with `shell_required_for_detach` and an actionable `shell ensure` hint. |
-| Foreground owner running | Another live download | Fail with `owner_busy`; do not construct or forward additional download work. |
-| Any owner running | A second owner start | Do not start another Scheduler or perform recovery. Report the active owner. |
-| No owner | Read-only Task, History, config, or diagnostic query | Read directly without claiming execution ownership. |
-| Shell crashes while a client waits | Accepted request | End the wait with `owner_disconnected`; preserve the Task for recovery and do not duplicate it. |
-
-### Acceptance Criteria
-
-- Contract tests cover valid requests, malformed or oversized messages, duplicate request IDs,
-  version mismatch, unsupported capabilities, disconnects, and structured errors.
-- Contract tests cover disconnects before acceptance, after durable acceptance, and after terminal
-  persistence but before delivery, with a deterministic result for every phase.
-- A silent or broken in-memory owner cannot leave a waiting client blocked beyond the configured
-  liveness deadline, while a healthy long-running command is not terminated by that deadline.
-- Owner and client code can be tested through an in-memory transport before Windows process tests
-  are added.
-- No IPC request can bypass the same CLI validation, confirmation, plugin, Task, and History
-  boundaries used by an in-process command.
 
 ## P5-12 Enforce One Download Owner Across Processes
 
