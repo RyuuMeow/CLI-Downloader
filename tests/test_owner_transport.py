@@ -21,6 +21,13 @@ from cli_downloader.core.owner_transport import OwnerPipeClient, OwnerPipeServer
 
 
 class OwnerPipeTransportTests(unittest.TestCase):
+    def test_missing_endpoint_metadata_fails_before_connect(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            scope = OwnerScope.from_data_root(directory)
+
+            with self.assertRaisesRegex(OwnerTransportError, "metadata is missing"):
+                OwnerPipeClient(scope)._load_endpoint()
+
     def test_round_trip_uses_scope_specific_endpoint(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             scope = OwnerScope.from_data_root(directory)

@@ -30,7 +30,11 @@ from cli_downloader.core.owner_protocol import (
     OwnerLifecycleState,
     OwnerMode,
 )
-from cli_downloader.core.owner_scope import OwnerDiscoveryMetadata, OwnerScope
+from cli_downloader.core.owner_scope import (
+    OwnerDiscoveryMetadata,
+    OwnerScope,
+    local_owner_lock_held,
+)
 
 
 class ShellStatusKind(StrEnum):
@@ -291,6 +295,8 @@ class ShellStatusService:
         )
 
     def _lock_held(self) -> bool | None:
+        if local_owner_lock_held(self.scope.lock_path):
+            return True
         try:
             lease = self.scope.lock().acquire()
         except OwnerAlreadyRunningError:

@@ -407,7 +407,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     shell_parser = subparsers.add_parser(
         "shell",
-        help="Start the interactive shell.",
+        help="Inspect or start the single visible Shell owner.",
     )
     shell_subparsers = shell_parser.add_subparsers(dest="shell_command")
     shell_status_parser = shell_subparsers.add_parser(
@@ -567,12 +567,12 @@ def build_parser() -> argparse.ArgumentParser:
     response_mode.add_argument(
         "--detach",
         action="store_true",
-        help="Submit to an active Shell owner and return after durable acceptance.",
+        help="Submit to an active visible Shell owner and return after durable acceptance (not final success).",
     )
     response_mode.add_argument(
         "--wait",
         action="store_true",
-        help="Explicitly wait for the download result (the default).",
+        help="Wait for the final download result through the Shell owner or a foreground owner (the default).",
     )
 
     operation_parser = subparsers.add_parser(

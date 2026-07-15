@@ -15,7 +15,8 @@ from io import StringIO
 import json
 import os
 from pathlib import Path
-from threading import Event, Lock, Thread
+from threading import Event, Lock, Thread, current_thread
+from time import monotonic
 
 from cli_downloader.application.task_hierarchy_service import TaskHierarchyService
 from cli_downloader.application.download_limiter import GalleryDownloadLimiter
@@ -161,6 +162,10 @@ def _build_interactive_shell_impl(
     batch_store = StateBatchStore(StateDatabase(layout.state_db))
     history_store = StateHistoryStore(StateDatabase(layout.state_db))
     startup_commands = _recover_interrupted_downloads(task_store, batch_store, history_store)
+    shutdown_requested = Event()
+    execution_lock = Lock()
+    active_cancellations: set[Event] = set()
+    active_workers: set[Thread] = set()
     if owner_lease is not None:
         ready_scope = owner_lease.scope
         ready_session = owner_session_id or new_owner_session_id()
@@ -216,13 +221,71 @@ def _build_interactive_shell_impl(
         )
 
     def run_background(shell_argv, cancellation, progress, on_accept=None):
-        return background_runner(
-            shell_argv,
-            cancellation,
-            progress,
-            shell_download_limiter,
-            on_accept,
+        worker = current_thread()
+        with execution_lock:
+            active_cancellations.add(cancellation)
+            active_workers.add(worker)
+            if shutdown_requested.is_set():
+                cancellation.set()
+        try:
+            return background_runner(
+                shell_argv,
+                cancellation,
+                progress,
+                shell_download_limiter,
+                on_accept,
+            )
+        finally:
+            with execution_lock:
+                active_cancellations.discard(cancellation)
+                active_workers.discard(worker)
+
+    def persist_interruption_intent() -> int:
+        unfinished = 0
+        for record in task_store.list():
+            if record.status in {
+                TaskStatus.PENDING,
+                TaskStatus.PLANNED,
+                TaskStatus.RUNNING,
+                TaskStatus.PAUSED,
+            }:
+                unfinished += 1
+            if record.status is TaskStatus.RUNNING:
+                task_store.upsert(
+                    record.transition(
+                        status=TaskStatus.PLANNED,
+                        desired_control=TaskDesiredControl.RUN,
+                        active_run_id=None,
+                    )
+                )
+        return unfinished
+
+    def request_shutdown() -> str | None:
+        shutdown_requested.set()
+        with execution_lock:
+            for cancellation in tuple(active_cancellations):
+                cancellation.set()
+        unfinished = persist_interruption_intent()
+        if unfinished == 0:
+            return None
+        noun = "task" if unfinished == 1 else "tasks"
+        return (
+            f"{unfinished} unfinished {noun} are persisted; they will be recovered "
+            "when the Shell starts again."
         )
+
+    def wait_for_safe_boundaries(timeout: float = 2.0) -> None:
+        deadline = monotonic() + timeout
+        while monotonic() < deadline:
+            with execution_lock:
+                workers = tuple(worker for worker in active_workers if worker is not current_thread())
+            if not workers:
+                break
+            for worker in workers:
+                worker.join(timeout=max(0.0, min(0.1, deadline - monotonic())))
+        # A worker may have written a RUNNING checkpoint just before it noticed
+        # cancellation; normalize it once more before the owner lock is freed.
+        persist_interruption_intent()
 
     operation_callback = operation_runner or (
         lambda url, params: _load_shell_operation(runtime, url, params)
@@ -245,6 +308,7 @@ def _build_interactive_shell_impl(
         runtime=runtime,
         plugins_dir=plugins_dir,
         cache_dir=environment.paths.cache_dir,
+        shutdown_warning=request_shutdown,
     )
 
     owner_server = None
@@ -266,6 +330,7 @@ def _build_interactive_shell_impl(
                 owner_session_id=owner_session_id,
                 task_service_loader=load_task_service,
                 notify_control=shell.notify_external_control,
+                is_shutting_down=shutdown_requested.is_set,
             ),
         )
         owner_server.start()
@@ -282,6 +347,8 @@ def _build_interactive_shell_impl(
     try:
         return shell.run()
     finally:
+        request_shutdown()
+        wait_for_safe_boundaries()
         if owner_server is not None:
             owner_server.stop()
 
@@ -335,6 +402,7 @@ def _handle_owner_request(
     owner_session_id: str,
     task_service_loader: Callable[[], TaskHierarchyService],
     notify_control: Callable[[], None] | None = None,
+    is_shutting_down: Callable[[], bool] | None = None,
 ) -> None:
     """Run one externally submitted download inside the Shell owner.
 
@@ -343,6 +411,8 @@ def _handle_owner_request(
     continues the same background execution and durable task lifecycle.
     """
 
+    if is_shutting_down is not None and is_shutting_down():
+        raise OwnerError("Shell is stopping and is not accepting new commands")
     if request.command is OwnerCommand.TASK_CONTROL:
         _handle_owner_control(
             request,

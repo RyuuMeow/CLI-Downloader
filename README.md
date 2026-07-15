@@ -83,6 +83,26 @@ clid doctor
 
 Use `clid <command> --help` for command-specific options. Commands that support `--json` can be consumed by scripts and other tools.
 
+For Agent-assisted work, keep downloads in the visible Shell owner:
+
+```powershell
+clid shell status --json
+clid shell ensure --visible --wait-ready --json
+clid download <url> --dry-run --json
+clid download <url> --detach --json
+clid tasks show <task-id>
+clid tasks pause <task-id>
+clid tasks resume <task-id>
+```
+
+`--detach` reports durable acceptance and the Task ID; it does not claim final success. If the
+owner disconnects, inspect that existing Task and History before retrying, rather than creating a
+replacement Task. See the [Agent Skill guide](skills/cli-downloader/README.md) for the full
+authorization and ownership workflow.
+
+When the visible Shell closes with unfinished work, it warns, stops accepting new commands,
+and leaves recoverable checkpoints for the next Shell startup.
+
 ## Visual Tour
 
 ### Tasks and Batches
@@ -138,6 +158,7 @@ This repository includes a ready-to-use [CLI-Downloader Agent Skill](skills/cli-
 - add and verify download tasks with explicit user authorization;
 - diagnose unsupported URLs and plugin routing problems; and
 - research, scaffold, test, and document external website plugins.
+- submit authorized work to the visible Shell owner and control the resulting Task through JSON commands.
 
 The Agent Skill does not grant additional permissions, bypass confirmation requirements, or make third-party plugins trustworthy. Agents must still follow the user's authorization and the security boundaries of their host environment.
 

@@ -147,6 +147,20 @@ class InteractiveShellTest(TestCase):
         self.assertIn("download <url> --dry-run", output.getvalue())
         self.assertNotIn("confirm-live-network", output.getvalue())
 
+    def test_shell_warns_before_releasing_owner_with_unfinished_tasks(self) -> None:
+        output = StringIO()
+        shell = InteractiveShell(
+            shutdown_warning=lambda: "2 unfinished tasks are persisted; resume later."
+        )
+
+        exit_code = shell.run(
+            input_stream=StringIO("exit\n"),
+            output_stream=output,
+        )
+
+        self.assertEqual(exit_code, 0)
+        self.assertIn("Warning: 2 unfinished tasks are persisted; resume later.", output.getvalue())
+
     def test_help_and_errors_follow_the_selected_interface_language(self) -> None:
         output = StringIO()
         shell = InteractiveShell()

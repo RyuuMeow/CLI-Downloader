@@ -97,6 +97,7 @@ BatchSelectionRunner = Callable[
 ExternalOpener = Callable[[str], None]
 BrowserAuthRunner = Callable[[str, BrowserAuthSchema], str]
 BrowserAuthValidator = Callable[[str, str], bool]
+ShutdownWarning = Callable[[], str | None]
 
 _AUTO_REFRESH_TASK_STATES = frozenset({TaskState.PREPARING, TaskState.QUEUED, TaskState.RUNNING})
 _PLUGIN_STATUS_MIN_WIDTH = 18
@@ -220,6 +221,7 @@ class InteractiveShell:
         plugins_dir: Path | None = None,
         cache_dir: Path | None = None,
         plugin_catalog_service: PluginCatalogService | None = None,
+        shutdown_warning: ShutdownWarning | None = None,
     ) -> None:
         self._prompt = prompt
         self._runner = runner
@@ -242,6 +244,7 @@ class InteractiveShell:
         self._plugin_catalog_service = plugin_catalog_service or PluginCatalogService(
             catalog_cache
         )
+        self._shutdown_warning_callback = shutdown_warning
 
     @property
     def translator(self) -> TranslationService:
@@ -257,6 +260,24 @@ class InteractiveShell:
         callback = self._external_refresh_callback
         if callback is not None:
             callback()
+
+    def shutdown_warning(self) -> str | None:
+        """Return a safe, user-facing warning before the Shell releases ownership."""
+
+        callback = self._shutdown_warning_callback
+        if callback is None:
+            return None
+        try:
+            warning = callback()
+        except Exception:
+            # Shutdown must never be prevented by a best-effort status probe.
+            return None
+        return warning if isinstance(warning, str) and warning.strip() else None
+
+    def _write_shutdown_warning(self, output_stream: TextIO) -> None:
+        warning = self.shutdown_warning()
+        if warning is not None:
+            output_stream.write(f"Warning: {warning}\n")
 
     def run_batch_selection(
         self,
@@ -297,6 +318,7 @@ class InteractiveShell:
             output_stream.flush()
             line = input_stream.readline()
             if line == "":
+                self._write_shutdown_warning(output_stream)
                 output_stream.write("\n")
                 return 0
 
@@ -336,6 +358,7 @@ class InteractiveShell:
                 output_stream.write("\x1b[2J\x1b[H")
             return True, 0
         if command in {"exit", "quit"}:
+            self._write_shutdown_warning(output_stream)
             return False, 0
         if not _is_allowed_shell_command(argv):
             self._print_error(
@@ -1141,6 +1164,9 @@ class TextualShellApp(App[int]):
         if self._operation_cancel is not None:
             self._cancel_operation()
             return
+        warning = self._shell.shutdown_warning()
+        if warning is not None:
+            self.notify(f"Warning: {warning}", severity="warning")
         self.exit(0)
 
     def action_show_console(self) -> None:

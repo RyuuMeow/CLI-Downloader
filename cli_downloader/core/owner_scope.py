@@ -22,6 +22,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
+from threading import Lock
 from typing import TYPE_CHECKING, Any, TypeAlias
 from uuid import uuid4
 
@@ -46,6 +47,8 @@ OWNER_SCOPE_SCHEMA_VERSION = 1
 _IDENTIFIER_PATTERN = re.compile(r"^[a-z0-9][a-z0-9_.-]{0,127}$")
 _FINGERPRINT_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 _PROCESS_INSTANCE_ID = uuid4().hex
+_LOCAL_LOCK_GUARD = Lock()
+_LOCAL_HELD_LOCKS: set[str] = set()
 
 JsonValue: TypeAlias = str | int | float | bool | None | list["JsonValue"] | dict[str, "JsonValue"]
 
@@ -254,6 +257,25 @@ def current_process_start_identity() -> str:
 
 def new_owner_session_id() -> str:
     return uuid4().hex
+
+
+def _local_lock_key(path: Path) -> str:
+    return os.path.normcase(os.path.abspath(os.fspath(path)))
+
+
+def _release_local_lock(key: str | None) -> None:
+    if key is None:
+        return
+    with _LOCAL_LOCK_GUARD:
+        _LOCAL_HELD_LOCKS.discard(key)
+
+
+def local_owner_lock_held(path: Path) -> bool:
+    """Return whether this process already owns the scoped lock path."""
+
+    key = _local_lock_key(path)
+    with _LOCAL_LOCK_GUARD:
+        return key in _LOCAL_HELD_LOCKS
 
 
 @dataclass(frozen=True)
@@ -586,9 +608,16 @@ class OwnerDiscoveryStore:
 class OwnerLease(AbstractContextManager["OwnerLease"]):
     """A held OS lock; releasing it also removes metadata published by this lease."""
 
-    def __init__(self, scope: OwnerScope, stream: Any) -> None:
+    def __init__(
+        self,
+        scope: OwnerScope,
+        stream: Any,
+        *,
+        local_lock_key: str | None = None,
+    ) -> None:
         self.scope = scope
         self._stream = stream
+        self._local_lock_key = local_lock_key
         self._released = False
         self._published_session_id: str | None = None
         self._discovery = OwnerDiscoveryStore(scope)
@@ -626,8 +655,11 @@ class OwnerLease(AbstractContextManager["OwnerLease"]):
             try:
                 _unlock_stream(self._stream)
             finally:
-                self._stream.close()
-                self._released = True
+                try:
+                    self._stream.close()
+                finally:
+                    _release_local_lock(self._local_lock_key)
+                    self._released = True
         if cleanup_error is not None:
             raise cleanup_error
 
@@ -653,17 +685,32 @@ class OwnerLock:
         self.scope = scope
 
     def acquire(self) -> OwnerLease:
+        lock_key = _local_lock_key(self.scope.lock_path)
+        with _LOCAL_LOCK_GUARD:
+            if lock_key in _LOCAL_HELD_LOCKS:
+                raise OwnerAlreadyRunningError(
+                    f"another process owns scope {self.scope.scope_fingerprint}"
+                )
+            _LOCAL_HELD_LOCKS.add(lock_key)
+        stream: Any | None = None
         try:
             self.scope.lock_path.parent.mkdir(parents=True, exist_ok=True)
             stream = _open_lock_stream(self.scope.lock_path)
             _lock_stream(stream)
         except OwnerAlreadyRunningError:
+            if stream is not None:
+                try:
+                    stream.close()
+                except OSError:
+                    pass
+            _release_local_lock(lock_key)
             raise
         except (BlockingIOError, PermissionError) as error:
             try:
                 stream.close()  # type: ignore[union-attr]
             except (NameError, AttributeError, OSError):
                 pass
+            _release_local_lock(lock_key)
             raise OwnerAlreadyRunningError(
                 f"another process owns scope {self.scope.scope_fingerprint}"
             ) from error
@@ -672,8 +719,16 @@ class OwnerLock:
                 stream.close()  # type: ignore[union-attr]
             except (NameError, AttributeError, OSError):
                 pass
+            _release_local_lock(lock_key)
             raise OwnerLockError(f"cannot acquire owner lock: {error}") from error
-        return OwnerLease(self.scope, stream)
+        except BaseException:
+            try:
+                stream.close()  # type: ignore[union-attr]
+            except (NameError, AttributeError, OSError):
+                pass
+            _release_local_lock(lock_key)
+            raise
+        return OwnerLease(self.scope, stream, local_lock_key=lock_key)
 
 
 class OwnerManager:

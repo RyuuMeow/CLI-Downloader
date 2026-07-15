@@ -16,6 +16,37 @@ Use the project's public CLI for normal operation. Modify Python code only when 
 5. Treat inspection and `--dry-run` as read-only. Ask for confirmation before live network access, file downloads, task deletion, history deletion, or external plugin activation unless the user already requested that exact action.
 6. Never print authentication cookies, tokens, secret configuration values, or unredacted session data.
 
+## Use the visible Shell owner
+
+The interactive Shell is the single Scheduler owner. Prefer it when an Agent needs a
+user-visible task, progress, or control surface:
+
+1. Check ownership first with `<cli> shell status --json`.
+2. If no compatible Shell is ready, ask for permission to start one, then run
+   `<cli> shell ensure --visible --wait-ready --json`. Do not launch a second Shell or
+   construct a private Scheduler.
+3. After explicit download authorization and a successful dry run, submit with
+   `<cli> download <url> --detach --json`. Detach is accepted only by a ready Shell and
+   returns durable acceptance, not final download success.
+4. Read the accepted `task_id`, verify it with `<cli> tasks show <task-id>`, and report the
+   task to the user before doing further control work.
+5. Use `<cli> tasks pause <task-id>`, `<cli> tasks resume <task-id>`,
+   `<cli> tasks cancel <task-id>`, `<cli> tasks retry <task-id>`, or
+   `<cli> tasks hard-retry <task-id>` for Item controls. Use the corresponding
+   `<cli> batches resume|retry <batch-id>` command for Batch parents.
+6. Treat `owner_disconnected` as an uncertain completion: keep the known Task ID, inspect
+   the Task and History, and never submit a replacement request automatically. A repeated
+   request ID is safe to retry because the owner replays the durable response.
+
+Without a Shell, a normal foreground command may temporarily own the Scheduler and wait for
+its terminal result. Do not use that fallback when the user expects a visible Shell or when
+the Agent must remain responsive; `--detach` without a ready Shell is rejected.
+
+When a visible Shell is closing, it warns about unfinished persisted Tasks, stops accepting
+new owner requests, and marks active checkpoints for recovery. Wait for the Shell status to
+become absent before starting a new owner; do not submit replacement downloads merely because
+the closing Shell did not emit a final event.
+
 Read [references/cli-operations.md](references/cli-operations.md) for exact task, history, download, and plugin-diagnostic commands.
 
 ## Inspect tasks and history

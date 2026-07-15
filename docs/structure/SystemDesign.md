@@ -102,6 +102,35 @@ routing rule remains unchanged.
 Operation identifiers may be plugin-defined and are validated against manifest
 schemas.
 
+## Scheduler Owner And Agent IPC
+
+One `OwnerScope` (product namespace, current-user identity, canonical data root,
+and protocol generation) has exactly one live Scheduler owner. The interactive
+Shell is the preferred owner. A foreground CLI may own the scope only when no
+Shell is ready; an external CLI otherwise submits a validated `OwnerRequest`
+through the local owner transport.
+
+Windows uses a scope-derived Named Pipe with an authenticated handshake;
+POSIX development uses a private Unix socket. Restricted Windows runners may
+use an ephemeral loopback endpoint only as an authenticated fallback. Endpoint
+metadata contains the complete scope fingerprint and is treated as discovery,
+not proof of liveness. The OS lease remains authoritative.
+
+Requests carry a stable request ID and response mode (`wait` or `detach`). The
+owner persists response events before sending them, so a retry can replay the
+same acceptance and terminal result instead of creating duplicate Tasks. Connect,
+handshake, acceptance, and response-idle waits are independently bounded;
+heartbeat and `owner_disconnected` events make a dead owner observable without
+inventing completion. Accepted work is reconciled from persisted Task, Batch,
+and torrent checkpoints by the next owner.
+
+Shell shutdown sets a stopping boundary before releasing the `OwnerScope` lease:
+new owner requests are rejected, active cancellation signals are propagated to
+download workers, active run checkpoints are normalized to recoverable planned
+state, and the Shell waits briefly for safe worker boundaries. The wait is bounded
+so a stuck integration cannot orphan the CLI indefinitely; the next owner performs
+the remaining checkpoint reconciliation.
+
 ## View And Interaction
 
 Plugins compose dynamic pages from core widget classes and enum-controlled

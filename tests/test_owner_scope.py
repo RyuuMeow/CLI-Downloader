@@ -25,8 +25,10 @@ from cli_downloader.core.owner_scope import (
     OwnerScope,
     canonicalize_data_root,
     current_process_start_identity,
+    local_owner_lock_held,
 )
 from cli_downloader.cli.app import main
+from cli_downloader.core.shell_control import ShellStatusKind, ShellStatusService
 from tests.example_site import build_example_runtime
 from tests.owner_scope_worker import hold_owner_lock
 
@@ -148,6 +150,20 @@ class OwnerScopeTests(unittest.TestCase):
             with first.lock().acquire(), second.lock().acquire():
                 self.assertTrue(first.lock_path.exists())
                 self.assertTrue(second.lock_path.exists())
+
+    def test_same_process_reacquire_fails_without_blocking(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            scope = OwnerScope.from_data_root(directory, user_identity="S-1-5-21-test")
+
+            with scope.lock().acquire():
+                self.assertTrue(local_owner_lock_held(scope.lock_path))
+                self.assertEqual(
+                    ShellStatusService(scope).inspect().kind,
+                    ShellStatusKind.STARTING,
+                )
+                with self.assertRaises(OwnerAlreadyRunningError):
+                    scope.lock().acquire()
+            self.assertFalse(local_owner_lock_held(scope.lock_path))
 
 
 class OwnerProcessLockTests(unittest.TestCase):

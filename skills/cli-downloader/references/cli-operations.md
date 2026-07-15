@@ -2,6 +2,34 @@
 
 Set `<cli>` to `clid` when installed, otherwise `python -m cli_downloader` from the repository root.
 
+## Shell owner and Agent submissions
+
+```text
+<cli> shell status --json
+<cli> shell ensure --visible --wait-ready --json
+<cli> download <url> --dry-run --json
+<cli> download <url> --detach --json
+<cli> tasks show <task-id>
+<cli> tasks pause <task-id>
+<cli> tasks resume <task-id>
+<cli> tasks cancel <task-id>
+<cli> tasks retry <task-id>
+<cli> tasks hard-retry <task-id>
+<cli> batches resume <batch-id>
+<cli> batches retry <batch-id>
+```
+
+Only use `shell ensure` and `download --detach` after the user authorizes starting a visible
+Shell and creating the requested download. A detached response proves durable acceptance only;
+query the returned Task ID for progress and terminal state. If the owner disconnects, inspect the
+existing Task and History before retrying with the same request ID; never create a replacement Task
+because the final event was lost.
+
+When the user closes the visible Shell, it warns about unfinished Tasks, rejects new owner
+requests, and persists active checkpoints for recovery. Poll `shell status --json` before
+assuming a new owner is available; a missing terminal event is not proof that the download
+failed.
+
 ## Read tasks
 
 ```text

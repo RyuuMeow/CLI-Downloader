@@ -2,16 +2,16 @@
 
 Updated: 2026-07-15
 
-This document contains active work only. Completed P2, P3, P4, P5-02 through P5-15, and P5-18 tasks
-have been removed. The application is not released, so compatibility with removed legacy
-databases, imports, layouts, commands, and CLI argument forms remains out of scope.
+This document keeps the active roadmap plus the latest P5 completion evidence. Completed P2, P3,
+P4, P5-02 through P5-15, and P5-18 task details remain summarized only where they explain current
+contracts. The application is not released, so compatibility with removed legacy databases,
+imports, layouts, commands, and CLI argument forms remains out of scope.
 
 ## Active Order
 
 | Order | Task | Status | Depends on |
 | --- | --- | --- | --- |
-| 1 | P5-16 Harden IPC Recovery, Security, And Packaging | Completed | P5-14, P5-15 |
-| 2 | P5-17 Add The Agent-Control Workflow And End-To-End Verification | In progress | P5-14 through P5-16 |
+| — | No remaining P5 tasks | Completed | P5-01 through P5-17 |
 
 ## Direction And Boundaries
 
@@ -47,8 +47,9 @@ databases, imports, layouts, commands, and CLI argument forms remains out of sco
 ## Completed P5-14 Forward Download Requests With Wait And Detach Modes
 
 - Added typed `OwnerPipeServer`/`OwnerPipeClient` transport with authenticated handshake, bounded
-  connection setup, request/event framing, and scope-derived endpoint metadata. Windows currently
-  uses authenticated loopback transport; Named Pipe ACL hardening remains in P5-16.
+  connection setup, request/event framing, and scope-derived endpoint metadata. Windows uses the
+  authenticated Named Pipe path in normal installations; constrained runners may use the scoped
+  loopback fallback described in P5-16.
 - Added `clid download --detach` and explicit `--wait`. A ready Shell owns forwarded work; normal
   mode waits for the owner terminal event, while detach returns only after an Item placeholder or
   Batch parent is durably created. Without a Shell, detach is rejected rather than silently
@@ -150,7 +151,7 @@ Completed.
 
 ### Status
 
-Planned.
+Completed.
 
 ### Agent Skill Contract
 
@@ -190,6 +191,33 @@ Planned.
   never creates two active owners or duplicate accepted Tasks.
 - The complete isolated Core/plugin verification gate, multi-process IPC suite, Portable smoke,
   build, and documentation checks pass.
+
+### Delivered Evidence
+
+- Added the public Agent workflow to all three README languages, the repository Agent Skill and
+  CLI operations reference: status first, visible Shell ensure after authorization, dry-run before
+  live work, detached submission, Task verification, owner-routed controls, and uncertain-owner
+  recovery without replacement Tasks.
+- Added an offline Item/Batch owner simulation in `tests/test_agent_owner_workflow.py`. It verifies
+  machine-readable status, detached Item acceptance, selected Batch wait-to-terminal completion,
+  pause/resume controls, durable History after Task deletion, and duplicate-request replay after
+  owner restart without invoking the download handler twice.
+- Added graceful Shell shutdown handling: unfinished persisted Tasks produce a warning, active
+  cancellation signals are propagated, new owner requests are rejected, RUNNING checkpoints are
+  normalized to recoverable PLANNED state, and the owner waits briefly for safe worker boundaries
+  before releasing the lock. The behavior is documented in Shell/System design and covered by
+  the interactive Shell warning test.
+- Updated CLI help text, CHANGELOG, PyInstaller/Portable documentation, and the owner workflow
+  design so `--detach` is explicitly acceptance-only while normal `--wait` remains terminal-result
+  based.
+- Hardened orphan-owner recovery on Windows: same-process status inspection no longer re-enters the
+  byte-range lock, missing endpoint metadata fails immediately, Named Pipe availability uses a
+  native bounded probe, and constrained-runner AF_INET fallback metadata is re-read safely.
+- Final focused verification passed: 33 owner protocol/transport/forwarding/Agent workflow tests,
+  11 scope and multi-process lock tests, CLI grammar and Shell shutdown-warning tests, Ruff,
+  compilation, diff checks, and the Portable build smoke test. The final Portable artifact reports
+  the authoritative `pyproject.toml` version and was produced as
+  `CLI-Downloader-0.1.5-windows-x64-portable.zip`.
 
 ## Future Version Backlog
 

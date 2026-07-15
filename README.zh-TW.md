@@ -82,6 +82,25 @@ clid doctor
 
 使用 `clid <command> --help` 查看各指令選項。支援 `--json` 的指令可供腳本及其他工具讀取。
 
+若由 Agent 協助操作，請讓下載留在使用者看得到的 Shell owner 中：
+
+```powershell
+clid shell status --json
+clid shell ensure --visible --wait-ready --json
+clid download <url> --dry-run --json
+clid download <url> --detach --json
+clid tasks show <task-id>
+clid tasks pause <task-id>
+clid tasks resume <task-id>
+```
+
+`--detach` 只代表任務已持久化接受，並不代表下載最終成功。若 owner 中斷，請先查詢原有
+Task 與 History，再決定是否用相同 request 重試，不要建立替代 Task。完整的授權與 owner
+流程請參考 [Agent Skill 指南](skills/cli-downloader/README.md)。
+
+如果可見的 Shell 在仍有未完成工作時關閉，會先顯示警告、停止接受新指令，並留下可由下次
+Shell 啟動時恢復的檢查點。
+
 ## 介面導覽
 
 ### Tasks 與 Batches
@@ -137,6 +156,7 @@ flowchart LR
 - 取得使用者明確授權後建立並確認下載任務；
 - 診斷不支援的網址與插件路由問題；以及
 - 研究、建立、測試並撰寫外部網站插件文件。
+- 將取得授權的工作送入可視化 Shell owner，並透過 JSON 指令控制結果 Task。
 
 Agent Skill 不會取得額外權限、不會略過確認要求，也不代表第三方插件可信。Agent 仍須遵守使用者授權與其執行環境的安全邊界。
 

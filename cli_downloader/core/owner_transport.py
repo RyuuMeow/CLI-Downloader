@@ -13,6 +13,7 @@ import hashlib
 import json
 import os
 import tempfile
+import ctypes
 from collections.abc import Callable
 from multiprocessing.connection import Client, Listener, wait as wait_connections
 from pathlib import Path
@@ -516,6 +517,22 @@ class OwnerPipeClient:
         last_failure: BaseException | None = None
         while monotonic() < deadline:
             address, family = self._load_endpoint()
+            if family == "AF_PIPE":
+                try:
+                    self._wait_for_windows_pipe(str(address), deadline=deadline)
+                except OwnerTransportError as error:
+                    # A constrained Windows runner may reject AF_PIPE on its
+                    # first accept and atomically republish an AF_INET fallback.
+                    # Re-read endpoint metadata until the bounded deadline.
+                    last_failure = error
+                    sleep(0.05)
+                    continue
+                try:
+                    return Client(address, family=family, authkey=_auth_key(self.scope))
+                except OSError as error:
+                    last_failure = error
+                    sleep(0.05)
+                    continue
             result: list[object] = []
             failure: list[BaseException] = []
 
@@ -539,32 +556,62 @@ class OwnerPipeClient:
             sleep(0.05)
         raise OwnerTransportError(f"cannot connect to owner endpoint: {last_failure}") from last_failure
 
+    @staticmethod
+    def _wait_for_windows_pipe(address: str, *, deadline: float) -> None:
+        """Bound the Windows named-pipe availability check without a Python thread.
+
+        ``multiprocessing.connection.Client`` may enter a blocking Win32 call
+        that holds the GIL.  In that state even ``Thread.start()`` in the
+        caller cannot provide a reliable timeout.  ``WaitNamedPipeW`` has a
+        native timeout and ctypes releases the GIL while it waits.
+        """
+
+        if os.name != "nt":
+            return
+        remaining_ms = max(1, min(250, int((deadline - monotonic()) * 1000)))
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.WaitNamedPipeW.argtypes = [ctypes.c_wchar_p, ctypes.c_uint32]
+        kernel32.WaitNamedPipeW.restype = ctypes.c_int
+        if kernel32.WaitNamedPipeW(address, remaining_ms):
+            return
+        error = ctypes.get_last_error()
+        raise OwnerTransportError(
+            f"owner named-pipe endpoint is unavailable (WinError {error})"
+        )
+
     def _load_endpoint(self):
-        address = self.address
-        family = self.family
         try:
             metadata = json.loads(self._metadata_path.read_text(encoding="utf-8"))
-            if isinstance(metadata, dict):
-                fingerprint = metadata.get("scope_fingerprint")
-                if fingerprint is not None and fingerprint != self.scope.scope_fingerprint:
-                    raise OwnerTransportError("owner endpoint metadata belongs to another data-root scope")
-                protocol_version = metadata.get("protocol_version")
-                if protocol_version is not None and protocol_version != self.scope.protocol_version:
-                    raise OwnerTransportError("owner endpoint metadata uses an incompatible protocol")
-                metadata_family = metadata.get("family")
-                metadata_address = metadata.get("address")
-                if metadata_family == "AF_INET":
-                    if not isinstance(metadata_address, (list, tuple)) or len(metadata_address) != 2:
-                        raise ValueError("invalid owner endpoint address")
-                    address = (str(metadata_address[0]), int(metadata_address[1]))
-                    family = "AF_INET"
-                elif metadata_family == family and isinstance(metadata_address, str):
-                    address = metadata_address
-                elif metadata_family or metadata_address:
-                    raise OwnerTransportError("owner endpoint metadata uses an incompatible IPC endpoint")
-        except (OSError, ValueError, TypeError, KeyError):
-            pass
-        return address, family
+        except FileNotFoundError as error:
+            raise OwnerTransportError("owner endpoint metadata is missing") from error
+        except OSError as error:
+            raise OwnerTransportError(f"owner endpoint metadata cannot be read: {error}") from error
+        except (json.JSONDecodeError, TypeError) as error:
+            raise OwnerTransportError("owner endpoint metadata is invalid") from error
+        if not isinstance(metadata, dict):
+            raise OwnerTransportError("owner endpoint metadata is invalid")
+        fingerprint = metadata.get("scope_fingerprint")
+        if fingerprint != self.scope.scope_fingerprint:
+            raise OwnerTransportError("owner endpoint metadata belongs to another data-root scope")
+        protocol_version = metadata.get("protocol_version")
+        if protocol_version != self.scope.protocol_version:
+            raise OwnerTransportError("owner endpoint metadata uses an incompatible protocol")
+        metadata_family = metadata.get("family")
+        metadata_address = metadata.get("address")
+        if metadata_family == "AF_INET":
+            if not isinstance(metadata_address, (list, tuple)) or len(metadata_address) != 2:
+                raise OwnerTransportError("owner endpoint address is invalid")
+            try:
+                host = str(metadata_address[0])
+                port = int(metadata_address[1])
+            except (TypeError, ValueError) as error:
+                raise OwnerTransportError("owner endpoint address is invalid") from error
+            if host != "127.0.0.1" or not 1 <= port <= 65535:
+                raise OwnerTransportError("owner endpoint address is not loopback-only")
+            return (host, port), "AF_INET"
+        if metadata_family == self.family and isinstance(metadata_address, str):
+            return metadata_address, self.family
+        raise OwnerTransportError("owner endpoint metadata uses an incompatible IPC endpoint")
 
     @staticmethod
     def _recv_bytes(connection, timeout: float) -> bytes:

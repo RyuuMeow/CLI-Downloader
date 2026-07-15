@@ -18,10 +18,17 @@ def _source_project() -> dict[str, Any]:
         return {}
 
 
-try:
-    __version__ = version("cli-downloader")
-except PackageNotFoundError:
-    __version__ = str(_source_project().get("version", "0+unknown"))
+_SOURCE_PROJECT = _source_project()
+_SOURCE_VERSION = _SOURCE_PROJECT.get("version")
+if isinstance(_SOURCE_VERSION, str) and _SOURCE_VERSION:
+    # A source checkout is authoritative even when an editable install left
+    # older dist-info behind. Packaged builds include this same pyproject file.
+    __version__ = _SOURCE_VERSION
+else:
+    try:
+        __version__ = version("cli-downloader")
+    except PackageNotFoundError:
+        __version__ = "0+unknown"
 
 
 def project_url(name: str) -> str | None:
@@ -35,6 +42,6 @@ def project_url(name: str) -> str | None:
         label, separator, url = entry.partition(",")
         if separator and label.strip().lower() == name.lower():
             return url.strip() or None
-    urls = _source_project().get("urls", {})
+    urls = _SOURCE_PROJECT.get("urls", {})
     value = urls.get(name) if isinstance(urls, dict) else None
     return str(value) if value else None
