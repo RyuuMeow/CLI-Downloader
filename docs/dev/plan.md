@@ -2,7 +2,7 @@
 
 Updated: 2026-07-15
 
-This document contains active work only. Completed P2, P3, P4, and P5-02 through P5-13 tasks
+This document contains active work only. Completed P2, P3, P4, P5-02 through P5-13, and P5-18 tasks
 have been removed. The application is not released, so compatibility with removed legacy
 databases, imports, layouts, commands, and CLI argument forms remains out of scope.
 
@@ -10,11 +10,10 @@ databases, imports, layouts, commands, and CLI argument forms remains out of sco
 
 | Order | Task | Status | Depends on |
 | --- | --- | --- | --- |
-| 1 | P5-18 Scale Tasks UI And Batch Projections | Planned | - |
-| 2 | P5-14 Forward Download Requests With Wait And Detach Modes | Planned | P5-18 |
-| 3 | P5-15 Route Task Control Through The Scheduler Owner | Planned | P5-14 |
-| 4 | P5-16 Harden IPC Recovery, Security, And Packaging | Planned | P5-14, P5-15 |
-| 5 | P5-17 Add The Agent-Control Workflow And End-To-End Verification | Planned | P5-14 through P5-16 |
+| 1 | P5-14 Forward Download Requests With Wait And Detach Modes | Planned | - |
+| 2 | P5-15 Route Task Control Through The Scheduler Owner | Planned | P5-14 |
+| 3 | P5-16 Harden IPC Recovery, Security, And Packaging | Planned | P5-14, P5-15 |
+| 4 | P5-17 Add The Agent-Control Workflow And End-To-End Verification | Planned | P5-14 through P5-16 |
 
 ## Direction And Boundaries
 
@@ -220,101 +219,6 @@ Planned.
   never creates two active owners or duplicate accepted Tasks.
 - The complete isolated Core/plugin verification gate, multi-process IPC suite, Portable smoke,
   build, and documentation checks pass.
-
-## P5-18 Scale Tasks UI And Batch Projections
-
-### Status
-
-Planned. This task is independent from IPC ownership, but it must finish before forwarded commands
-make the visible Shell the primary control surface for every download.
-
-### Confirmed Problem
-
-- The Tasks root view currently builds every child `TaskNode` to calculate one Batch parent row.
-  A Batch with 1000 Items therefore performs child, asset, attempt, scheduler, and byte projection
-  work even while the user remains outside the Batch.
-- The Batch child view rebuilds all child projections during periodic refresh. Per-child calls to
-  `get_child`, `list_assets`, `list_attempts`, and scheduler lookup create an N+1 query pattern.
-- Entry sequence calculation reloads and scans the complete parent entry list for each resolved
-  child. A 1000-Item Batch can therefore approach O(n^2) entry decoding during one refresh.
-- The Textual event loop performs synchronous projection, row comparison, cell updates, detail
-  refresh, focus changes, column resizing, and layout invalidation. Mouse hover, keyboard input,
-  tab switching, and other UI messages wait behind that work.
-- Background workers can enqueue progress callbacks faster than the UI consumes them. Byte and
-  torrent updates are partly throttled at the CLI output boundary, but the Shell needs its own
-  bounded latest-value coalescer.
-
-### Read-Model And Storage Refactor
-
-- Introduce explicit lightweight read models for `TaskRootSummary`, `BatchChildSummary`, and
-  selected Task detail. List rows contain only stable identity, display fields, aggregate progress,
-  status, queue reason, and revision; they do not carry the full execution graph.
-- Give the Tasks root view a Batch summary projection that reads title, source, site, aggregate
-  counts, byte progress, state, and revision without constructing child nodes or decoding every
-  entry payload. Maintain aggregate state transactionally with execution changes when a simple
-  bounded query cannot provide the required cost.
-- Add stable, paged Batch child-summary queries with total count and ordering. Fetch entries,
-  children, aggregated asset counts or bytes, attempt counts, and scheduler state in a bounded
-  number of bulk operations rather than one transaction per row.
-- Compute entry order once from a persisted sequence or the bulk query result. Remove list-view
-  use of per-child `_entry_sequence()` scans.
-- Do not read the same child's assets twice, call `os.path.getsize`, or calculate full output-file
-  lists for table rows. Load files, failures, attempts, and filesystem details only when the user
-  selects or opens one Task.
-- Expose projection revisions or `updated_at` generations so the UI can ask for rows changed since
-  its last snapshot and still run a periodic full consistency check after missed notifications.
-
-### Tasks UI Update Model
-
-- Build storage snapshots outside the Textual event loop using worker-safe database connections.
-  Tag every request with the current navigation and refresh generation; discard stale results when
-  the user changes tab, leaves a Batch, deletes a Task, or a newer refresh completes first.
-- Replace row-count-based refresh logic with a keyed diff that handles added, removed, reordered,
-  and replaced Task IDs even when the number of rows is unchanged. Update only changed cells and
-  preserve cursor, selection, and scroll position whenever their Task still exists.
-- Use a bounded child page or window for large Batches instead of mounting and diffing every child
-  on each refresh. Start with a stable 100-row page, show current range and total count, and keep
-  navigation deterministic while new children resolve or old Tasks are deleted.
-- Resize columns only after viewport, language, schema, or visible-column changes. Do not force
-  focus, selected-detail rendering, or layout recalculation after an unchanged progress refresh.
-- Keep the periodic refresh as a consistency fallback, not the primary live-update path. Apply
-  owner or worker notifications immediately to the cached read model when their revisions are
-  newer.
-- Coalesce high-frequency progress by Task or asset with latest-value-wins semantics and flush at
-  a bounded UI cadence, initially 100-250 ms. Deliver lifecycle transitions, failures, completion,
-  cancellation, and durable acceptance immediately and never drop their ordering.
-- Ensure closing or navigating away from Tasks cancels pending presentation work without
-  cancelling downloads or losing persisted progress.
-
-### Verification
-
-- Add deterministic 1000-child fixtures for unresolved, mixed, fully resolved, downloading,
-  paused, completed, failed, and auto-deleting Batches. Add a non-gating 10000-child stress fixture
-  for local profiling.
-- Instrument storage calls in tests. Root refresh must not call child-node construction, asset,
-  attempt, filesystem, or per-entry detail reads. One child page must use a bounded query count
-  independent of the Batch's total child count.
-- Verify that repeated unchanged snapshots cause no DataTable row or layout updates; same-count ID
-  replacement, reorder, deletion, and auto-delete apply the correct keyed diff.
-- Verify that a stale worker result cannot reopen a deleted Task, replace a newer page, reset the
-  cursor, or return the user to a Batch they already left.
-- Flood the Shell with progress updates and prove the pending UI queue remains bounded, final byte
-  progress is retained, and lifecycle events arrive in order.
-- Add a Textual responsiveness test with an event-loop sentinel during root and child refresh. Use
-  structural work and query bounds as the deterministic CI gate rather than fragile machine-speed
-  microbenchmarks.
-
-### Acceptance Criteria
-
-- Rendering or refreshing a Batch row in the Tasks root view never materialises its children.
-- Opening a 1000-Item Batch renders only the active bounded page and performs no N+1 or O(n^2)
-  storage work.
-- No synchronous UI-thread operation scales with the total number of children in an unopened or
-  paged Batch. Hover, keyboard, tab, and button state remain responsive during active downloads.
-- Progress coalescing cannot hide terminal state, regress the displayed revision, or allow its
-  in-memory queue to grow without a bound.
-- Existing Task controls, hierarchy navigation, i18n, auto-delete recovery, scheduler queue labels,
-  direct Items, Batch Items, torrent progress, and durable History behavior remain unchanged.
 
 ## Future Version Backlog
 

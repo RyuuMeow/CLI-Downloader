@@ -108,6 +108,77 @@ class TaskNode:
 
 
 @dataclass(frozen=True)
+class TaskRootSummary:
+    """Compact, row-safe read model for the Tasks root projection."""
+
+    task_id: str
+    kind: TaskKind
+    state: TaskState
+    title: str
+    progress: TaskProgress
+    site_id: str | None = None
+    source_url: str | None = None
+    details: dict[str, Any] = field(default_factory=dict)
+
+    def to_task_node(self) -> TaskNode:
+        return TaskNode(
+            task_id=self.task_id,
+            kind=self.kind,
+            state=self.state,
+            title=self.title,
+            progress=self.progress,
+            site_id=self.site_id,
+            source_url=self.source_url,
+            details=dict(self.details),
+        )
+
+
+@dataclass(frozen=True)
+class BatchChildSummary:
+    """One bounded-page Batch child row without its execution graph."""
+
+    task_id: str
+    parent_id: str
+    state: TaskState
+    title: str
+    progress: TaskProgress
+    site_id: str | None = None
+    source_url: str | None = None
+    details: dict[str, Any] = field(default_factory=dict)
+
+    def to_task_node(self) -> TaskNode:
+        return TaskNode(
+            task_id=self.task_id,
+            kind=TaskKind.ITEM,
+            state=self.state,
+            title=self.title,
+            progress=self.progress,
+            parent_id=self.parent_id,
+            site_id=self.site_id,
+            source_url=self.source_url,
+            details=dict(self.details),
+        )
+
+
+@dataclass(frozen=True)
+class BatchChildPage:
+    """Stable, ordered page of Batch child summaries."""
+
+    items: tuple[BatchChildSummary, ...]
+    total_count: int
+    offset: int
+    limit: int
+
+    def __post_init__(self) -> None:
+        if self.total_count < 0 or self.offset < 0 or self.limit <= 0:
+            raise ValueError("BatchChildPage bounds must be non-negative and limit must be positive")
+        if self.offset > self.total_count and self.items:
+            raise ValueError("BatchChildPage offset cannot exceed total count with items")
+        if len(self.items) > self.limit:
+            raise ValueError("BatchChildPage contains more items than its limit")
+
+
+@dataclass(frozen=True)
 class TaskFileNode:
     file_id: str
     name: str

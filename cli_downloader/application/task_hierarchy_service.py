@@ -15,10 +15,13 @@ from cli_downloader.core.batch import (
 from cli_downloader.core.errors import InvalidTaskTransitionError, TaskNotFoundError
 from cli_downloader.core.progress import checkpoint_byte_progress, normalise_byte_progress
 from cli_downloader.core.task_tree import (
+    BatchChildPage,
+    BatchChildSummary,
     TaskFileNode,
     TaskKind,
     TaskNode,
     TaskProgress,
+    TaskRootSummary,
     TaskState,
 )
 from cli_downloader.storage.state_batch_store import StateBatchStore
@@ -99,16 +102,26 @@ class TaskHierarchyService:
             self._execution_coordinator = execution_coordinator
 
     def list_roots(self) -> tuple[TaskNode, ...]:
+        return tuple(summary.to_task_node() for summary in self.list_root_summaries())
+
+    def list_root_summaries(self) -> tuple[TaskRootSummary, ...]:
+        """Build the root projection without materialising Batch children."""
+
         records = self._task_store.list()
         parent_ids = self._batch_store.list_parent_ids()
+        item_ids = tuple(record.task_id for record in records if record.kind is TaskKind.ITEM)
+        internal_entry_ids = self._batch_store.find_entry_ids(item_ids)
         standalone = tuple(
-            self._standalone_node(record)
+            self._standalone_root_summary(record)
             for record in records
             if record.kind is TaskKind.ITEM
-            and self._batch_store.get_entry(record.task_id) is None
+            and record.task_id not in internal_entry_ids
             and record.task_id not in parent_ids
         )
-        batches = tuple(self._batch_node(parent_id) for parent_id in parent_ids)
+        batches = tuple(
+            self._batch_root_summary(parent_id)
+            for parent_id in parent_ids
+        )
         return (*standalone, *batches)
 
     def list_children(self, parent_id: str) -> tuple[TaskNode, ...]:
@@ -116,6 +129,31 @@ class TaskHierarchyService:
             raise TaskNotFoundError(f"task not found: {parent_id}")
         entries = self._batch_store.list_entries(parent_id)
         return tuple(self._entry_node(entry) for entry in entries)
+
+    def list_child_summaries(
+        self,
+        parent_id: str,
+        *,
+        offset: int = 0,
+        limit: int = 100,
+    ) -> BatchChildPage:
+        """Return a bounded child page suitable for the Tasks table."""
+
+        page = self._batch_store.list_child_summaries(
+            parent_id,
+            offset=offset,
+            limit=limit,
+        )
+        items = tuple(
+            self._with_child_scheduler_detail(summary, sequence=offset + index)
+            for index, summary in enumerate(page.items)
+        )
+        return BatchChildPage(
+            items=items,
+            total_count=page.total_count,
+            offset=page.offset,
+            limit=page.limit,
+        )
 
     def get(self, task_id: str) -> TaskNode:
         entry = self._batch_store.get_entry(task_id)
@@ -352,7 +390,65 @@ class TaskHierarchyService:
                 "Batch item controls are unavailable; control the Batch task instead"
             )
 
+    def _batch_root_summary(self, parent_id: str) -> TaskRootSummary:
+        summary = self._batch_store.get_summary(parent_id)
+        record = self._task_store.get(parent_id)
+        if record is None or record.kind is not TaskKind.BATCH:
+            raise TaskNotFoundError(f"batch task record not found: {parent_id}")
+        return TaskRootSummary(
+            task_id=parent_id,
+            kind=TaskKind.BATCH,
+            state=_STANDALONE_STATES[record.status],
+            title=summary.title or parent_id[:8],
+            progress=TaskProgress(
+                completed_files=summary.completed_files,
+                total_files=summary.total_files,
+                preparing_items=(
+                    summary.counts.unresolved
+                    + summary.counts.resolving
+                    + summary.counts.queued
+                ),
+                completed_bytes=summary.completed_bytes,
+                total_bytes=summary.total_bytes,
+            ),
+            site_id=summary.site_id,
+            source_url=summary.source_url,
+            details={
+                "counts": summary.counts.to_dict(),
+                "created_at": record.created_at.astimezone().isoformat(),
+                "revision": record.revision,
+                **self._scheduler_detail(parent_id),
+            },
+        )
+
+    def _standalone_root_summary(self, record: TaskRecord) -> TaskRootSummary:
+        node = self._standalone_node(record)
+        compact_details: dict[str, object] = {
+            "created_at": record.created_at.astimezone().isoformat(),
+            "revision": record.revision,
+        }
+        for key in (
+            "failure",
+            "scheduler_waiting_reason",
+            "scheduler_queue_position",
+            "scheduler_site_id",
+        ):
+            if key in node.details:
+                compact_details[key] = node.details[key]
+        return TaskRootSummary(
+            task_id=node.task_id,
+            kind=node.kind,
+            state=node.state,
+            title=node.title,
+            progress=node.progress,
+            site_id=node.site_id,
+            source_url=node.source_url,
+            details=compact_details,
+        )
+
     def _batch_node(self, parent_id: str) -> TaskNode:
+        """Build a full Batch detail node for selected-task views only."""
+
         snapshot = self._batch_store.get_snapshot(parent_id)
         entries = self._batch_store.list_entries(parent_id)
         child_nodes = tuple(self._entry_node(entry) for entry in entries)
@@ -409,6 +505,25 @@ class TaskHierarchyService:
                 "created_at": self._task_created_at(parent_id),
                 **self._scheduler_detail(parent_id),
             },
+        )
+
+    def _with_child_scheduler_detail(
+        self,
+        summary: BatchChildSummary,
+        *,
+        sequence: int,
+    ) -> BatchChildSummary:
+        details = dict(summary.details)
+        details.update(self._scheduler_detail(summary.parent_id, sequence=sequence))
+        return BatchChildSummary(
+            task_id=summary.task_id,
+            parent_id=summary.parent_id,
+            state=summary.state,
+            title=summary.title,
+            progress=summary.progress,
+            site_id=summary.site_id,
+            source_url=summary.source_url,
+            details=details,
         )
 
     def _entry_node(self, entry: BatchEntry) -> TaskNode:

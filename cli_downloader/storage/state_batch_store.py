@@ -14,6 +14,8 @@ from cli_downloader.core.batch import (
     BatchEntryStatus,
     BatchParent,
     BatchSnapshot,
+    BatchSummary,
+    BatchCounts,
     DuplicateKind,
     DownloadAsset,
     DownloadChild,
@@ -29,12 +31,19 @@ from cli_downloader.core.batch import (
     validate_asset_transition,
     validate_child_transition,
     derive_batch_snapshot,
+    derive_batch_execution_status,
     validate_entry_transition,
 )
 from cli_downloader.core.models import DownloadStrategy
 from cli_downloader.core.errors import BatchConflictError, BatchNotFoundError
 from cli_downloader.core.events import TaskEvent
 from cli_downloader.core.history_records import DownloadHistoryRecord
+from cli_downloader.core.task_tree import (
+    BatchChildPage,
+    BatchChildSummary,
+    TaskProgress,
+    TaskState,
+)
 from cli_downloader.storage.state_database import StateDatabase, StateUnitOfWork
 from cli_downloader.storage.task_store import TaskRecord
 
@@ -83,6 +92,153 @@ class StateBatchStore:
     def list_parent_ids(self) -> tuple[str, ...]:
         with StateUnitOfWork(self._database) as unit_of_work:
             return unit_of_work.execution.list_batch_ids()
+
+    def find_entry_ids(self, task_ids: tuple[str, ...]) -> frozenset[str]:
+        """Return matching Batch entry IDs in one bounded SQL query.
+
+        This is used only to hide legacy entry Task rows from the root view;
+        it avoids one ``get_entry`` transaction per Task record.
+        """
+
+        if not task_ids:
+            return frozenset()
+        placeholders = ",".join("?" for _ in task_ids)
+        with StateUnitOfWork(self._database) as unit_of_work:
+            rows = unit_of_work.connection.execute(
+                f"SELECT entry_id FROM execution_entries WHERE entry_id IN ({placeholders})",
+                task_ids,
+            ).fetchall()
+        return frozenset(str(row[0]) for row in rows)
+
+    def get_summary(self, parent_id: str) -> BatchSummary:
+        """Read a Batch root aggregate without decoding its child graph."""
+
+        with StateUnitOfWork(self._database) as unit_of_work:
+            connection = unit_of_work.connection
+            root = connection.execute(
+                "SELECT title FROM execution_batches WHERE task_id = ?",
+                (parent_id,),
+            ).fetchone()
+            if root is None:
+                raise BatchNotFoundError(f"batch parent not found: {parent_id}")
+            count_rows = connection.execute(
+                """
+                SELECT entry.status, child.status, COUNT(*)
+                FROM execution_entries AS entry
+                LEFT JOIN execution_children AS child ON child.entry_id = entry.entry_id
+                WHERE entry.task_id = ?
+                GROUP BY entry.status, child.status
+                """,
+                (parent_id,),
+            ).fetchall()
+            first = connection.execute(
+                """
+                SELECT entry_id, payload_json
+                FROM execution_entries
+                WHERE task_id = ?
+                ORDER BY position
+                LIMIT 1
+                """,
+                (parent_id,),
+            ).fetchone()
+            byte_row = connection.execute(
+                """
+                SELECT
+                    COUNT(*),
+                    SUM(CASE WHEN asset.status = ? THEN 1 ELSE 0 END),
+                    COALESCE(SUM(CASE
+                        WHEN json_type(asset.payload_json, '$.metadata.torrent_checkpoint.completed_bytes')
+                             IN ('integer', 'real')
+                        THEN CAST(json_extract(asset.payload_json,
+                             '$.metadata.torrent_checkpoint.completed_bytes') AS INTEGER)
+                        ELSE 0 END), 0),
+                    COALESCE(SUM(CASE
+                        WHEN json_type(asset.payload_json, '$.metadata.torrent_checkpoint.total_bytes')
+                             IN ('integer', 'real')
+                        THEN CAST(json_extract(asset.payload_json,
+                             '$.metadata.torrent_checkpoint.total_bytes') AS INTEGER)
+                        ELSE 0 END), 0),
+                    SUM(CASE
+                        WHEN json_type(asset.payload_json, '$.metadata.torrent_checkpoint.total_bytes')
+                             IN ('integer', 'real')
+                        THEN 0 ELSE 1 END)
+                FROM execution_assets AS asset
+                JOIN execution_children AS child ON child.child_id = asset.child_id
+                WHERE child.task_id = ?
+                """,
+                (AssetStatus.COMPLETED.value, parent_id),
+            ).fetchone()
+
+        counts = _batch_counts_from_rows(count_rows)
+        entry = _entry_from_payload(first[1]) if first is not None else None
+        asset_count = int(byte_row[0] or 0)
+        completed_asset_count = int(byte_row[1] or 0)
+        missing_total = int(byte_row[4] or 0)
+        return BatchSummary(
+            parent_id=parent_id,
+            title=root[0],
+            first_entry_id=entry.entry_id if entry is not None else None,
+            site_id=entry.site_id if entry is not None else None,
+            source_url=entry.source_url if entry is not None else None,
+            counts=counts,
+            execution_status=derive_batch_execution_status(counts),
+            completed_files=completed_asset_count,
+            total_files=asset_count,
+            completed_bytes=int(byte_row[2] or 0),
+            total_bytes=(int(byte_row[3] or 0) if asset_count > 0 and missing_total == 0 else None),
+        )
+
+    def list_child_summaries(
+        self,
+        parent_id: str,
+        *,
+        offset: int = 0,
+        limit: int = 100,
+    ) -> BatchChildPage:
+        """Return one bounded Batch child page using bulk aggregate queries."""
+
+        if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
+            raise ValueError("offset must be a non-negative integer")
+        if isinstance(limit, bool) or not isinstance(limit, int) or limit <= 0:
+            raise ValueError("limit must be a positive integer")
+        limit = min(limit, 500)
+        with StateUnitOfWork(self._database) as unit_of_work:
+            connection = unit_of_work.connection
+            exists = connection.execute(
+                "SELECT 1 FROM execution_batches WHERE task_id = ?", (parent_id,)
+            ).fetchone()
+            if exists is None:
+                raise BatchNotFoundError(f"batch parent not found: {parent_id}")
+            total_row = connection.execute(
+                "SELECT COUNT(*) FROM execution_entries WHERE task_id = ?", (parent_id,)
+            ).fetchone()
+            total_count = int(total_row[0] or 0)
+            rows = connection.execute(
+                """
+                SELECT entry.entry_id, entry.position, entry.status, entry.payload_json,
+                       entry.child_id, child.status, child.payload_json
+                FROM execution_entries AS entry
+                LEFT JOIN execution_children AS child ON child.entry_id = entry.entry_id
+                WHERE entry.task_id = ?
+                ORDER BY entry.position
+                LIMIT ? OFFSET ?
+                """,
+                (parent_id, limit, offset),
+            ).fetchall()
+            child_ids = tuple(str(row[4]) for row in rows if row[4] is not None)
+            asset_counts = _asset_summary_rows(connection, child_ids)
+            attempt_counts = _attempt_summary_rows(connection, child_ids)
+
+        summaries = tuple(
+            _child_summary_from_row(row, asset_counts, attempt_counts)
+            for row in rows
+        )
+        return BatchChildPage(
+            items=summaries,
+            total_count=total_count,
+            offset=offset,
+            limit=limit,
+        )
 
     def create_task_and_batch(
         self,
@@ -633,4 +789,171 @@ def _entry_identity(entry: BatchEntry) -> tuple[str, ...]:
         entry.candidate_id,
         entry.source_operation_id,
         entry.source_url,
+    )
+
+
+def _batch_counts_from_rows(rows: object) -> BatchCounts:
+    counts = {name: 0 for name in BatchCounts.__dataclass_fields__}
+    for entry_status_value, child_status_value, raw_count in rows:
+        count = int(raw_count)
+        entry_status = BatchEntryStatus(entry_status_value)
+        if entry_status is BatchEntryStatus.PENDING_RESOLUTION:
+            counts["unresolved"] += count
+        elif entry_status is BatchEntryStatus.RESOLVING:
+            counts["resolving"] += count
+        elif entry_status in {
+            BatchEntryStatus.RESOLUTION_FAILED,
+            BatchEntryStatus.PACKAGE_REJECTED,
+        }:
+            counts["rejected"] += count
+        elif entry_status is BatchEntryStatus.DUPLICATE_SKIPPED:
+            counts["skipped"] += count
+        elif entry_status is BatchEntryStatus.CANCELLED:
+            counts["cancelled"] += count
+        elif child_status_value is None:
+            # A package-ready entry without a joined child is an incomplete
+            # handoff. Keep it visible as preparing until the next refresh.
+            counts["unresolved"] += count
+        else:
+            child_status = DownloadChildStatus(child_status_value)
+            category = {
+                DownloadChildStatus.QUEUED: "queued",
+                DownloadChildStatus.DOWNLOADING: "downloading",
+                DownloadChildStatus.COMPLETED: "completed",
+                DownloadChildStatus.PARTIALLY_COMPLETED: "failed",
+                DownloadChildStatus.FAILED: "failed",
+                DownloadChildStatus.CANCELLED: "cancelled",
+            }[child_status]
+            counts[category] += count
+    return BatchCounts(**counts)
+
+
+def _asset_summary_rows(connection: object, child_ids: tuple[str, ...]) -> dict[str, tuple[int, int, int, int, int]]:
+    if not child_ids:
+        return {}
+    placeholders = ",".join("?" for _ in child_ids)
+    rows = connection.execute(
+        f"""
+        SELECT child_id,
+               COUNT(*),
+               SUM(CASE WHEN status = ? THEN 1 ELSE 0 END),
+               COALESCE(SUM(CASE
+                   WHEN json_type(payload_json, '$.metadata.torrent_checkpoint.completed_bytes')
+                        IN ('integer', 'real')
+                   THEN CAST(json_extract(payload_json,
+                        '$.metadata.torrent_checkpoint.completed_bytes') AS INTEGER)
+                   ELSE 0 END), 0),
+               COALESCE(SUM(CASE
+                   WHEN json_type(payload_json, '$.metadata.torrent_checkpoint.total_bytes')
+                        IN ('integer', 'real')
+                   THEN CAST(json_extract(payload_json,
+                        '$.metadata.torrent_checkpoint.total_bytes') AS INTEGER)
+                   ELSE 0 END), 0),
+               SUM(CASE
+                   WHEN json_type(payload_json, '$.metadata.torrent_checkpoint.total_bytes')
+                        IN ('integer', 'real')
+                   THEN 0 ELSE 1 END)
+        FROM execution_assets
+        WHERE child_id IN ({placeholders})
+        GROUP BY child_id
+        """,
+        (AssetStatus.COMPLETED.value, *child_ids),
+    ).fetchall()
+    return {
+        str(row[0]): (
+            int(row[1] or 0),
+            int(row[2] or 0),
+            int(row[3] or 0),
+            int(row[4] or 0),
+            int(row[5] or 0),
+        )
+        for row in rows
+    }
+
+
+def _attempt_summary_rows(connection: object, child_ids: tuple[str, ...]) -> dict[str, int]:
+    if not child_ids:
+        return {}
+    placeholders = ",".join("?" for _ in child_ids)
+    rows = connection.execute(
+        f"""
+        SELECT child_id, COUNT(*)
+        FROM execution_attempts
+        WHERE child_id IN ({placeholders})
+        GROUP BY child_id
+        """,
+        child_ids,
+    ).fetchall()
+    return {str(row[0]): int(row[1] or 0) for row in rows}
+
+
+def _child_summary_from_row(
+    row: tuple[object, ...],
+    asset_counts: dict[str, tuple[int, int, int, int, int]],
+    attempt_counts: dict[str, int],
+) -> BatchChildSummary:
+    entry = _entry_from_payload(row[3])
+    child_id = str(row[4]) if row[4] is not None else None
+    if child_id is None or row[5] is None or row[6] is None:
+        state = {
+            BatchEntryStatus.PENDING_RESOLUTION: TaskState.PREPARING,
+            BatchEntryStatus.RESOLVING: TaskState.PREPARING,
+            BatchEntryStatus.RESOLUTION_FAILED: TaskState.FAILED,
+            BatchEntryStatus.PACKAGE_REJECTED: TaskState.FAILED,
+            BatchEntryStatus.DUPLICATE_SKIPPED: TaskState.SKIPPED,
+            BatchEntryStatus.CANCELLED: TaskState.CANCELLED,
+            BatchEntryStatus.PACKAGE_READY: TaskState.PREPARING,
+        }[entry.status]
+        details: dict[str, object] = {"preparation_status": entry.status.value}
+        if entry.failure is not None:
+            details["failure"] = entry.failure.to_dict()
+        return BatchChildSummary(
+            task_id=entry.entry_id,
+            parent_id=entry.parent_id,
+            state=state,
+            title=entry.title or entry.candidate_id,
+            progress=TaskProgress(preparing_items=int(state is TaskState.PREPARING)),
+            site_id=entry.site_id,
+            source_url=entry.source_url,
+            details=details,
+        )
+
+    child_status = DownloadChildStatus(row[5])
+    child_payload = json.loads(row[6])
+    asset_count, completed_count, completed_bytes, total_bytes, missing_total = asset_counts.get(
+        child_id, (0, 0, 0, 0, 0)
+    )
+    package_payload = child_payload.get("package", {})
+    state = {
+        DownloadChildStatus.QUEUED: TaskState.QUEUED,
+        DownloadChildStatus.DOWNLOADING: TaskState.RUNNING,
+        DownloadChildStatus.COMPLETED: TaskState.COMPLETED,
+        DownloadChildStatus.PARTIALLY_COMPLETED: TaskState.PARTIALLY_COMPLETED,
+        DownloadChildStatus.FAILED: TaskState.FAILED,
+        DownloadChildStatus.CANCELLED: TaskState.CANCELLED,
+    }[child_status]
+    details = {
+        "preparation_status": entry.status.value,
+        "child_id": child_id,
+        "package_id": package_payload.get("package_id"),
+        "package_version": package_payload.get("version"),
+        "attempt_count": attempt_counts.get(child_id, 0),
+    }
+    failure = entry.failure or _failure_from_payload(child_payload.get("failure"))
+    if failure is not None:
+        details["failure"] = failure.to_dict()
+    return BatchChildSummary(
+        task_id=entry.entry_id,
+        parent_id=entry.parent_id,
+        state=state,
+        title=entry.title or entry.candidate_id,
+        progress=TaskProgress(
+            completed_files=completed_count,
+            total_files=asset_count,
+            completed_bytes=completed_bytes,
+            total_bytes=(total_bytes if asset_count > 0 and missing_total == 0 else None),
+        ),
+        site_id=entry.site_id,
+        source_url=entry.source_url,
+        details=details,
     )
