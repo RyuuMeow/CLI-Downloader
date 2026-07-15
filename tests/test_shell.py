@@ -1518,6 +1518,68 @@ class TextualShellAppTest(IsolatedAsyncioTestCase):
             await pilot.press("escape", "escape", "escape")
             self.assertEqual(tabs.active, "console")
 
+    async def test_switching_equal_length_items_replaces_file_rows(self) -> None:
+        torrent = TaskNode(
+            "torrent-task",
+            TaskKind.ITEM,
+            TaskState.COMPLETED,
+            "Torrent item",
+            TaskProgress(1, 1),
+            site_id="ehentai",
+        )
+        direct = TaskNode(
+            "direct-task",
+            TaskKind.ITEM,
+            TaskState.COMPLETED,
+            "Direct item",
+            TaskProgress(1, 1),
+            site_id="pixiv",
+        )
+        files = {
+            "torrent-task": (
+                TaskFileNode(
+                    "torrent-file",
+                    "gallery.torrent",
+                    "completed",
+                    location="downloads/ehentai/gallery.torrent",
+                ),
+            ),
+            "direct-task": (
+                TaskFileNode(
+                    "direct-file",
+                    "illustration.png",
+                    "completed",
+                    location="downloads/pixiv/illustration.png",
+                ),
+            ),
+        }
+        service = SimpleNamespace(
+            list_roots=lambda: (direct, torrent),
+            list_files=lambda task_id: files[task_id],
+        )
+        app = TextualShellApp(
+            InteractiveShell(task_service_loader=lambda: service)
+        )
+
+        async with app.run_test() as pilot:
+            app.query_one(TabbedContent).active = "tasks"
+            await pilot.pause()
+            table = app.query_one("#task-file-table", DataTable)
+
+            app._open_task("torrent-task")
+            self.assertEqual(str(table.get_row_at(0)[1]), "gallery.torrent")
+            self.assertEqual(tuple(str(key.value) for key in table.rows), ("torrent-file",))
+
+            app._task_back()
+            app._open_task("direct-task")
+            self.assertEqual(table.row_count, 1)
+            self.assertEqual(str(table.get_row_at(0)[1]), "illustration.png")
+            self.assertEqual(
+                str(table.get_row_at(0)[5]),
+                "downloads/pixiv/illustration.png",
+            )
+            self.assertEqual(tuple(str(key.value) for key in table.rows), ("direct-file",))
+
     async def test_task_refresh_returns_to_roots_when_open_batch_is_auto_deleted(self) -> None:
         present = True
         batch = TaskNode(

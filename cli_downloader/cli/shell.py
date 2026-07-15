@@ -3509,7 +3509,9 @@ class TextualShellApp(App[int]):
         self._task_files = {file.file_id: file for file in files}
         table = self.query_one("#task-file-table", DataTable)
 
-        if len(table.rows) != len(files):
+        existing_keys = tuple(str(key.value) for key in table.rows)
+        desired_keys = tuple(file.file_id for file in files)
+        if existing_keys != desired_keys:
             table.clear()
             for index, file in enumerate(files, start=1):
                 table.add_row(
@@ -3522,25 +3524,21 @@ class TextualShellApp(App[int]):
                     key=file.file_id,
                 )
         else:
-            for file in files:
-                try:
-                    new_progress = _task_file_progress(file)
-                    if table.get_cell(file.file_id, "progress") != new_progress:
-                        table.update_cell(file.file_id, "progress", new_progress)
-
-                    new_status = _display_status(file.state, self._shell.translator)
-                    if table.get_cell(file.file_id, "status") != new_status:
-                        table.update_cell(file.file_id, "status", new_status)
-
-                    new_attempts = str(file.attempts)
-                    if table.get_cell(file.file_id, "attempts") != new_attempts:
-                        table.update_cell(file.file_id, "attempts", new_attempts)
-
-                    new_location = file.location or "-"
-                    if table.get_cell(file.file_id, "location") != new_location:
-                        table.update_cell(file.file_id, "location", new_location)
-                except Exception:
-                    pass
+            for index, file in enumerate(files, start=1):
+                values = {
+                    "index": _number_cell(index),
+                    "name": file.name,
+                    "progress": _task_file_progress(file),
+                    "status": _display_status(file.state, self._shell.translator),
+                    "attempts": str(file.attempts),
+                    "location": file.location or "-",
+                }
+                for column, value in values.items():
+                    try:
+                        if table.get_cell(file.file_id, column) != value:
+                            table.update_cell(file.file_id, column, value)
+                    except Exception:
+                        pass
         self._task_level = "files"
         self._update_task_page_controls()
         task_label = self._shell.translator("task.path")
