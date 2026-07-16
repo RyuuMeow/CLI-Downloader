@@ -1,6 +1,7 @@
 from tests.state_store_support import StateBatchStore, StateTaskStore
 import asyncio
 from dataclasses import replace
+from hashlib import sha256
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from threading import Event
@@ -42,6 +43,15 @@ class BatchTorrentFetcher:
     async def fetch(self, _asset):
         self.calls += 1
         return b"descriptor"
+
+
+class BatchDirectFetcher:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def fetch(self, _asset):
+        self.calls += 1
+        return b"complete asset"
 
 
 class BatchTorrentClient:
@@ -142,6 +152,51 @@ def _batch_torrent_fixture(root: Path, outcome: TorrentOutcome):
     return store, child
 
 
+def _batch_direct_fixture(root: Path):
+    database = StateDatabase(root / "state.sqlite3")
+    store = StateBatchStore(database)
+    asset = DownloadAsset(
+        site_id="example",
+        gallery_id="direct-gallery",
+        plugin_asset_key="direct-1",
+        url="https://example.test/direct/item",
+        filename="item.jpg",
+        index=1,
+    )
+    package = DownloadPackage(
+        package_id="direct-package",
+        version=1,
+        plugin_id="example",
+        site_id="example",
+        gallery_id="direct-gallery",
+        source_operation_id="resolve_gallery",
+        source_url="https://example.test/gallery/direct",
+        strategy=DownloadStrategy.DIRECT,
+        assets=(asset,),
+        title="Direct Gallery",
+        folder_template="{task_id}",
+    )
+    entry = BatchEntry(
+        entry_id="direct-entry",
+        parent_id="direct-parent",
+        plugin_id="example",
+        site_id="example",
+        candidate_id="direct-candidate",
+        source_operation_id="resolve_gallery",
+        source_url="https://example.test/gallery/direct",
+        status=BatchEntryStatus.RESOLVING,
+    )
+    store.create_batch(BatchParent("direct-parent", (entry.entry_id,)), (entry,))
+    child = DownloadChild(
+        child_id="direct-child",
+        parent_id="direct-parent",
+        entry_id=entry.entry_id,
+        package=package,
+    )
+    store.attach_child(entry.entry_id, child)
+    return store, child
+
+
 def _items() -> tuple[ListItemData, ...]:
     return (
         ListItemData(
@@ -158,6 +213,43 @@ def _items() -> tuple[ListItemData, ...]:
 
 
 class BatchServiceTests(unittest.TestCase):
+    def test_direct_prefix_checkpoint_is_never_promoted_as_complete(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            store, child = _batch_direct_fixture(root)
+            partial = root / child.child_id / "item.jpg.part"
+            partial.parent.mkdir(parents=True, exist_ok=True)
+            partial.write_bytes(b"prefix")
+            record = store.list_assets(child.child_id)[0]
+            store.update_asset(
+                child.child_id,
+                replace(
+                    record,
+                    status=AssetStatus.DOWNLOADING,
+                    partial_path=str(partial),
+                    content_sha256=sha256(b"prefix").hexdigest(),
+                ),
+            )
+            fetcher = BatchDirectFetcher()
+            downloader = SystemBatchDownloader(
+                file_writer=AssetFileWriter(root),
+                store=store,
+                fetchers={"example": fetcher},
+            )
+
+            outcomes = asyncio.run(
+                downloader.execute(
+                    child,
+                    (store.list_assets(child.child_id)[0],),
+                    Event(),
+                    lambda _reason, _data: None,
+                )
+            )
+
+            self.assertEqual(fetcher.calls, 1)
+            self.assertEqual(outcomes[0].status, AssetStatus.COMPLETED)
+            self.assertEqual(Path(outcomes[0].final_path).read_bytes(), b"complete asset")
+
     def test_selection_persists_explicit_download_strategy_on_entries(self) -> None:
         with TemporaryDirectory() as directory:
             database = StateDatabase(Path(directory) / "state.sqlite3")
@@ -736,6 +828,9 @@ class BatchServiceTests(unittest.TestCase):
             self.assertEqual(outcomes[0].status, AssetStatus.DOWNLOADING)
             self.assertTrue(client.shutdown_seen)
             self.assertFalse(client.cancel_called)
+            checkpoint = store.list_assets(child.child_id)[0].metadata["torrent_checkpoint"]
+            self.assertEqual(checkpoint["status"], "downloading")
+            self.assertEqual(checkpoint["progress"], 0.5)
 
 
 if __name__ == "__main__":

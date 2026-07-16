@@ -329,6 +329,8 @@ class OwnerPipeServer:
 
     def _handle(self, connection) -> None:
         send_lock = Lock()
+        request: OwnerRequest | None = None
+        stream: OwnerResponseStream | None = None
 
         def send(payload: bytes) -> None:
             with send_lock:
@@ -388,6 +390,11 @@ class OwnerPipeServer:
             with self._response_lock:
                 self._response_cache[request.request_id] = tuple(response_events)
         except Exception as error:  # endpoint failures must not take down Shell
+            if request is not None and (stream is None or not stream.accepted):
+                # No durable Task/acceptance event exists for this request;
+                # allow the same request ID to be retried after a transient
+                # admission state such as RECOVERING.
+                self.ledger.discard(request.request_id)
             try:
                 send(
                     _frame(

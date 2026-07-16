@@ -450,40 +450,25 @@ class SystemBatchDownloader(BatchDownloadExecutor):
                 append_outcome(replace(record, status=AssetStatus.CANCELLED))
                 continue
             legacy_asset = _legacy_asset(record.asset)
-            resumed = None
+            # A direct-stream checkpoint is a verified prefix, not a complete
+            # asset.  The current fetcher contract has no range-resume
+            # capability, so never promote it with ``AssetFileWriter.resume``.
+            # Validate the prefix for diagnostics and let the next write
+            # safely replace it from byte zero.
             if record.partial_path is not None and record.content_sha256 is not None:
-                resumed = self._file_writer.resume(
-                    _legacy_asset(record.asset, include_plugin_asset_key=False),
-                    task_id=child.child_id,
-                    partial_path=record.partial_path,
-                    content_sha256=record.content_sha256,
-                    folder_fields=_package_folder_fields(child.package),
-                    folder_template=child.package.folder_template,
-                )
-                if resumed is None:
-                    resumed = self._file_writer.resume(
-                        legacy_asset,
-                        task_id=child.child_id,
-                        partial_path=record.partial_path,
-                        content_sha256=record.content_sha256,
-                        folder_fields=_package_folder_fields(child.package),
-                        folder_template=child.package.folder_template,
-                    )
-            if resumed is not None:
-                append_outcome(
-                    replace(
-                        record,
-                        status=AssetStatus.COMPLETED,
-                        failure=None,
-                        partial_path=None,
-                        final_path=str(resumed.path),
-                    )
-                )
-                progress(
-                    "asset_resumed",
-                    {"asset_id": record.asset.asset_id, "path": str(resumed.path)},
-                )
-                continue
+                partial = Path(record.partial_path)
+                try:
+                    if partial.is_file():
+                        digest = sha256()
+                        with partial.open("rb") as stream:
+                            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                                digest.update(chunk)
+                        if digest.hexdigest() != record.content_sha256:
+                            partial.unlink(missing_ok=True)
+                except OSError:
+                    # The subsequent fetch/write path remains authoritative;
+                    # an inaccessible prefix must not become a completion.
+                    pass
             fetcher = self._fetchers.get(record.asset.site_id)
             if hasattr(fetcher, "fetch_stream"):
                 hash_obj = sha256()
@@ -901,6 +886,12 @@ class SystemBatchDownloader(BatchDownloadExecutor):
                         handle,
                         **poll_kwargs,
                     )
+                    # qBittorrent returns the last observed state directly on
+                    # owner shutdown, before its polling helper can emit the
+                    # normal callback. Persist that observation so restart
+                    # reconciliation does not mistake a submitted torrent
+                    # for an unknown state.
+                    _status_callback(outcome)
                 else:
                     outcome = await self._torrent_client.get_status(handle)
                     _status_callback(outcome)

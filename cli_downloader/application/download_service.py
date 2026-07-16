@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
+from hashlib import sha256
 from pathlib import Path
 from typing import Callable, Mapping, Protocol
 from uuid import uuid4
@@ -53,6 +54,38 @@ from cli_downloader.storage.state_history_store import StateHistoryStore
 TaskIdFactory = Callable[[], str]
 DownloadProgress = Callable[[int, int], None]
 ByteProgress = Callable[[str, int, int | None], None]
+
+
+def _sha256_file(path: Path) -> str:
+    digest = sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _verified_checkpoint(
+    metadata: Mapping[str, object],
+    asset_url: str,
+    fallback_path: str | None,
+) -> tuple[Path, str, int | None] | None:
+    checkpoints = metadata.get("completed_assets")
+    if not isinstance(checkpoints, (list, tuple)):
+        return None
+    for value in checkpoints:
+        if not isinstance(value, Mapping) or value.get("url") != asset_url:
+            continue
+        path_value = value.get("path") or fallback_path
+        digest = value.get("sha256")
+        bytes_value = value.get("bytes")
+        if not isinstance(path_value, str) or not path_value:
+            return None
+        if not isinstance(digest, str) or len(digest) != 64:
+            return None
+        if not isinstance(bytes_value, int) or isinstance(bytes_value, bool) or bytes_value < 0:
+            bytes_value = None
+        return Path(path_value), digest, bytes_value
+    return None
 
 
 class CancelSignal(Protocol):
@@ -651,22 +684,35 @@ class WriteAssetsStage:
                 raise asyncio.CancelledError
 
             if index < completed_count and index < len(existing_outputs):
-                existing_path = Path(existing_outputs[index])
-                if existing_path.is_file():
-                    written_assets.append(
-                        WrittenAsset(
-                            asset_url=asset.url,
-                            path=existing_path,
-                            bytes_written=existing_path.stat().st_size,
-                        )
-                    )
-                    if self._progress is not None:
-                        self._progress(len(written_assets), total)
-                    self._active_asset = None
-                    self._active_partial_path = None
-                    continue
+                checkpoint = _verified_checkpoint(
+                    record.metadata,
+                    asset.url,
+                    existing_outputs[index],
+                )
+                if checkpoint is not None:
+                    existing_path, expected_digest, expected_bytes = checkpoint
+                    if existing_path.is_file():
+                        actual_bytes = existing_path.stat().st_size
+                        if (expected_bytes is None or actual_bytes == expected_bytes) and (
+                            await asyncio.to_thread(_sha256_file, existing_path)
+                            == expected_digest
+                        ):
+                            written_assets.append(
+                                WrittenAsset(
+                                    asset_url=asset.url,
+                                    path=existing_path,
+                                    bytes_written=actual_bytes,
+                                )
+                            )
+                            if self._progress is not None:
+                                self._progress(len(written_assets), total)
+                            self._active_asset = None
+                            self._active_partial_path = None
+                            continue
 
+            content_sha256: str
             if hasattr(self._fetcher, "fetch_stream"):
+                hash_obj = sha256()
 
                 async def _chunk_generator():
                     import time
@@ -679,6 +725,7 @@ class WriteAssetsStage:
                             lease_controller=lease_controller,
                         )
                         bytes_so_far += len(chunk)
+                        hash_obj.update(chunk)
                         if self._byte_progress is not None:
                             now = time.monotonic()
                             if (
@@ -708,6 +755,7 @@ class WriteAssetsStage:
                     else await fetch_and_write()
                 )
                 written_assets.append(written_asset)
+                content_sha256 = hash_obj.hexdigest()
             else:
 
                 async def fetch_asset() -> bytes:
@@ -733,10 +781,29 @@ class WriteAssetsStage:
                         folder_template=folder_template,
                     )
                 )
+                content_sha256 = sha256(content).hexdigest()
             self._assert_execution_fence(context.task_id)
             current = self._task_store.get(context.task_id)
             if current is None:
                 raise RuntimeError(f"task disappeared during download: {context.task_id}")
+            completed_assets = [
+                value
+                for value in (
+                    current.metadata.get("completed_assets", [])
+                    if isinstance(current.metadata.get("completed_assets", []), (list, tuple))
+                    else []
+                )
+                if not isinstance(value, Mapping) or value.get("url") != asset.url
+            ]
+            completed_asset = written_assets[-1]
+            completed_assets.append(
+                {
+                    "url": asset.url,
+                    "path": str(completed_asset.path),
+                    "bytes": completed_asset.bytes_written,
+                    "sha256": content_sha256,
+                }
+            )
             self._task_store.upsert(
                 current.transition(
                     metadata={
@@ -744,6 +811,7 @@ class WriteAssetsStage:
                         "completed_files": len(written_assets),
                         "total_files": total,
                         "output_files": [str(item.path) for item in written_assets],
+                        "completed_assets": completed_assets,
                         "partial_files": {
                             key: value
                             for key, value in (
@@ -931,6 +999,10 @@ class WriteAssetsStage:
                         handle,
                         **poll_kwargs,
                     )
+                    # The shutdown path returns a final observed client
+                    # state without invoking the polling callback. Persist it
+                    # before the owner checkpoint is written.
+                    _status_callback(outcome)
                 else:
                     outcome = await self._torrent_client.get_status(handle)
                     _status_callback(outcome)
@@ -1122,6 +1194,7 @@ class WriteAssetsStage:
         partial_files[asset.url] = {
             "path": str(partial),
             "bytes": partial.stat().st_size,
+            "sha256": _sha256_file(partial),
         }
         self._task_store.upsert(
             current.transition(

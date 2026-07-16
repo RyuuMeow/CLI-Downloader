@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from concurrent.futures import Future, TimeoutError as FutureTimeoutError
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
@@ -428,6 +429,9 @@ class BatchPipeline:
         self._active: dict[str, _RunState] = {}
 
     def cancel(self, parent_id: str) -> bool:
+        return self._dispatch_control(parent_id, self._cancel_on_owner_loop)
+
+    def _cancel_on_owner_loop(self, parent_id: str) -> bool:
         active = self._active_task(parent_id)
         if active is None:
             return False
@@ -445,7 +449,9 @@ class BatchPipeline:
 
     def shutdown(self, parent_id: str) -> bool:
         """Stop an owner without converting active work into user cancellation."""
+        return self._dispatch_control(parent_id, self._shutdown_on_owner_loop)
 
+    def _shutdown_on_owner_loop(self, parent_id: str) -> bool:
         active = self._active_task(parent_id)
         if active is None:
             return False
@@ -458,6 +464,9 @@ class BatchPipeline:
         return True
 
     def pause(self, task_id: str) -> bool:
+        return self._dispatch_control(task_id, self._pause_on_owner_loop)
+
+    def _pause_on_owner_loop(self, task_id: str) -> bool:
         active = self._active_task(task_id)
         if active is None:
             return False
@@ -473,6 +482,9 @@ class BatchPipeline:
         return True
 
     def resume(self, task_id: str) -> bool:
+        return self._dispatch_control(task_id, self._resume_on_owner_loop)
+
+    def _resume_on_owner_loop(self, task_id: str) -> bool:
         active = self._active_task(task_id)
         if active is None:
             return False
@@ -500,6 +512,49 @@ class BatchPipeline:
     def is_running(self, task_id: str) -> bool:
         """Return True if the task is currently active in the pipeline."""
         return self._active_task(task_id) is not None
+
+    def _dispatch_control(
+        self,
+        task_id: str,
+        operation: Callable[[str], bool],
+    ) -> bool:
+        """Run a control mutation on the Batch owner's asyncio loop.
+
+        Textual callbacks and IPC handlers execute outside the loop that owns
+        the Batch workers.  Mutating asyncio Events or the run-state sets from
+        those threads is undefined and can leave a paused worker holding its
+        admission lease.  Route the mutation through ``call_soon_threadsafe``
+        and keep a bounded wait for the synchronous service contract.
+        """
+
+        active = self._active_task(task_id)
+        if active is None:
+            return False
+        _root_id, state = active
+        loop = state.loop
+        try:
+            current_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            current_loop = None
+        if loop is None or not loop.is_running() or current_loop is loop:
+            return operation(task_id)
+
+        result: Future[bool] = Future()
+
+        def invoke() -> None:
+            if result.cancelled():
+                return
+            try:
+                result.set_result(operation(task_id))
+            except BaseException as error:
+                result.set_exception(error)
+
+        loop.call_soon_threadsafe(invoke)
+        try:
+            return bool(result.result(timeout=5.0))
+        except FutureTimeoutError:
+            result.cancel()
+            return False
 
     def _active_task(self, task_id: str) -> tuple[str, _RunState] | None:
         state = self._active.get(task_id)

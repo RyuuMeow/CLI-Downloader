@@ -42,11 +42,16 @@ from cli_downloader.core.history_records import DownloadHistoryRecord
 from cli_downloader.core.task_tree import (
     BatchChildPage,
     BatchChildSummary,
+    TaskKind,
     TaskProgress,
     TaskState,
 )
 from cli_downloader.storage.state_database import StateDatabase, StateUnitOfWork
-from cli_downloader.storage.task_store import TaskRecord
+from cli_downloader.storage.task_store import (
+    TaskDesiredControl,
+    TaskRecord,
+    TaskStatus,
+)
 
 
 class StateBatchStore:
@@ -93,6 +98,85 @@ class StateBatchStore:
     def list_parent_ids(self) -> tuple[str, ...]:
         with StateUnitOfWork(self._database) as unit_of_work:
             return unit_of_work.execution.list_batch_ids()
+
+    def recover_interrupted_root(
+        self,
+        parent_id: str,
+        *,
+        execution_fence: str,
+    ) -> TaskRecord | None:
+        """Atomically rebuild one Batch root's owner checkpoint.
+
+        Recovery used to update the public Task row and the execution graph in
+        separate repository transactions.  A crash between those writes
+        could leave a paused parent with a downloading child, or a resumed
+        parent whose stale child still owned an admission state.  Keep the
+        root's task, child, and asset normalization in one Unit of Work so a
+        new owner observes one coherent checkpoint.
+        """
+
+        with StateUnitOfWork(self._database) as unit_of_work:
+            if parent_id not in unit_of_work.execution.list_batch_ids():
+                return None
+            current = unit_of_work.tasks.get(parent_id)
+            if current is None or current.kind is not TaskKind.BATCH:
+                return current
+            if current.status not in {
+                TaskStatus.PENDING,
+                TaskStatus.PLANNED,
+                TaskStatus.RUNNING,
+                TaskStatus.PAUSED,
+            }:
+                return current
+
+            paused = current.status is TaskStatus.PAUSED
+            updated = current.transition(
+                status=TaskStatus.PAUSED if paused else (
+                    TaskStatus.PLANNED
+                    if current.status is TaskStatus.RUNNING
+                    else current.status
+                ),
+                desired_control=(
+                    TaskDesiredControl.PAUSE if paused else TaskDesiredControl.RUN
+                ),
+                active_run_id=None,
+                metadata={**current.metadata, "execution_fence": execution_fence},
+            )
+            unit_of_work.tasks.upsert(updated)
+
+            # A worker can be interrupted after it marks a child/asset
+            # DOWNLOADING but before it releases the process.  Requeue those
+            # operational rows for the next explicit resume.  Checkpoint
+            # metadata (partial files and torrent handles) remains untouched.
+            for _entry_id, _entry_status, _payload, child_id in unit_of_work.execution.list_entry_payloads(
+                parent_id
+            ):
+                if not isinstance(child_id, str) or not child_id:
+                    continue
+                child_payload = unit_of_work.execution.get_child_payload(child_id)
+                if child_payload is None:
+                    continue
+                child = _child_from_payload(child_payload)
+                if child.status is not DownloadChildStatus.DOWNLOADING:
+                    continue
+                queued_child = replace(child, status=DownloadChildStatus.QUEUED)
+                unit_of_work.execution.update_child(
+                    child.child_id,
+                    queued_child.status.value,
+                    queued_child.to_dict(),
+                )
+                for asset_payload in unit_of_work.execution.list_asset_payloads(child.child_id):
+                    asset = _asset_record_from_payload(asset_payload)
+                    if asset.status is not AssetStatus.DOWNLOADING:
+                        continue
+                    queued_asset = replace(asset, status=AssetStatus.QUEUED)
+                    unit_of_work.execution.update_asset(
+                        child.child_id,
+                        queued_asset.asset.asset_id,
+                        queued_asset.status.value,
+                        queued_asset.to_dict(),
+                    )
+            return updated
 
     def find_entry_ids(self, task_ids: tuple[str, ...]) -> frozenset[str]:
         """Return matching Batch entry IDs in one bounded SQL query.

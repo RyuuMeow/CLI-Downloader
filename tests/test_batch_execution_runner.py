@@ -352,6 +352,49 @@ class CoordinatedBatchRunnerTests(TestCase):
         with TemporaryDirectory() as directory:
             asyncio.run(scenario(directory))
 
+    def test_cross_thread_batch_control_is_dispatched_to_owner_loop(self) -> None:
+        async def scenario(directory: str) -> None:
+            root = Path(directory)
+            batches = StateBatchStore(root / "state.sqlite3")
+            tasks = StateTaskStore(root / "state.sqlite3")
+            entry = _entry()
+            batches.create_batch(BatchParent("parent-1", (entry.entry_id,)), (entry,))
+            tasks.upsert(
+                TaskRecord(
+                    task_id="parent-1",
+                    status=TaskStatus.PENDING,
+                    kind=TaskKind.BATCH,
+                )
+            )
+            resolver = PauseBoundaryResolver()
+            pipeline = BatchPipeline(
+                store=batches,
+                resolver=resolver,
+                downloader=ImmediateDownloader(),
+            )
+            coordinator = TaskExecutionCoordinator(task_store=tasks)
+            runner = CoordinatedBatchRunner(pipeline=pipeline, coordinator=coordinator)
+
+            running = asyncio.create_task(runner.run_batch("parent-1"))
+            await asyncio.wait_for(resolver.started.wait(), timeout=ASYNC_TEST_TIMEOUT)
+            await coordinator.request_pause("parent-1")
+            self.assertTrue(await asyncio.to_thread(pipeline.pause, "parent-1"))
+            resolver.release_boundary.set()
+
+            for _ in range(20):
+                if tasks.get("parent-1").status is TaskStatus.PAUSED:
+                    break
+                await asyncio.sleep(0.01)
+            self.assertEqual(tasks.get("parent-1").status, TaskStatus.PAUSED)
+
+            await coordinator.request_resume("parent-1")
+            self.assertTrue(await asyncio.to_thread(pipeline.resume, "parent-1"))
+            result = await asyncio.wait_for(running, timeout=ASYNC_TEST_TIMEOUT)
+            self.assertEqual(result.task_status, TaskStatus.COMPLETED)
+
+        with TemporaryDirectory() as directory:
+            asyncio.run(scenario(directory))
+
     def test_shared_task_store_rejects_second_pipeline_and_tags_events_with_run_id(self) -> None:
         async def scenario(directory: str) -> None:
             root = Path(directory)

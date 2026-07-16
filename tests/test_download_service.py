@@ -2,6 +2,7 @@ import asyncio
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from threading import Event
+from hashlib import sha256
 from unittest import TestCase
 
 from cli_downloader.application.download_service import DownloadService, WriteAssetsStage
@@ -62,6 +63,16 @@ class ShutdownAfterWrite(AssetFileWriter):
 class StaticFetcher:
     async def fetch(self, _asset):
         return b"asset written before shutdown boundary"
+
+
+class CountingDirectFetcher:
+    def __init__(self, content: bytes = b"verified content") -> None:
+        self.content = content
+        self.calls = 0
+
+    async def fetch(self, _asset):
+        self.calls += 1
+        return self.content
 
 
 class ShutdownStreamFetcher:
@@ -424,6 +435,62 @@ class DownloadServiceTest(TestCase):
             output = root / "partial-task" / "partial.txt"
             self.assertEqual(output.read_bytes(), b"ab")
             self.assertEqual(store.get("partial-task").metadata["partial_files"], {})
+
+    def test_tampered_completed_output_is_refetched_instead_of_trusted(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            asset = Asset(
+                "https://example.test/verified",
+                AssetKind.FILE,
+                "verified.txt",
+            )
+            writer = AssetFileWriter(root)
+            target, _partial = writer.paths(asset, task_id="verified-task")
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(b"tampered")
+            store = InMemoryTaskStore()
+            store.upsert(
+                TaskRecord(
+                    "verified-task",
+                    TaskStatus.PLANNED,
+                    metadata={
+                        "completed_files": 1,
+                        "total_files": 1,
+                        "output_files": [str(target)],
+                        "completed_assets": [
+                            {
+                                "url": asset.url,
+                                "path": str(target),
+                                "bytes": len(b"original"),
+                                "sha256": sha256(b"original").hexdigest(),
+                            }
+                        ],
+                    },
+                )
+            )
+            fetcher = CountingDirectFetcher()
+            plan = DownloadStrategyPlan(
+                strategy=DownloadStrategy.DIRECT,
+                reason="test",
+                assets=AssetList((asset,)),
+            )
+            context = PipelineContext(
+                "verified-task",
+                data={
+                    "item": ResolvedItem("example", "example://verified", "Verified"),
+                    "plan": plan,
+                },
+            )
+
+            stage = WriteAssetsStage(
+                fetcher=fetcher,
+                file_writer=writer,
+                task_store=store,
+            )
+            asyncio.run(stage._run(context))
+
+            self.assertEqual(fetcher.calls, 1)
+            self.assertEqual(target.read_bytes(), b"verified content")
 
     def test_standalone_pause_releases_shared_item_slot_between_assets(self) -> None:
         async def scenario(directory: Path) -> None:

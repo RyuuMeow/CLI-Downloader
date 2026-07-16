@@ -864,6 +864,19 @@ class OwnerRequestLedger:
         entry = self._records.get(request_id)
         return entry[1] if entry else None
 
+    def discard(self, request_id: str) -> None:
+        """Remove a request that never reached acceptance.
+
+        Transport-level admission failures (for example, a Shell still in
+        ``RECOVERING``) are not durable Task outcomes.  Keeping their
+        ``SUBMITTED`` ledger row would make a later retry look like a request
+        permanently in progress, even though no Task was created.
+        """
+
+        entry = self._records.get(request_id)
+        if entry is not None and entry[1].state is RequestState.SUBMITTED:
+            del self._records[request_id]
+
     def _get(self, request_id: str) -> tuple[OwnerRequest, OwnerRequestRecord]:
         entry = self._records.get(request_id)
         if entry is None:

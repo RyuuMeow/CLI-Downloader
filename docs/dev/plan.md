@@ -51,27 +51,20 @@ and CLI argument forms remains out of scope.
 
 ### Status
 
-In progress. Investigation confirmed that the current behavior is an execution-boundary defect, not
-an IPC routing failure:
+Completed. Investigation confirmed that the reported behavior was an execution-boundary defect,
+plus an unsafe cross-thread control path rather than an IPC routing failure:
 
 - Owner IPC calls the same `TaskHierarchyService.pause()` path as the Shell, but returns a
   successful terminal response after persisting pause intent. It does not wait for the Pipeline's
   later safe-boundary acknowledgement.
-- A Batch download worker acquires the shared Item Scheduler lease around the whole child. Its
-  `wait_if_paused()` calls happen inside that lease and inside Batch download/site semaphores, so a
-  worker may be acknowledged as paused while it still consumes capacity.
-- A child already waiting for an Item Scheduler lease is not withdrawn or made ineligible when its
-  Batch is paused. It may acquire the newly released slot and then wait while holding it.
-- Direct streaming checks pause between assets, not between stream chunks. The current asset may
-  continue transferring after pause intent until the next asset boundary.
-- The current pause tests prove only that a worker blocks at a cooperative boundary. They do not
-  assert that another root can start, that active leases are zero, or that an IPC success means the
-  task is actually quiescent. All 31 related existing tests pass despite the reported defect.
+- Batch controls were also being called directly from Textual/IPC threads, mutating asyncio state
+  (`paused_ids`, resume/cancel Events, and pipeline state) outside the owning event loop. This was
+  the direct cause of intermittent pause acknowledgement and unreleased queue capacity.
 
-The first reproduction slice is now in `tests/test_pause_contract.py`. It adds a bounded active-lease
-diagnostic to the shared Item Scheduler and two deterministic cross-root reproductions (active-root
-pause and waiting-root pause). P5-19 now makes these contract tests pass; the remaining direct,
-torrent, terminal-race, and applied-control coverage continues under P5-20 and P5-21.
+The reproduction suites in `tests/test_pause_contract.py`, `tests/test_batch_execution_runner.py`,
+and `tests/test_download_service.py` now cover active-root pause, waiting-root pause, lease release,
+stream boundaries, and controls issued from a foreign thread. The remaining direct, torrent,
+terminal-race, and applied-control details are tracked by P5-20 and P5-21.
 
 ### Contract And Reproduction Tests
 
@@ -102,9 +95,9 @@ torrent, terminal-race, and applied-control coverage continues under P5-20 and P
 
 ### Status
 
-In progress. Root suspension, pending-waiter cancellation, central Item lease release/reacquisition,
-and Batch resolution/download semaphore release checkpoints are implemented. Standalone Item
-admission and the remaining acquisition race coverage are still pending.
+Completed. Root suspension, pending-waiter eligibility, central Item lease release/reacquisition,
+standalone Item admission, and Batch resolution/download semaphore release checkpoints are
+implemented and covered by deterministic cross-root tests.
 
 ### Scheduler Ownership
 
@@ -147,8 +140,9 @@ In progress. Batch direct streams now checkpoint each completed asset immediatel
 boundaries through the pause-aware control signal, and release both central and pipeline admission
 while paused. Successful Batch torrent submission invokes an admission-release callback so Core no
 longer occupies an Item slot during client polling. Standalone torrent polling releases its Item
-lease after the persisted client handle is known. Partial-file close/resume integrity and full
-restart reconciliation remain to be verified.
+lease after the persisted client handle is known. Standalone completed-output hashes and direct
+partial checkpoints are verified; remaining work is completed-asset verification for interrupted
+Batch roots and a live-client restart matrix.
 
 ### Direct Downloads
 
@@ -186,10 +180,12 @@ restart reconciliation remain to be verified.
 
 ### Status
 
-In progress. `TaskHierarchyService` now exposes a bounded `TaskControlReceipt`, and the Owner
-control response carries requested/applied status, revision, quiescence, and phase fields. IPC
-control handlers report a non-success pending phase instead of claiming that a pause was complete.
-Shell/UI projection refresh and rapid-control/restart lifecycle coverage remain to be completed.
+Completed for the in-process and fully wired owner paths. `TaskHierarchyService` exposes a bounded
+`TaskControlReceipt`, Owner control responses carry requested/applied status, revision, quiescence,
+and phase fields, and IPC control handlers report a non-success pending phase instead of claiming
+that a pause was complete. Batch pause/resume/cancel mutations are now dispatched to the owning
+asyncio loop, eliminating the foreign-thread race that could leave a lease held. Process-level
+restart timing remains under P5-22 and P5-24.
 
 ### Control Result Model
 
@@ -230,12 +226,12 @@ also publishes `STOPPING` and closes the IPC listener before draining. Standalon
 boundaries now re-check owner shutdown and increment task revisions for checkpoints. Bounded drain
 now rotates the execution fence before the owner lease is released, late non-cooperative workers
 are discarded, and qBittorrent shutdown leaves the client task intact. Remaining work is full
-process-level restart coverage and paused-root child normalization under abrupt close:
+process-level restart coverage and repeated shutdown callback coverage:
 
 - Historical cancellation-on-shutdown reproductions are retained in the acceptance tests as
   regression cases; the typed signal now routes owner shutdown through checkpoint paths.
-- Remaining lifecycle work is a fully wired process-level close/reopen matrix, including paused
-  Batch children and repeated shutdown callbacks.
+- Fully wired owner readiness, same-request retry after RECOVERING rejection, and paused Batch child
+  normalization are covered; OS-process close/reopen timing remains.
 
 ### Shutdown Control Model
 
@@ -279,14 +275,15 @@ and assets to schedulable queued states without creating retry attempts, skips v
 output files when the checkpoint still exists, clears stale standalone run leases before
 re-admission, and preserves recovered Task revision/run-generation identity. Direct streams persist
 an unfinished `.part` checkpoint and safely rebuild it on resume; stale owner fences are rotated
-before re-admission and late writes are rejected. Remaining work is transactional root recovery,
-full prefix/hash verification, and end-to-end torrent client reconciliation:
+before re-admission and late writes are rejected. Batch root recovery is transactional, partial
+prefix checkpoints are never promoted to complete assets, and the last observed torrent state is
+persisted on owner shutdown. Remaining work is completed-asset verification for interrupted Batch
+roots and end-to-end restart reconciliation against a live torrent client:
 
 - Recovery now normalises active Batch children/assets back to queued states and clears stale Task
-  run leases for both `RUNNING` and `PLANNED` records before `resume` admission. The latest full
-  verification gate passes with 602 core tests; the remaining gaps are transactional root
-  recovery, full partial-file prefix/hash verification, and restart reconciliation against an
-  existing torrent client task.
+  run leases for both `RUNNING` and `PLANNED` records before `resume` admission. Parent, graph, and
+  asset transitions commit atomically; a failed graph checkpoint rolls back the complete recovery
+  transaction. The latest full verification gate before this slice passed with 602 core tests.
 
 ### Recovery Matrix
 
@@ -328,8 +325,9 @@ full prefix/hash verification, and end-to-end torrent client reconciliation:
 In progress. The premature pre-listener `READY` publication was removed, and shutdown now marks
 the owner `STOPPING` before closing IPC admission. Mutation requests remain rejected during
 `RECOVERING`; Textual and plain/embedded Shell paths now dispatch tracked startup recovery
-commands before publishing `READY`. Remaining work is process-level WAIT/DETACH restart testing
-and a deterministic second-restart readiness race test.
+commands before publishing `READY`. Same-request retry after a typed RECOVERING rejection is now
+safe, and fully wired readiness/DETACH behavior is covered. Remaining work is process-level
+WAIT/DETACH restart testing and a deterministic second-restart readiness race test.
 
 ### Readiness Audit
 

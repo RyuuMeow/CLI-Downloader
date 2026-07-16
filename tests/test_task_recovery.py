@@ -5,6 +5,7 @@ from dataclasses import replace
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest import TestCase
+from unittest.mock import patch
 from uuid import uuid4
 
 from cli_downloader.cli.app import _recover_interrupted_downloads
@@ -26,6 +27,7 @@ from cli_downloader.storage.task_store import (
     TaskRecord,
     TaskStatus,
 )
+from cli_downloader.storage.state_database import ExecutionRepository
 
 
 def _asset(asset_id: str) -> DownloadAsset:
@@ -323,6 +325,23 @@ class BatchRecoveryTest(TestCase):
             task_store = StateTaskStore(base / "state.sqlite3")
 
             self._create_batch(batch_store, "paused-batch", "entry-p")
+            paused_asset = _asset("paused-asset")
+            paused_child = DownloadChild(
+                child_id="paused-child",
+                parent_id="paused-batch",
+                entry_id="entry-p",
+                package=_package(paused_asset),
+            )
+            entry = batch_store.get_entry("entry-p")
+            batch_store.update_entry(replace(entry, status=BatchEntryStatus.RESOLVING))
+            batch_store.attach_child("entry-p", paused_child)
+            batch_store.update_child(
+                replace(paused_child, status=DownloadChildStatus.DOWNLOADING)
+            )
+            stored_asset = batch_store.list_assets("paused-child")[0]
+            batch_store.update_asset(
+                "paused-child", replace(stored_asset, status=AssetStatus.DOWNLOADING)
+            )
             task_store.upsert(
                 TaskRecord(
                     task_id="paused-batch",
@@ -345,6 +364,14 @@ class BatchRecoveryTest(TestCase):
             self.assertIsNone(recovered.active_run_id)
             self.assertEqual(recovered.run_generation, 3)
             self.assertEqual(commands, ())
+            self.assertEqual(
+                batch_store.get_child("paused-child").status,
+                DownloadChildStatus.QUEUED,
+            )
+            self.assertEqual(
+                batch_store.list_assets("paused-child")[0].status,
+                AssetStatus.QUEUED,
+            )
 
             async def resume_and_claim() -> None:
                 coordinator = TaskExecutionCoordinator(task_store=task_store)
@@ -499,6 +526,65 @@ class BatchRecoveryTest(TestCase):
             self.assertEqual(batch_store.get_child("child-a").status, DownloadChildStatus.QUEUED)
             for record in batch_store.list_assets("child-a"):
                 self.assertEqual(record.status, AssetStatus.QUEUED)
+
+    def test_batch_recovery_rolls_back_parent_when_graph_checkpoint_fails(self) -> None:
+        with TemporaryDirectory() as directory:
+            base = Path(directory)
+            batch_store = StateBatchStore(base / "state.sqlite3")
+            task_store = StateTaskStore(base / "state.sqlite3")
+            self._create_batch(
+                batch_store,
+                "batch-atomic",
+                "entry-atomic",
+                entry_status=BatchEntryStatus.RESOLVING,
+            )
+            asset = _asset("atomic-asset")
+            entry = batch_store.get_entry("entry-atomic")
+            child = DownloadChild(
+                child_id="child-atomic",
+                parent_id="batch-atomic",
+                entry_id="entry-atomic",
+                package=_package(asset),
+            )
+            batch_store.attach_child(entry.entry_id, child)
+            batch_store.update_child(
+                replace(child, status=DownloadChildStatus.DOWNLOADING)
+            )
+            original_asset = batch_store.list_assets(child.child_id)[0]
+            batch_store.update_asset(
+                child.child_id,
+                replace(original_asset, status=AssetStatus.DOWNLOADING),
+            )
+            task_store.upsert(
+                TaskRecord(
+                    "batch-atomic",
+                    TaskStatus.RUNNING,
+                    kind=TaskKind.BATCH,
+                    active_run_id="old-run",
+                    metadata={"execution_fence": "old-fence"},
+                )
+            )
+
+            with patch.object(
+                ExecutionRepository,
+                "update_asset",
+                side_effect=RuntimeError("checkpoint write failed"),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "checkpoint write failed"):
+                    _recover_interrupted_downloads(task_store, batch_store=batch_store)
+
+            unchanged = task_store.get("batch-atomic")
+            self.assertEqual(unchanged.status, TaskStatus.RUNNING)
+            self.assertEqual(unchanged.active_run_id, "old-run")
+            self.assertEqual(unchanged.metadata["execution_fence"], "old-fence")
+            self.assertEqual(
+                batch_store.get_child("child-atomic").status,
+                DownloadChildStatus.DOWNLOADING,
+            )
+            self.assertEqual(
+                batch_store.list_assets("child-atomic")[0].status,
+                AssetStatus.DOWNLOADING,
+            )
 
     def test_completed_assets_remain_untouched(self) -> None:
         with TemporaryDirectory() as directory:
