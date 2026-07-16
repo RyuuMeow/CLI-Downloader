@@ -1,5 +1,6 @@
 import unittest
 from itertools import product
+from types import SimpleNamespace
 
 from cli_downloader.cli._shell_wiring import _handle_owner_control, _handle_owner_download
 from cli_downloader.core.owner_protocol import (
@@ -53,6 +54,134 @@ class OwnerForwardingTests(unittest.TestCase):
         )
         self.assertTrue(events[1].payload["acknowledged"])
         self.assertEqual(events[2].payload["status"], "completed")
+
+    def test_task_control_reports_applied_receipt(self) -> None:
+        events = []
+
+        class FakeTaskService:
+            def get(self, task_id):
+                return TaskNode(
+                    task_id=task_id,
+                    kind=TaskKind.ITEM,
+                    state=TaskState.RUNNING,
+                    title="fixture",
+                    progress=TaskProgress(),
+                )
+
+            def pause(self, task_id):
+                return {"task_id": task_id, "status": "paused"}
+
+            def wait_for_control_applied(self, task_id, action, *, timeout):
+                self.wait_timeout = timeout
+                return SimpleNamespace(
+                    task_id=task_id,
+                    action=action,
+                    requested=True,
+                    applied=True,
+                    actual_status=SimpleNamespace(value="paused"),
+                    desired_control=SimpleNamespace(value="pause"),
+                    revision=9,
+                    quiescent=True,
+                    phase="applied",
+                    to_dict=lambda: {
+                        "task_id": task_id,
+                        "action": action,
+                        "requested": True,
+                        "applied": True,
+                        "actual_status": "paused",
+                        "desired_control": "pause",
+                        "revision": 9,
+                        "quiescent": True,
+                        "phase": "applied",
+                    },
+                )
+
+        request = OwnerRequest(
+            OWNER_PROTOCOL_VERSION,
+            "control-receipt",
+            OwnerSource.CLI,
+            OwnerCommand.TASK_CONTROL,
+            OwnerResponseMode.WAIT,
+            {"task_id": "task-1", "action": "pause"},
+            "client-session",
+        )
+        _handle_owner_control(
+            request,
+            events.append,
+            run_background=lambda *_args: 0,
+            owner_session_id="shell-session",
+            task_service=FakeTaskService(),
+        )
+
+        control = events[1].payload
+        self.assertTrue(control["requested"])
+        self.assertTrue(control["applied"])
+        self.assertTrue(control["quiescent"])
+        self.assertEqual(control["phase"], "applied")
+        self.assertEqual(events[-1].payload["status"], "completed")
+
+    def test_pending_control_is_bounded_and_not_reported_as_success(self) -> None:
+        events = []
+
+        class FakeTaskService:
+            def get(self, task_id):
+                return TaskNode(
+                    task_id=task_id,
+                    kind=TaskKind.ITEM,
+                    state=TaskState.RUNNING,
+                    title="fixture",
+                    progress=TaskProgress(),
+                )
+
+            def pause(self, task_id):
+                return {"task_id": task_id, "status": "pausing"}
+
+            def wait_for_control_applied(self, task_id, action, *, timeout):
+                self.wait_timeout = timeout
+                return SimpleNamespace(
+                    task_id=task_id,
+                    action=action,
+                    requested=True,
+                    applied=False,
+                    actual_status=SimpleNamespace(value="running"),
+                    desired_control=SimpleNamespace(value="pause"),
+                    revision=10,
+                    quiescent=False,
+                    phase="pending",
+                    to_dict=lambda: {
+                        "task_id": task_id,
+                        "action": action,
+                        "requested": True,
+                        "applied": False,
+                        "actual_status": "running",
+                        "desired_control": "pause",
+                        "revision": 10,
+                        "quiescent": False,
+                        "phase": "pending",
+                    },
+                )
+
+        request = OwnerRequest(
+            OWNER_PROTOCOL_VERSION,
+            "control-pending",
+            OwnerSource.CLI,
+            OwnerCommand.TASK_CONTROL,
+            OwnerResponseMode.WAIT,
+            {"task_id": "task-1", "action": "pause"},
+            "client-session",
+        )
+        _handle_owner_control(
+            request,
+            events.append,
+            run_background=lambda *_args: 0,
+            owner_session_id="shell-session",
+            task_service=FakeTaskService(),
+        )
+
+        self.assertFalse(events[1].payload["applied"])
+        self.assertEqual(events[1].payload["phase"], "pending")
+        self.assertEqual(events[-1].payload["status"], "failed")
+        self.assertEqual(events[-1].payload["exit_code"], 2)
 
     def test_batch_resume_uses_owner_background_runner(self) -> None:
         events = []

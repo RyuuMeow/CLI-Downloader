@@ -180,6 +180,42 @@ class HandshakeTests(unittest.TestCase):
 
 
 class ResponseStreamTests(unittest.TestCase):
+    def test_control_event_carries_applied_receipt_fields(self) -> None:
+        event = OwnerResponseEvent.control(
+            "request-1",
+            1,
+            task_id="task-1",
+            action="pause",
+            acknowledged=True,
+            requested=True,
+            applied=True,
+            actual_status="paused",
+            revision=4,
+            desired_control="pause",
+            quiescent=True,
+            phase="applied",
+        )
+
+        self.assertTrue(event.payload["applied"])
+        self.assertEqual(event.payload["actual_status"], "paused")
+        self.assertTrue(event.payload["quiescent"])
+
+    def test_control_event_rejects_non_boolean_receipt_flags(self) -> None:
+        with self.assertRaises(ContractValidationError) as context:
+            OwnerResponseEvent(
+                "request-1",
+                1,
+                OwnerEventKind.CONTROL,
+                {
+                    "task_id": "task-1",
+                    "action": "pause",
+                    "acknowledged": True,
+                    "applied": "yes",
+                },
+            )
+
+        self.assertEqual(context.exception.code, "invalid_boolean")
+
     def test_stream_requires_acceptance_and_one_terminal_event(self) -> None:
         stream = OwnerResponseStream("request-1")
         accepted = OwnerResponseEvent.accepted("request-1", 1, owner_session_id="owner-1", accepted_at=NOW, task_id="task-1")

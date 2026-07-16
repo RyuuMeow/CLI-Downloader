@@ -585,13 +585,36 @@ def _event_payload(kind: OwnerEventKind, payload: Mapping[str, FrozenJsonValue])
         if "message" in payload:
             _require_text(payload["message"], "event.payload.message")
     elif kind is OwnerEventKind.CONTROL:
-        _check_keys(payload, "event.payload", frozenset({"task_id", "action", "acknowledged", "revision", "desired_control"}))
+        _check_keys(
+            payload,
+            "event.payload",
+            frozenset(
+                {
+                    "task_id",
+                    "action",
+                    "acknowledged",
+                    "requested",
+                    "applied",
+                    "actual_status",
+                    "revision",
+                    "desired_control",
+                    "quiescent",
+                    "phase",
+                }
+            ),
+        )
         for name in ("task_id", "action"):
             if name not in payload:
                 raise _error("missing_field", f"event.payload.{name}", "is required")
             _require_token(payload[name], f"event.payload.{name}")
         if "acknowledged" not in payload or not isinstance(payload["acknowledged"], bool):
             raise _error("invalid_boolean", "event.payload.acknowledged", "must be a boolean")
+        for name in ("requested", "applied", "quiescent"):
+            if name in payload and not isinstance(payload[name], bool):
+                raise _error("invalid_boolean", f"event.payload.{name}", "must be a boolean")
+        for name in ("actual_status", "phase"):
+            if name in payload:
+                _require_identifier(payload[name], f"event.payload.{name}")
         if "revision" in payload:
             _require_positive_int(payload["revision"], "event.payload.revision")
         if "desired_control" in payload:
@@ -673,12 +696,34 @@ class OwnerResponseEvent:
         return cls(request_id, sequence, OwnerEventKind.PROGRESS, payload)
 
     @classmethod
-    def control(cls, request_id: str, sequence: int, *, task_id: str, action: str, acknowledged: bool, revision: int | None = None, desired_control: str | None = None) -> "OwnerResponseEvent":
+    def control(
+        cls,
+        request_id: str,
+        sequence: int,
+        *,
+        task_id: str,
+        action: str,
+        acknowledged: bool,
+        requested: bool | None = None,
+        applied: bool | None = None,
+        actual_status: str | None = None,
+        revision: int | None = None,
+        desired_control: str | None = None,
+        quiescent: bool | None = None,
+        phase: str | None = None,
+    ) -> "OwnerResponseEvent":
         payload: dict[str, object] = {"task_id": task_id, "action": action, "acknowledged": acknowledged}
-        if revision is not None:
-            payload["revision"] = revision
-        if desired_control is not None:
-            payload["desired_control"] = desired_control
+        for name, value in (
+            ("requested", requested),
+            ("applied", applied),
+            ("actual_status", actual_status),
+            ("revision", revision),
+            ("desired_control", desired_control),
+            ("quiescent", quiescent),
+            ("phase", phase),
+        ):
+            if value is not None:
+                payload[name] = value
         return cls(request_id, sequence, OwnerEventKind.CONTROL, payload)
 
     @classmethod

@@ -184,6 +184,13 @@ restart reconciliation remain to be verified.
 
 ## P5-21 Wait For Applied Controls Across IPC And UI
 
+### Status
+
+In progress. `TaskHierarchyService` now exposes a bounded `TaskControlReceipt`, and the Owner
+control response carries requested/applied status, revision, quiescence, and phase fields. IPC
+control handlers report a non-success pending phase instead of claiming that a pause was complete.
+Shell/UI projection refresh and rapid-control/restart lifecycle coverage remain to be completed.
+
 ### Control Result Model
 
 - Return a typed control receipt with separate `requested`, `applied`, `actual_status`,

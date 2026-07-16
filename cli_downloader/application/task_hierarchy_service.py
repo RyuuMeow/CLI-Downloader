@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from pathlib import Path
+from time import monotonic, sleep
 from typing import Mapping
 
 from cli_downloader.application.batch_pipeline import BatchPipeline
@@ -65,6 +67,34 @@ _TERMINAL_TASK_STATUSES = frozenset(
         TaskStatus.SKIPPED,
     }
 )
+
+
+@dataclass(frozen=True)
+class TaskControlReceipt:
+    """Typed distinction between a requested control and its applied state."""
+
+    task_id: str
+    action: str
+    requested: bool
+    applied: bool
+    actual_status: TaskStatus
+    desired_control: TaskDesiredControl
+    revision: int
+    quiescent: bool
+    phase: str
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "task_id": self.task_id,
+            "action": self.action,
+            "requested": self.requested,
+            "applied": self.applied,
+            "actual_status": self.actual_status.value,
+            "desired_control": self.desired_control.value,
+            "revision": self.revision,
+            "quiescent": self.quiescent,
+            "phase": self.phase,
+        }
 
 
 class TaskHierarchyService:
@@ -307,6 +337,44 @@ class TaskHierarchyService:
             self._scheduler_root_control("cancel", task_id)
             return result
         raise TaskNotFoundError(f"task not found: {task_id}")
+
+    def wait_for_control_applied(
+        self,
+        task_id: str,
+        action: str,
+        *,
+        timeout: float = 2.0,
+    ) -> TaskControlReceipt:
+        """Wait for a bounded, durable Task state transition after a control request."""
+
+        if action not in {"pause", "resume", "cancel"}:
+            raise ValueError(f"unsupported task control action: {action}")
+        if timeout <= 0:
+            raise ValueError("timeout must be positive")
+        expected = {
+            "pause": TaskDesiredControl.PAUSE,
+            "resume": TaskDesiredControl.RUN,
+            "cancel": TaskDesiredControl.CANCEL,
+        }[action]
+        deadline = monotonic() + timeout
+        while True:
+            record = self._task_store.get(task_id)
+            if record is None:
+                raise TaskNotFoundError(f"task not found: {task_id}")
+            applied = _control_is_applied(record, action)
+            if applied or monotonic() >= deadline:
+                return TaskControlReceipt(
+                    task_id=task_id,
+                    action=action,
+                    requested=record.desired_control is expected,
+                    applied=applied,
+                    actual_status=record.status,
+                    desired_control=record.desired_control,
+                    revision=record.revision,
+                    quiescent=action == "pause" and record.status is TaskStatus.PAUSED,
+                    phase="applied" if applied else "pending",
+                )
+            sleep(0.02)
 
     async def retry(self, task_id: str) -> object:
         self._reject_batch_item_control(task_id)
@@ -813,6 +881,23 @@ def _uses_shared_state_stores(task_store: object, batch_store: object) -> bool:
         isinstance(task_store, StateTaskStore)
         and isinstance(batch_store, StateBatchStore)
         and task_store.database.path == batch_store.database.path
+    )
+
+
+def _control_is_applied(record: TaskRecord, action: str) -> bool:
+    if action == "pause":
+        return (
+            record.status is TaskStatus.PAUSED
+            and record.desired_control is TaskDesiredControl.PAUSE
+        )
+    if action == "resume":
+        return (
+            record.desired_control is TaskDesiredControl.RUN
+            and record.status in {TaskStatus.PLANNED, TaskStatus.RUNNING}
+        )
+    return (
+        record.desired_control is TaskDesiredControl.CANCEL
+        and record.status in _TERMINAL_TASK_STATUSES
     )
 
 

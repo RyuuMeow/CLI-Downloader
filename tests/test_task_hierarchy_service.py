@@ -29,7 +29,7 @@ from cli_downloader.storage.state_database import StateDatabase
 from cli_downloader.storage.state_history_store import StateHistoryStore
 from cli_downloader.storage.state_batch_store import StateBatchStore as ProductionStateBatchStore
 from cli_downloader.storage.state_task_store import StateTaskStore as ProductionStateTaskStore
-from cli_downloader.storage.task_store import TaskRecord, TaskStatus
+from cli_downloader.storage.task_store import TaskDesiredControl, TaskRecord, TaskStatus
 
 
 def _entry(entry_id: str, parent_id: str = "batch-1") -> BatchEntry:
@@ -140,6 +140,55 @@ class _FinishedBatchPipeline:
 
 
 class TaskHierarchyServiceTest(TestCase):
+    def test_control_receipt_waits_for_quiescent_pause(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            tasks = StateTaskStore(root / "state.sqlite3")
+            batches = StateBatchStore(root / "state.sqlite3")
+            tasks.upsert(
+                TaskRecord(
+                    "item-1",
+                    TaskStatus.PAUSED,
+                    desired_control=TaskDesiredControl.PAUSE,
+                    revision=4,
+                )
+            )
+
+            receipt = TaskHierarchyService(
+                task_store=tasks,
+                batch_store=batches,
+            ).wait_for_control_applied("item-1", "pause", timeout=0.1)
+
+            self.assertTrue(receipt.requested)
+            self.assertTrue(receipt.applied)
+            self.assertTrue(receipt.quiescent)
+            self.assertEqual(receipt.phase, "applied")
+            self.assertEqual(receipt.to_dict()["actual_status"], "paused")
+
+    def test_control_receipt_times_out_without_claiming_pause(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            tasks = StateTaskStore(root / "state.sqlite3")
+            batches = StateBatchStore(root / "state.sqlite3")
+            tasks.upsert(
+                TaskRecord(
+                    "item-1",
+                    TaskStatus.RUNNING,
+                    desired_control=TaskDesiredControl.PAUSE,
+                    revision=4,
+                )
+            )
+
+            receipt = TaskHierarchyService(
+                task_store=tasks,
+                batch_store=batches,
+            ).wait_for_control_applied("item-1", "pause", timeout=0.05)
+
+            self.assertTrue(receipt.requested)
+            self.assertFalse(receipt.applied)
+            self.assertFalse(receipt.quiescent)
+            self.assertEqual(receipt.phase, "pending")
+
     def test_available_folder_uses_item_metadata_and_bounded_batch_assets(self) -> None:
         with TemporaryDirectory() as directory:
             root = Path(directory)

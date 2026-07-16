@@ -695,32 +695,74 @@ def _handle_owner_control(
             serialised = dict(result)
         else:
             serialised = {"task_id": task_id, "action": action, "acknowledged": bool(result)}
+        receipt = None
+        wait_for_applied = getattr(task_service, "wait_for_control_applied", None)
+        if action in {"pause", "resume", "cancel"} and callable(wait_for_applied):
+            receipt = wait_for_applied(task_id, action, timeout=2.0)
+            if hasattr(receipt, "to_dict"):
+                serialised = {
+                    **(serialised if isinstance(serialised, dict) else {"value": serialised}),
+                    "control_receipt": receipt.to_dict(),
+                }
+        acknowledged = exit_code == 0
+        applied = None
+        actual_status = None
+        desired_control = (
+            "pause"
+            if action == "pause"
+            else "cancel"
+            if action == "cancel"
+            else "run"
+        )
+        quiescent = None
+        phase = None
+        if receipt is not None:
+            acknowledged = bool(getattr(receipt, "requested", acknowledged))
+            applied = bool(getattr(receipt, "applied", False))
+            actual_status = getattr(getattr(receipt, "actual_status", None), "value", None)
+            desired_control = getattr(getattr(receipt, "desired_control", None), "value", desired_control)
+            quiescent = bool(getattr(receipt, "quiescent", False))
+            phase = getattr(receipt, "phase", None)
+            receipt_revision = getattr(receipt, "revision", None)
+            if isinstance(receipt_revision, int) and receipt_revision > 0:
+                revision = receipt_revision
         emit(
             OwnerResponseEvent.control(
                 request.request_id,
                 sequence,
                 task_id=task_id,
                 action=action,
-                acknowledged=exit_code == 0,
-                desired_control=(
-                    "pause"
-                    if action == "pause"
-                    else "cancel"
-                    if action == "cancel"
-                    else "run"
-                ),
+                acknowledged=acknowledged,
+                requested=(getattr(receipt, "requested", None) if receipt is not None else None),
+                applied=applied,
+                actual_status=actual_status,
+                desired_control=desired_control,
                 revision=revision if isinstance(revision, int) and revision > 0 else None,
+                quiescent=quiescent,
+                phase=phase,
             )
         )
         sequence += 1
+        control_applied = applied is not False
+        terminal_status = (
+            OwnerTerminalStatus.COMPLETED
+            if exit_code == 0 and control_applied
+            else OwnerTerminalStatus.FAILED
+        )
+        terminal_exit_code = exit_code if exit_code != 0 or control_applied else 2
         emit(
             OwnerResponseEvent.terminal(
                 request.request_id,
                 sequence,
-                status=OwnerTerminalStatus.COMPLETED if exit_code == 0 else OwnerTerminalStatus.FAILED,
+                status=terminal_status,
                 task_id=task_id,
-                exit_code=exit_code,
+                exit_code=terminal_exit_code,
                 result={**serialised, "output": output.getvalue()} if isinstance(serialised, dict) else {"value": serialised},
+                error=(
+                    {"phase": phase, "message": "task control is still pending"}
+                    if applied is False and phase == "pending"
+                    else None
+                ),
             )
         )
         if notify_tasks is not None:
