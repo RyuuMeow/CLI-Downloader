@@ -9,13 +9,8 @@ and CLI argument forms remains out of scope.
 
 ## Active Order
 
-1. P5-18 Lock The Pause Contract With Cross-Root Reproductions
-2. P5-19 Make Scheduler Admission Pause-Aware
-3. P5-20 Add Quiescent Direct And Torrent Checkpoints
-4. P5-21 Wait For Applied Controls Across IPC And UI
-5. P5-22 Separate Owner Shutdown From User Cancellation
-6. P5-23 Recover Checkpoints Without Retry Or Cancellation Semantics
-7. P5-24 Gate Owner Readiness And Verify Restart Lifecycles
+No active P5 tasks. P5-18 through P5-24 are complete; their implementation history is kept in
+`CHANGELOG.md` and Git history.
 
 ## Direction And Boundaries
 
@@ -136,13 +131,14 @@ implemented and covered by deterministic cross-root tests.
 
 ### Status
 
-In progress. Batch direct streams now checkpoint each completed asset immediately, wait at chunk
+Completed. Batch direct streams now checkpoint each completed asset immediately, wait at chunk
 boundaries through the pause-aware control signal, and release both central and pipeline admission
 while paused. Successful Batch torrent submission invokes an admission-release callback so Core no
 longer occupies an Item slot during client polling. Standalone torrent polling releases its Item
 lease after the persisted client handle is known. Standalone and Batch completed direct outputs
 are now hash-verified during recovery; a mismatched or missing output is requeued in one atomic
-child/asset update. Remaining work is the live-client torrent restart matrix.
+child/asset update. Deterministic qBittorrent-compatible restart tests cover downloading, paused,
+completed, missing, and client-error checkpoints without resubmitting accepted torrents.
 
 ### Direct Downloads
 
@@ -180,12 +176,12 @@ child/asset update. Remaining work is the live-client torrent restart matrix.
 
 ### Status
 
-Completed for the in-process and fully wired owner paths. `TaskHierarchyService` exposes a bounded
+Completed. `TaskHierarchyService` exposes a bounded
 `TaskControlReceipt`, Owner control responses carry requested/applied status, revision, quiescence,
 and phase fields, and IPC control handlers report a non-success pending phase instead of claiming
 that a pause was complete. Batch pause/resume/cancel mutations are now dispatched to the owning
 asyncio loop, eliminating the foreign-thread race that could leave a lease held. Process-level
-restart timing remains under P5-22 and P5-24.
+WAIT/DETACH and restart replay coverage is included in the final owner lifecycle gate.
 
 ### Control Result Model
 
@@ -220,21 +216,21 @@ restart timing remains under P5-22 and P5-24.
 
 ### Status
 
-In progress. A typed stop signal now distinguishes `user_cancel` from `owner_shutdown`; Batch and
+Completed. A typed stop signal now distinguishes `user_cancel` from `owner_shutdown`; Batch and
 standalone Item workers can checkpoint to `PLANNED` without emitting cancellation. Shell shutdown
 also publishes `STOPPING` and closes the IPC listener before draining. Standalone terminal
 boundaries now re-check owner shutdown and increment task revisions for checkpoints. Bounded drain
 now rotates the execution fence before the owner lease is released, late non-cooperative workers
 are discarded, and qBittorrent shutdown leaves the client task intact. An abrupt owner-process
 test now proves a WAIT client becomes a bounded typed disconnect with the accepted Task ID, and a
-replacement owner replays that request instead of executing it twice. Fully wired Shell coverage
-also proves repeated shutdown callbacks keep paused Tasks paused and cleanup idempotent. Remaining
-work is full process-level Shell restart coverage:
+replacement owner replays that request instead of executing it twice. Fully wired and process-level
+Shell coverage also proves repeated shutdown callbacks keep paused Tasks paused and cleanup
+idempotent.
 
 - Historical cancellation-on-shutdown reproductions are retained in the acceptance tests as
   regression cases; the typed signal now routes owner shutdown through checkpoint paths.
-- Fully wired owner readiness, same-request retry after RECOVERING rejection, and paused Batch child
-  normalization are covered; OS-process close/reopen timing remains.
+- Fully wired owner readiness, same-request retry after RECOVERING rejection, paused Batch child
+  normalization, and OS-process close/reopen timing are covered.
 
 ### Shutdown Control Model
 
@@ -275,7 +271,7 @@ work is full process-level Shell restart coverage:
 
 ### Status
 
-In progress. Startup recovery now uses `resume` instead of `retry`, returns active Batch children
+Completed. Startup recovery now uses `resume` instead of `retry`, returns active Batch children
 and assets to schedulable queued states without creating retry attempts, skips verified standalone
 output files when the checkpoint still exists, clears stale standalone run leases before
 re-admission, and preserves recovered Task revision/run-generation identity. Direct streams persist
@@ -283,15 +279,15 @@ an unfinished `.part` checkpoint and safely rebuild it on resume; stale owner fe
 before re-admission and late writes are rejected. Batch root recovery is transactional, partial
 explicitly partial checkpoints are never promoted to complete assets, completed direct outputs are
 verified and atomically requeued when corrupted, and the last observed torrent state is persisted
-on owner shutdown. Remaining work is end-to-end restart reconciliation against a live torrent
-client:
+on owner shutdown. End-to-end restart reconciliation uses deterministic torrent-client fixtures and
+preserves the accepted handle, paused/running state, and output identity.
 
 - Recovery now normalises active Batch children/assets back to queued states and clears stale Task
   run leases for both `RUNNING` and `PLANNED` records before `resume` admission. Parent, graph, and
   asset transitions commit atomically; a failed graph checkpoint rolls back the complete recovery
   transaction. Recovery verifies direct completed assets with their persisted SHA-256 and rolls
   corrupt outputs back to `QUEUED` in the same child/asset transaction. The latest full
-  verification gate passes with 610 core tests plus all three isolated plugin suites.
+  verification gate passes with 611 core tests plus all three isolated plugin suites.
 
 ### Recovery Matrix
 
@@ -330,13 +326,12 @@ client:
 
 ### Status
 
-In progress. The premature pre-listener `READY` publication was removed, and shutdown now marks
+Completed. The premature pre-listener `READY` publication was removed, and shutdown now marks
 the owner `STOPPING` before closing IPC admission. Mutation requests remain rejected during
 `RECOVERING`; Textual and plain/embedded Shell paths now dispatch tracked startup recovery
 commands before publishing `READY`. Same-request retry after a typed RECOVERING rejection is now
-safe, fully wired readiness/DETACH behavior is covered, and an abrupt owner-process WAIT test
-proves bounded disconnect plus request replay after restart. Remaining work is process-level
-Shell WAIT/DETACH restart testing and a deterministic second-restart readiness race test.
+safe, fully wired readiness/DETACH behavior is covered, and process-level Shell tests prove
+bounded WAIT disconnect, DETACH acceptance, request replay, and a second restart readiness race.
 
 ### Readiness Audit
 

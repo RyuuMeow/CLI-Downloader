@@ -1,4 +1,5 @@
 import os
+import multiprocessing
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest import TestCase
@@ -21,6 +22,7 @@ from cli_downloader.storage.state_database import StateDatabase
 from cli_downloader.storage.state_task_store import StateTaskStore
 from cli_downloader.storage.task_store import TaskDesiredControl, TaskRecord, TaskStatus
 from tests.example_site import build_example_runtime
+from tests.owner_transport_worker import shell_owner_process
 
 
 class ShellWiringTest(TestCase):
@@ -223,3 +225,80 @@ class ShellWiringTest(TestCase):
             self.assertIsNotNone(paused)
             self.assertEqual(paused.status, TaskStatus.PAUSED)
             self.assertEqual(paused.desired_control, TaskDesiredControl.PAUSE)
+
+    def test_process_shell_restart_replays_detached_request_after_ready(self) -> None:
+        context = multiprocessing.get_context("spawn")
+        with TemporaryDirectory() as directory:
+            scope = OwnerScope.from_data_root(directory)
+            session = "process-shell-client"
+            request = OwnerRequest(
+                OWNER_PROTOCOL_VERSION,
+                "process-shell-request",
+                OwnerSource.CLI,
+                OwnerCommand.DOWNLOAD,
+                OwnerResponseMode.DETACH,
+                {"url": "https://example.test/gallery/process-shell"},
+                session,
+            )
+            handshake = OwnerHandshake(
+                OWNER_PROTOCOL_VERSION,
+                session,
+                OwnerMode.FOREGROUND,
+                "0.1.5",
+                ("download",),
+                ("download",),
+                scope.scope_fingerprint,
+            )
+
+            def start_owner():
+                ready = context.Event()
+                stop = context.Event()
+                executed = context.Event()
+                process = context.Process(
+                    target=shell_owner_process,
+                    args=(directory, ready, stop, executed),
+                )
+                process.start()
+                if not ready.wait(15):
+                    if process.is_alive():
+                        process.terminate()
+                    process.join(15)
+                    error_path = Path(directory) / "process-owner-error.txt"
+                    trace_path = Path(directory) / "process-owner-trace.txt"
+                    detail_path = error_path if error_path.exists() else trace_path
+                    detail = detail_path.read_text(encoding="utf-8") if detail_path.exists() else "unknown child failure"
+                    self.fail(f"Shell owner did not publish READY (exit={process.exitcode}): {detail}")
+                return process, stop, executed
+
+            first, first_stop, first_executed = start_owner()
+            try:
+                accepted = OwnerPipeClient(scope).request(request, handshake=handshake)
+                self.assertEqual(accepted[-1].kind.value, "accepted")
+                self.assertEqual(accepted[-1].payload["task_id"], "process-task")
+                self.assertTrue(first_executed.wait(5))
+            finally:
+                first_stop.set()
+                first.join(15)
+            self.assertFalse(first.is_alive())
+
+            second, second_stop, second_executed = start_owner()
+            try:
+                replay = OwnerPipeClient(scope).request(request, handshake=handshake)
+            finally:
+                second_stop.set()
+                second.join(15)
+            self.assertFalse(second.is_alive())
+            self.assertEqual(replay[-1].kind.value, "accepted")
+            self.assertEqual(replay[-1].payload["task_id"], "process-task")
+            self.assertFalse(second_executed.is_set())
+
+            third, third_stop, third_executed = start_owner()
+            try:
+                replay_again = OwnerPipeClient(scope).request(request, handshake=handshake)
+            finally:
+                third_stop.set()
+                third.join(15)
+            self.assertFalse(third.is_alive())
+            self.assertEqual(replay_again[-1].kind.value, "accepted")
+            self.assertEqual(replay_again[-1].payload["task_id"], "process-task")
+            self.assertFalse(third_executed.is_set())

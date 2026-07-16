@@ -3,6 +3,10 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
+import os
+from pathlib import Path
+import traceback
+from unittest.mock import patch
 
 from cli_downloader.core.owner_protocol import (
     OWNER_PROTOCOL_VERSION,
@@ -52,3 +56,47 @@ def orphan_owner_process(directory: str, ready, accepted, hold) -> None:
         hold.wait(30)
     finally:
         server.stop()
+
+
+def shell_owner_process(directory: str, ready, stop, executed) -> None:
+    """Run a minimal importable Shell owner for process-level restart tests."""
+
+    from cli_downloader.cli._shell_wiring import build_interactive_shell
+    from tests.example_site import build_example_runtime
+
+    os.environ["CLI_DOWNLOADER_DATA_ROOT"] = directory
+    plugins_dir = Path(directory) / "plugins"
+
+    class FakeShell:
+        def __init__(self, **kwargs) -> None:
+            self._startup_ready = kwargs["startup_ready_callback"]
+
+        def notify_external_tasks(self) -> None:
+            return None
+
+        def run(self) -> int:
+            self._startup_ready()
+            ready.set()
+            stop.wait(30)
+            return 0
+
+    def background_runner(_argv, _cancellation, _progress, _limiter, on_accept=None):
+        executed.set()
+        if on_accept is not None:
+            on_accept("process-task", "item")
+        return 0
+
+    try:
+        with patch("cli_downloader.cli._shell_wiring.InteractiveShell", FakeShell):
+            build_interactive_shell(
+                runtime=build_example_runtime(),
+                plugins_dir=plugins_dir,
+                runner=lambda _argv: 0,
+                background_runner=background_runner,
+            )
+    except Exception:
+        (Path(directory) / "process-owner-error.txt").write_text(
+            traceback.format_exc(),
+            encoding="utf-8",
+        )
+        raise
