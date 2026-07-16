@@ -19,7 +19,7 @@ from cli_downloader.core.owner_scope import OwnerScope
 from cli_downloader.core.owner_transport import OwnerPipeClient, OwnerTransportError
 from cli_downloader.storage.state_database import StateDatabase
 from cli_downloader.storage.state_task_store import StateTaskStore
-from cli_downloader.storage.task_store import TaskRecord, TaskStatus
+from cli_downloader.storage.task_store import TaskDesiredControl, TaskRecord, TaskStatus
 from tests.example_site import build_example_runtime
 
 
@@ -176,3 +176,50 @@ class ShellWiringTest(TestCase):
                     )
 
             self.assertEqual(exit_code, 0)
+
+    def test_repeated_shutdown_callback_keeps_paused_task_and_owner_cleanup_idempotent(self) -> None:
+        runner = Mock(return_value=0)
+        background_runner = Mock(return_value=0)
+
+        with TemporaryDirectory() as directory:
+            plugins_dir = Path(directory) / "plugins"
+            store = StateTaskStore(
+                StateDatabase(Path(directory) / "state" / "state.sqlite3")
+            )
+            store.upsert(
+                TaskRecord(
+                    task_id="paused-before-close",
+                    status=TaskStatus.PAUSED,
+                    desired_control=TaskDesiredControl.PAUSE,
+                    source_url="https://example.test/gallery/paused-before-close",
+                    metadata={"scheduler_managed": True},
+                )
+            )
+            with patch.dict(os.environ, {"CLI_DOWNLOADER_DATA_ROOT": directory}):
+                runtime = build_example_runtime()
+                fake_shell = Mock()
+
+                def run_shell() -> int:
+                    warning = shell_constructor.call_args.kwargs["shutdown_warning"]
+                    first = warning()
+                    second = warning()
+                    self.assertEqual(first, second)
+                    return 0
+
+                fake_shell.run.side_effect = run_shell
+                with patch(
+                    "cli_downloader.cli._shell_wiring.InteractiveShell",
+                    return_value=fake_shell,
+                ) as shell_constructor:
+                    exit_code = build_interactive_shell(
+                        runtime=runtime,
+                        plugins_dir=plugins_dir,
+                        runner=runner,
+                        background_runner=background_runner,
+                    )
+
+            self.assertEqual(exit_code, 0)
+            paused = store.get("paused-before-close")
+            self.assertIsNotNone(paused)
+            self.assertEqual(paused.status, TaskStatus.PAUSED)
+            self.assertEqual(paused.desired_control, TaskDesiredControl.PAUSE)

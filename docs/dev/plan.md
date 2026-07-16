@@ -227,8 +227,9 @@ boundaries now re-check owner shutdown and increment task revisions for checkpoi
 now rotates the execution fence before the owner lease is released, late non-cooperative workers
 are discarded, and qBittorrent shutdown leaves the client task intact. An abrupt owner-process
 test now proves a WAIT client becomes a bounded typed disconnect with the accepted Task ID, and a
-replacement owner replays that request instead of executing it twice. Remaining work is full
-process-level Shell restart coverage and repeated shutdown callback coverage:
+replacement owner replays that request instead of executing it twice. Fully wired Shell coverage
+also proves repeated shutdown callbacks keep paused Tasks paused and cleanup idempotent. Remaining
+work is full process-level Shell restart coverage:
 
 - Historical cancellation-on-shutdown reproductions are retained in the acceptance tests as
   regression cases; the typed signal now routes owner shutdown through checkpoint paths.
@@ -257,7 +258,9 @@ process-level Shell restart coverage and repeated shutdown callback coverage:
   invalidate the old run before process ownership is released.
 - Close accepted IPC waits with a typed owner-stopping/disconnected outcome containing the durable
   Task ID and revision. Clients remain bounded and never resubmit a replacement automatically.
-- Make repeated shutdown callbacks and late worker completion idempotent.
+- Make repeated shutdown callbacks and late worker completion idempotent. The callback path is now
+  covered by a fully wired Shell regression test; late worker fencing remains covered by the
+  existing execution-fence tests.
 
 ### Acceptance Criteria
 
