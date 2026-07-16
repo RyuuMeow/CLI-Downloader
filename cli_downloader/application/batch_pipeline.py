@@ -1044,6 +1044,8 @@ class BatchPipeline:
             outcomes = await self._downloader.execute(
                 downloading_child, assets, control, reporter
             )
+            if control.is_shutdown_requested():
+                return
             outcomes = _validate_outcomes(assets, outcomes)
         except OwnerShutdownRequested:
             return
@@ -1066,6 +1068,8 @@ class BatchPipeline:
                 replace(asset, status=AssetStatus.FAILED, failure=failure) for asset in assets
             )
 
+        if control.is_shutdown_requested():
+            return
         for outcome in outcomes:
             self._store.update_asset(child.child_id, outcome)
         all_outcomes = self._store.list_assets(child.child_id)

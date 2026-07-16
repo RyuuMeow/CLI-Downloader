@@ -14,6 +14,7 @@ from cli_downloader.core.batch import (
     BatchEntryStatus,
     BatchParent,
     DownloadAsset,
+    DownloadChildStatus,
     DownloadPackage,
 )
 from cli_downloader.core.errors import TaskExecutionConflictError
@@ -128,6 +129,25 @@ class ImmediateDownloader:
         )
 
 
+class NonCooperativeDownloader:
+    def __init__(self) -> None:
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def execute(self, child, assets, cancel_event, progress):
+        self.started.set()
+        await self.release.wait()
+        return tuple(
+            AssetRecord(
+                asset=asset.asset,
+                status=AssetStatus.COMPLETED,
+                final_path=f"output/{asset.asset.filename}",
+                content_sha256="b" * 64,
+            )
+            for asset in assets
+        )
+
+
 class CoordinatedBatchRunnerTests(TestCase):
     def test_owner_shutdown_checkpoints_batch_without_cancellation(self) -> None:
         async def scenario(directory: str) -> None:
@@ -161,6 +181,43 @@ class CoordinatedBatchRunnerTests(TestCase):
             self.assertTrue(recovered.metadata["owner_shutdown_checkpoint"])
             self.assertIsNone(recovered.active_run_id)
             self.assertEqual(batches.get_entry("entry-1").status, BatchEntryStatus.RESOLVING)
+
+        with TemporaryDirectory() as directory:
+            asyncio.run(scenario(directory))
+
+    def test_shutdown_discards_late_noncooperative_download_outcome(self) -> None:
+        async def scenario(directory: str) -> None:
+            root = Path(directory)
+            batches = StateBatchStore(root / "state.sqlite3")
+            tasks = StateTaskStore(root / "state.sqlite3")
+            entry = _entry()
+            batches.create_batch(BatchParent("parent-1", (entry.entry_id,)), (entry,))
+            tasks.upsert(TaskRecord("parent-1", TaskStatus.PENDING, kind=TaskKind.BATCH))
+            resolver = BlockingResolver()
+            downloader = NonCooperativeDownloader()
+            pipeline = BatchPipeline(
+                store=batches,
+                resolver=resolver,
+                downloader=downloader,
+            )
+            runner = CoordinatedBatchRunner(
+                pipeline=pipeline,
+                coordinator=TaskExecutionCoordinator(task_store=tasks),
+            )
+
+            running = asyncio.create_task(runner.run_batch("parent-1"))
+            await asyncio.wait_for(resolver.started.wait(), timeout=ASYNC_TEST_TIMEOUT)
+            resolver.release.set()
+            await asyncio.wait_for(downloader.started.wait(), timeout=ASYNC_TEST_TIMEOUT)
+            self.assertTrue(pipeline.shutdown("parent-1"))
+            downloader.release.set()
+            result = await asyncio.wait_for(running, timeout=ASYNC_TEST_TIMEOUT)
+
+            self.assertTrue(result.stopped)
+            self.assertEqual(result.task_status, TaskStatus.PLANNED)
+            child = batches.list_children("parent-1")[0]
+            self.assertEqual(child.status, DownloadChildStatus.DOWNLOADING)
+            self.assertEqual(batches.list_assets(child.child_id)[0].status, AssetStatus.DOWNLOADING)
 
         with TemporaryDirectory() as directory:
             asyncio.run(scenario(directory))
