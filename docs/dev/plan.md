@@ -13,6 +13,9 @@ and CLI argument forms remains out of scope.
 2. P5-19 Make Scheduler Admission Pause-Aware
 3. P5-20 Add Quiescent Direct And Torrent Checkpoints
 4. P5-21 Wait For Applied Controls Across IPC And UI
+5. P5-22 Separate Owner Shutdown From User Cancellation
+6. P5-23 Recover Checkpoints Without Retry Or Cancellation Semantics
+7. P5-24 Gate Owner Readiness And Verify Restart Lifecycles
 
 ## Direction And Boundaries
 
@@ -188,6 +191,149 @@ an IPC routing failure:
 - An in-progress pause is reported as `Pausing`, never as a completed pause.
 - IPC loss cannot leave the caller waiting forever, duplicate a control request, or change the
   existing Task/History separation.
+
+## P5-22 Separate Owner Shutdown From User Cancellation
+
+### Status
+
+Planned after the IPC lifecycle audit. The current Shell shutdown path sets every background
+worker's cancellation Event. That Event means user cancellation inside Item and Batch pipelines:
+
+- A running standalone Item may commit `CANCELED` after shutdown first normalises it to `PLANNED`.
+- A running Batch calls `BatchPipeline.cancel()`, which may persist unfinished entries, children,
+  and assets as `CANCELLED` and finish the parent as canceled.
+- A paused Batch still owns a live worker. Shell shutdown releases its pause wait through the same
+  cancel path, so a task that should remain paused may become canceled before process exit.
+- Torrent polling interprets the Event as a client cancel request, so closing the Shell may cancel
+  the external torrent instead of leaving a recoverable checkpoint.
+- The final shutdown normalisation intentionally leaves terminal statuses unchanged, so a late
+  worker `CANCELED` commit wins over the earlier recoverable `PLANNED` state.
+
+### Shutdown Control Model
+
+- Replace the shared boolean cancellation Event with typed execution stop reasons at minimum:
+  `user_cancel`, `owner_shutdown`, and `owner_lost`/recovery fencing where required.
+- `user_cancel` retains the current terminal cancellation semantics. `owner_shutdown` requests a
+  resumable checkpoint and lease release; it must not emit cancellation History or Completion.
+- On graceful Shell close, stop accepting new Owner requests, publish `STOPPING` immediately,
+  suspend Scheduler roots, and ask active Item and Batch workers to reach the P5-20 checkpoint
+  boundary.
+- Preserve `desired_control=PAUSE` for already paused Tasks. Running Tasks retain run intent and
+  become recoverable without being reported as user-paused or canceled.
+- Do not send qBittorrent cancel/delete for owner shutdown. Persist the client handle and last
+  observed state for startup reconciliation.
+
+### Bounded Drain And Fencing
+
+- Keep shutdown bounded, but do not release the Owner lease while an old worker can still commit
+  an unfenced terminal result. Fence writes by owner session, run ID, generation, and revision.
+- If the graceful checkpoint deadline expires, persist an explicit interrupted checkpoint and
+  invalidate the old run before process ownership is released.
+- Close accepted IPC waits with a typed owner-stopping/disconnected outcome containing the durable
+  Task ID and revision. Clients remain bounded and never resubmit a replacement automatically.
+- Make repeated shutdown callbacks and late worker completion idempotent.
+
+### Acceptance Criteria
+
+- Closing the Shell never changes a running or paused Task to `CANCELED` unless the user explicitly
+  requested cancel first.
+- A paused Item or Batch remains durably paused with no automatic startup command.
+- A running Item or Batch becomes resumable with its completed checkpoints intact.
+- Torrent handles remain in the external client and are reconciled rather than canceled.
+- No worker from the old owner can update the Task after a new owner has claimed its data root.
+
+## P5-23 Recover Checkpoints Without Retry Or Cancellation Semantics
+
+### Status
+
+Planned after the startup recovery audit. Current state-only tests pass, but recovery still uses
+retry as a workaround:
+
+- Startup converts active Batch entries, children, and assets to `CANCELLED`, then starts
+  `batches retry`; this records interruption as cancellation/retry instead of normal recovery.
+- `BatchResumeService.plan_resume()` includes `DOWNLOADING` children, but `BatchPipeline.run_batch()`
+  initially queues only `QUEUED` children. A real downloading checkpoint is therefore not resumed
+  by the resume path without the cancellation/retry conversion.
+- Standalone recovery reuses the Task ID and metadata but does not yet prove that completed assets
+  are skipped. Re-resolving a gallery may download completed files again.
+- Running standalone recovery changes `RUNNING` to `PLANNED` without clearing the stale active run
+  lease in the same normalisation step.
+
+### Recovery Matrix
+
+- Normalise Task status, desired control, active run lease, Batch execution rows, and History in one
+  transactional recovery operation per root.
+- `PAUSED + PAUSE`: clear only the stale owner/run lease, retain checkpoints, and enqueue nothing.
+- Interrupted nonterminal `RUN`: clear the stale lease, retain run intent, and enqueue
+  `tasks resume` or `batches resume`; do not route through retry.
+- Explicitly canceled, failed, partially completed, skipped, and completed roots remain terminal
+  and are never auto-resumed.
+- Preserve run generation until the recovery worker successfully claims a new generation.
+
+### Item And Batch Checkpoints
+
+- Make Batch resume convert persisted `RESOLVING`, `QUEUED`, and `DOWNLOADING` work into schedulable
+  recovery inputs without changing them to failure/cancellation states or creating retry attempts.
+- Persist completed Batch asset outcomes incrementally and never enqueue them again. Reconcile an
+  unfinished direct asset using the P5-20 partial-file policy.
+- Give standalone Items the same typed per-asset checkpoint identity. Recovery skips verified
+  completed assets and safely resumes or restarts only the unfinished asset.
+- Keep the original Task IDs, Batch child IDs, History records, output ownership markers, and
+  Completion identities. Recovery must not create duplicate tasks or files.
+- Reconcile standalone and Batch torrent checkpoints by client handle. Completed/missing/external
+  states follow the defined torrent safety matrix without resubmitting a known torrent.
+
+### Acceptance Criteria
+
+- A running direct Item and Batch continue after restart without re-downloading verified completed
+  assets and without adding retry/cancel History.
+- A downloading Batch child is actually scheduled by `batches resume`.
+- Paused roots remain paused across any number of restarts and resume only on an explicit command.
+- Stale active run IDs are cleared for both Task kinds before recovery admission.
+- Torrent recovery reuses the persisted client task and preserves its paused/running state.
+
+## P5-24 Gate Owner Readiness And Verify Restart Lifecycles
+
+### Readiness Audit
+
+- Keep discovery lifecycle at `RECOVERING` while plugins, stores, checkpoint normalisation, and
+  recovery admission are being prepared.
+- Start the IPC endpoint before advertising an endpoint-capable state. Do not publish `READY`
+  before the pipe listener exists and startup recovery commands have been durably admitted.
+- Define whether read-only queries are available during `RECOVERING`; reject or queue downloads and
+  controls with a typed recovering response instead of letting forwarding race a missing pipe.
+- External forwarding must not treat discovery metadata alone as proof that the Owner can accept a
+  command. `shell ensure --wait-ready` returns only after the same readiness barrier.
+- Publish `STOPPING` when shutdown begins, not only after `shell.run()` returns, and reject new
+  mutation requests consistently during the drain.
+
+### End-To-End Restart Matrix
+
+- Add process-level or fully wired Shell-owner tests using deterministic fake fetchers and a
+  temporary data root. Exercise graceful close and abrupt owner loss separately.
+- Cover standalone Item and Batch roots in queued, resolving, downloading, pausing, paused,
+  resumed, and torrent-submitted states.
+- For each state, assert persisted Task/Batch/asset rows, desired control, active run lease, History,
+  Completion, Scheduler admission, startup commands, and final output identity before and after a
+  second owner starts.
+- Cover an external WAIT client and DETACH client during shutdown. Both remain bounded; an accepted
+  Task ID remains authoritative even if its terminal event is lost.
+- Test rapid close/reopen, recovery followed by pause/cancel, missing plugin/client, auto-delete on
+  completion, and a second restart during recovery.
+- Replace state-only recovery expectations that encode `CANCELLED + retry` with the resumable
+  checkpoint contract from P5-23.
+
+### Acceptance Criteria
+
+- `READY` means the IPC endpoint is reachable and startup recovery has crossed its defined
+  admission barrier.
+- Closing and reopening the Shell preserves paused work and resumes running work exactly once.
+- Graceful shutdown, crash recovery, and explicit cancel produce three distinguishable durable
+  outcomes.
+- No restart path duplicates a Task, Batch child, torrent submission, output file, History terminal
+  event, or Completion identity.
+- The focused lifecycle suites and full verification gate pass without timing sleeps or live
+  network dependencies.
 
 ## Future Version Backlog
 
