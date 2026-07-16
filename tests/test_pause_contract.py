@@ -1,6 +1,7 @@
 import asyncio
+from pathlib import Path
 from tempfile import TemporaryDirectory
-from unittest import IsolatedAsyncioTestCase, expectedFailure
+from unittest import IsolatedAsyncioTestCase
 
 from cli_downloader.application.batch_pipeline import BatchPipeline
 from cli_downloader.application.download_limiter import GalleryDownloadLimiter
@@ -17,7 +18,7 @@ async def _wait_for_row(
     snapshot_factory,
     *,
     root_id: str,
-    active: bool,
+    present: bool,
     turns: int = 200,
 ) -> None:
     """Wait for a scheduler diagnostic row without relying on wall-clock sleeps."""
@@ -25,10 +26,12 @@ async def _wait_for_row(
     for _ in range(turns):
         rows = await snapshot_factory()
         found = any(row["root_id"] == root_id for row in rows)
-        if found is active:
+        if found is present:
             return
         await asyncio.sleep(0)
-    raise AssertionError(f"scheduler row did not reach active={active}: {root_id}")
+    raise AssertionError(
+        f"scheduler row did not reach present={present}: {root_id}; last_rows={rows!r}"
+    )
 
 
 class ImmediateResolver:
@@ -72,14 +75,13 @@ class HoldingDownloader:
 
 
 class PauseContractReproductionTests(IsolatedAsyncioTestCase):
-    @expectedFailure
     async def test_paused_root_releases_item_lease_before_quiescent_ack(self) -> None:
-        """Current code keeps the central Item lease while a Batch waits paused."""
+        """A paused root releases its central Item lease before quiescence."""
 
         with TemporaryDirectory() as directory:
             limiter = GalleryDownloadLimiter(1, item_site_limit=1)
-            store_a = StateBatchStore(f"{directory}/a.sqlite3")
-            store_b = StateBatchStore(f"{directory}/b.sqlite3")
+            store_a = StateBatchStore(Path(directory) / "a.sqlite3")
+            store_b = StateBatchStore(Path(directory) / "b.sqlite3")
             create_batch(store_a, "parent-a", ("pixiv",))
             create_batch(store_b, "parent-b", ("ehentai",))
             downloader = PauseBoundaryDownloader()
@@ -101,26 +103,25 @@ class PauseContractReproductionTests(IsolatedAsyncioTestCase):
             second = asyncio.create_task(pipeline_b.run_batch("parent-b"))
             try:
                 await downloader.active_started.wait()
-                await _wait_for_row(limiter.waiting_snapshot, root_id="parent-b", active=False)
+                await _wait_for_row(limiter.waiting_snapshot, root_id="parent-b", present=True)
                 self.assertTrue(pipeline_a.pause("parent-a"))
                 downloader.allow_boundary.set()
                 await downloader.about_to_wait.wait()
-
+                await _wait_for_row(limiter.active_snapshot, root_id="parent-a", present=False)
                 active = await limiter.active_snapshot()
-                self.assertEqual(active, ())
+                self.assertNotIn("parent-a", {row["root_id"] for row in active})
             finally:
                 pipeline_a.resume("parent-a")
                 downloader.allow_boundary.set()
                 await asyncio.gather(first, second, return_exceptions=True)
 
-    @expectedFailure
     async def test_paused_waiting_root_cannot_acquire_a_released_item_lease(self) -> None:
-        """Current code grants a slot to a waiter that was paused mid-acquire."""
+        """A root suspended while waiting cannot acquire a later released slot."""
 
         with TemporaryDirectory() as directory:
             limiter = GalleryDownloadLimiter(1, item_site_limit=1)
-            store_a = StateBatchStore(f"{directory}/a.sqlite3")
-            store_b = StateBatchStore(f"{directory}/b.sqlite3")
+            store_a = StateBatchStore(Path(directory) / "a.sqlite3")
+            store_b = StateBatchStore(Path(directory) / "b.sqlite3")
             create_batch(store_a, "parent-a", ("pixiv",))
             create_batch(store_b, "parent-b", ("ehentai",))
             downloader = HoldingDownloader()
@@ -142,11 +143,11 @@ class PauseContractReproductionTests(IsolatedAsyncioTestCase):
             second = asyncio.create_task(pipeline_b.run_batch("parent-b"))
             try:
                 await downloader.active_started.wait()
-                await _wait_for_row(limiter.waiting_snapshot, root_id="parent-b", active=False)
+                await _wait_for_row(limiter.waiting_snapshot, root_id="parent-b", present=True)
                 self.assertTrue(pipeline_b.pause("parent-b"))
                 downloader.release_active.set()
                 await first
-                await _wait_for_row(limiter.active_snapshot, root_id="parent-b", active=True)
+                await _wait_for_row(limiter.active_snapshot, root_id="parent-b", present=False)
 
                 active = await limiter.active_snapshot()
                 self.assertNotIn("parent-b", {row["root_id"] for row in active})

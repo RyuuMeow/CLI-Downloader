@@ -740,23 +740,40 @@ class TaskHierarchyService:
         return 0
 
     def _scheduler_detail(self, root_id: str, *, sequence: int | None = None) -> dict[str, object]:
-        method = getattr(self._scheduler, "waiting_snapshot_sync", None)
-        if not callable(method):
+        waiting_method = getattr(self._scheduler, "waiting_snapshot_sync", None)
+        active_method = getattr(self._scheduler, "active_snapshot_sync", None)
+        if not callable(waiting_method) and not callable(active_method):
             return {}
-        try:
-            rows = method()
-        except Exception:
-            return {}
-        for row in rows:
-            if not isinstance(row, Mapping) or row.get("root_id") != root_id:
-                continue
-            if sequence is not None and row.get("sequence") != sequence:
-                continue
-            return {
-                "scheduler_waiting_reason": row.get("reason"),
-                "scheduler_queue_position": row.get("position"),
-                "scheduler_site_id": row.get("site_id"),
-            }
+        if callable(active_method):
+            try:
+                active_rows = active_method()
+            except Exception:
+                active_rows = ()
+            for row in active_rows:
+                if not isinstance(row, Mapping) or row.get("root_id") != root_id:
+                    continue
+                if sequence is not None and row.get("sequence") != sequence:
+                    continue
+                return {
+                    "scheduler_active": True,
+                    "scheduler_site_id": row.get("site_id"),
+                }
+        if callable(waiting_method):
+            try:
+                waiting_rows = waiting_method()
+            except Exception:
+                waiting_rows = ()
+            for row in waiting_rows:
+                if not isinstance(row, Mapping) or row.get("root_id") != root_id:
+                    continue
+                if sequence is not None and row.get("sequence") != sequence:
+                    continue
+                return {
+                    "scheduler_active": False,
+                    "scheduler_waiting_reason": row.get("reason"),
+                    "scheduler_queue_position": row.get("position"),
+                    "scheduler_site_id": row.get("site_id"),
+                }
         return {}
 
     def _task_created_at(self, task_id: str) -> str | None:

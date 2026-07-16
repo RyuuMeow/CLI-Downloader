@@ -98,12 +98,37 @@ class GalleryDownloadLimiter:
         site_id: str,
         sequence: int = 0,
     ):
-        async with self._scheduler.item(
+        lease = await self.acquire_item(
             root_id=root_id,
             site_id=site_id,
             sequence=sequence,
-        ) as lease:
+        )
+        try:
             yield lease
+        finally:
+            await lease.release()
+
+    async def acquire_item(
+        self,
+        *,
+        root_id: str,
+        site_id: str,
+        sequence: int = 0,
+    ) -> ItemLease:
+        return await self._scheduler.acquire(
+            root_id=root_id,
+            site_id=site_id,
+            sequence=sequence,
+        )
+
+    def suspend_root_sync(self, root_id: str) -> None:
+        self._scheduler.suspend_root_sync(root_id)
+
+    def resume_root_sync(self, root_id: str) -> None:
+        self._scheduler.resume_root_sync(root_id)
+
+    def cancel_root_sync(self, root_id: str) -> None:
+        self._scheduler.cancel_root_sync(root_id)
 
     async def waiting_snapshot(self) -> tuple[dict[str, object], ...]:
         return await self._scheduler.waiting_snapshot()

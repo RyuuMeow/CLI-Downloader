@@ -117,3 +117,35 @@ class ItemSchedulerTest(IsolatedAsyncioTestCase):
         await first.release()
         await second.release()
         self.assertEqual(await scheduler.active_snapshot(), ())
+
+    async def test_suspended_root_cannot_receive_a_pending_grant_until_resumed(self) -> None:
+        scheduler = ItemScheduler(1, 1)
+        first = await scheduler.acquire(root_id="batch-a", site_id="pixiv")
+        waiting = asyncio.create_task(
+            scheduler.acquire(root_id="batch-b", site_id="pixiv")
+        )
+        await asyncio.sleep(0)
+
+        await scheduler.suspend_root("batch-b")
+        await first.release()
+        await asyncio.sleep(0)
+        self.assertFalse(waiting.done())
+        snapshot = await scheduler.waiting_snapshot()
+        self.assertEqual(snapshot[0]["reason"], "root_suspended")
+
+        await scheduler.resume_root("batch-b")
+        await (await waiting).release()
+
+    async def test_cancelled_root_removes_pending_waiters_and_unblocks_acquire(self) -> None:
+        scheduler = ItemScheduler(1, 1)
+        first = await scheduler.acquire(root_id="batch-a", site_id="pixiv")
+        waiting = asyncio.create_task(
+            scheduler.acquire(root_id="batch-b", site_id="pixiv")
+        )
+        await asyncio.sleep(0)
+
+        await scheduler.cancel_root("batch-b")
+        with self.assertRaises(asyncio.CancelledError):
+            await waiting
+        self.assertEqual(await scheduler.waiting_snapshot(), ())
+        await first.release()

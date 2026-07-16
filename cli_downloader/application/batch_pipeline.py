@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable, Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from types import MappingProxyType
@@ -138,6 +138,8 @@ class _TaskControl:
     parent_id: str
     task_id: str
     worker_id: str | None = None
+    pause_boundary: Callable[[], Awaitable[None]] | None = None
+    resume_boundary: Callable[[], Awaitable[None]] | None = None
 
     def is_set(self) -> bool:
         return self.state.cancel_event.is_set() or self.task_id in self.state.cancelled_ids
@@ -161,17 +163,108 @@ class _TaskControl:
             task.result()
 
     async def wait_if_paused(self) -> None:
-        for target_id in (self.parent_id, self.task_id):
-            if self.is_set():
-                return
-            event = self.state.resume_events.setdefault(target_id, asyncio.Event())
-            if target_id not in self.state.paused_ids:
-                event.set()
-            elif target_id == self.parent_id and self.worker_id is not None:
+        paused_targets = tuple(
+            target_id
+            for target_id in (self.parent_id, self.task_id)
+            if target_id in self.state.paused_ids
+        )
+        if not paused_targets or self.is_set():
+            return
+
+        if self.pause_boundary is not None:
+            await self.pause_boundary()
+        for target_id in paused_targets:
+            if target_id == self.parent_id and self.worker_id is not None:
                 _mark_worker_boundary(self.state, self.parent_id, self.worker_id, True)
+            event = self.state.resume_events.setdefault(target_id, asyncio.Event())
             await event.wait()
             if target_id == self.parent_id and self.worker_id is not None:
                 _mark_worker_boundary(self.state, self.parent_id, self.worker_id, False)
+            if self.is_set():
+                break
+        if not self.is_set() and self.resume_boundary is not None:
+            await self.resume_boundary()
+
+
+class _ItemLeaseController:
+    """Release and reacquire one central Item lease around pause checkpoints."""
+
+    def __init__(
+        self,
+        limiter: GalleryDownloadLimiter,
+        *,
+        root_id: str,
+        site_id: str,
+        sequence: int,
+        cancelled: Callable[[], bool],
+    ) -> None:
+        self._limiter = limiter
+        self._root_id = root_id
+        self._site_id = site_id
+        self._sequence = sequence
+        self._cancelled = cancelled
+        self._lease = None
+
+    async def acquire(self) -> None:
+        if self._lease is None and not self._cancelled():
+            self._lease = await self._limiter.acquire_item(
+                root_id=self._root_id,
+                site_id=self._site_id,
+                sequence=self._sequence,
+            )
+
+    async def release(self) -> None:
+        lease, self._lease = self._lease, None
+        if lease is not None:
+            await lease.release()
+
+    async def pause_boundary(self) -> None:
+        await self.release()
+
+    async def resume_boundary(self) -> None:
+        await self.acquire()
+
+
+class _SemaphoreLeaseController:
+    """Make pipeline backpressure permits pause-safe and idempotently releasable."""
+
+    def __init__(self, *semaphores: asyncio.Semaphore) -> None:
+        self._semaphores = semaphores
+        self._acquired = 0
+
+    async def acquire(self) -> None:
+        while self._acquired < len(self._semaphores):
+            try:
+                await self._semaphores[self._acquired].acquire()
+            except BaseException:
+                await self.release()
+                raise
+            self._acquired += 1
+
+    async def release(self) -> None:
+        while self._acquired:
+            self._acquired -= 1
+            self._semaphores[self._acquired].release()
+
+    async def pause_boundary(self) -> None:
+        await self.release()
+
+    async def resume_boundary(self) -> None:
+        await self.acquire()
+
+
+def _compose_pause_boundaries(
+    controllers: tuple[object, ...],
+) -> tuple[Callable[[], Awaitable[None]], Callable[[], Awaitable[None]]]:
+    async def pause() -> None:
+        for controller in controllers:
+            await controller.pause_boundary()
+
+    async def resume() -> None:
+        for controller in reversed(controllers):
+            await controller.resume_boundary()
+
+    return pause, resume
 
 
 def _mark_worker_boundary(state: _RunState, parent_id: str, worker_id: str, is_safe: bool) -> None:
@@ -306,6 +399,8 @@ class BatchPipeline:
         root_id, state = active
         if parent_id == root_id:
             state.cancel_event.set()
+            if self._download_limiter is not None:
+                self._download_limiter.cancel_root_sync(root_id)
         else:
             state.cancelled_ids.add(parent_id)
             state.cancel_events.setdefault(parent_id, asyncio.Event()).set()
@@ -320,6 +415,8 @@ class BatchPipeline:
         root_id, state = active
         state.paused_ids.add(task_id)
         state.resume_events.setdefault(task_id, asyncio.Event()).clear()
+        if task_id == root_id and self._download_limiter is not None:
+            self._download_limiter.suspend_root_sync(root_id)
         self._emit(state, root_id, "task_pause_requested", task_id=task_id)
         if task_id == root_id:
             state.pause_acknowledged = False
@@ -334,6 +431,8 @@ class BatchPipeline:
         if task_id not in state.paused_ids:
             return False
         self._release_pause(state, task_id)
+        if task_id == root_id and self._download_limiter is not None:
+            self._download_limiter.resume_root_sync(root_id)
         self._emit(state, root_id, "task_resume_requested", task_id=task_id)
         if task_id == root_id:
             queue = state.control_acknowledgements
@@ -534,7 +633,12 @@ class BatchPipeline:
                         self._cancel_entry(state, entry)
                     else:
                         await self._resolve_entry(
-                            parent_id, state, entry, download_queue, worker_id=worker_id
+                            parent_id,
+                            state,
+                            entry,
+                            download_queue,
+                            worker_id=worker_id,
+                            control=control,
                         )
                 except Exception as error:
                     state.worker_error = state.worker_error or error
@@ -553,6 +657,7 @@ class BatchPipeline:
         download_queue: asyncio.Queue[DownloadChild | None],
         *,
         worker_id: str,
+        control: _TaskControl,
     ) -> None:
         resolving = entry
         if entry.status is BatchEntryStatus.PENDING_RESOLUTION:
@@ -560,22 +665,25 @@ class BatchPipeline:
             self._store.update_entry(resolving)
         self._emit(state, parent_id, "entry_resolving", entry_id=entry.entry_id)
         reporter = self._reporter(state, parent_id, entry_id=entry.entry_id)
-        control = _TaskControl(state, parent_id, entry.entry_id, worker_id)
+        site_slots = self._site_resolution_slots.get(entry.site_id)
+        resolution_slots = (
+            (site_slots, self._resolution_slots)
+            if site_slots is not None
+            else (self._resolution_slots,)
+        )
+        slot_controller = _SemaphoreLeaseController(*resolution_slots)
         try:
-            site_slots = self._site_resolution_slots.get(entry.site_id)
-            if site_slots is None:
-                async with self._resolution_slots:
-                    await control.wait_if_paused()
-                    if control.is_set():
-                        raise asyncio.CancelledError
-                    package = await self._resolve_package(resolving, state, control, reporter)
-            else:
-                async with site_slots:
-                    async with self._resolution_slots:
-                        await control.wait_if_paused()
-                        if control.is_set():
-                            raise asyncio.CancelledError
-                        package = await self._resolve_package(resolving, state, control, reporter)
+            await slot_controller.acquire()
+            pause_boundary, resume_boundary = _compose_pause_boundaries((slot_controller,))
+            control = replace(
+                control,
+                pause_boundary=pause_boundary,
+                resume_boundary=resume_boundary,
+            )
+            await control.wait_if_paused()
+            if control.is_set():
+                raise asyncio.CancelledError
+            package = await self._resolve_package(resolving, state, control, reporter)
         except asyncio.CancelledError:
             if not control.is_set():
                 raise
@@ -606,6 +714,8 @@ class BatchPipeline:
                 failure=failure.to_dict(),
             )
             return
+        finally:
+            await slot_controller.release()
 
         if control.is_set():
             self._cancel_entry(state, resolving)
@@ -732,11 +842,16 @@ class BatchPipeline:
                     if state.worker_error is not None:
                         continue
                     control = _TaskControl(state, parent_id, child.entry_id, worker_id)
-                    await control.wait_if_paused()
                     if control.is_set():
                         self._cancel_child(state, child)
                     else:
-                        await self._download_child(parent_id, state, child, worker_id=worker_id)
+                        await self._download_child(
+                            parent_id,
+                            state,
+                            child,
+                            worker_id=worker_id,
+                            control=control,
+                        )
                 except Exception as error:
                     state.worker_error = state.worker_error or error
                     state.cancel_event.set()
@@ -753,16 +868,59 @@ class BatchPipeline:
         child: DownloadChild,
         *,
         worker_id: str,
+        control: _TaskControl,
     ) -> None:
+        await control.wait_if_paused()
+        if control.is_set():
+            self._cancel_child(state, child)
+            return
+
+        controllers: list[object] = []
+        lease_controller = None
         if self._download_limiter is not None:
-            async with self._download_limiter.item(
+            lease_controller = _ItemLeaseController(
+                self._download_limiter,
                 root_id=parent_id,
                 site_id=child.package.site_id,
                 sequence=self._child_sequence(parent_id, child.child_id),
-            ):
-                await self._execute_download_child(parent_id, state, child, worker_id=worker_id)
-            return
-        await self._execute_download_child(parent_id, state, child, worker_id=worker_id)
+                cancelled=control.is_set,
+            )
+            try:
+                await lease_controller.acquire()
+            except asyncio.CancelledError:
+                if control.is_set():
+                    self._cancel_child(state, child)
+                    return
+                raise
+            controllers.append(lease_controller)
+        site_slots = self._site_download_slots.get(child.package.site_id)
+        slot_controller = _SemaphoreLeaseController(
+            *(
+                (site_slots, self._download_slots)
+                if site_slots is not None
+                else (self._download_slots,)
+            )
+        )
+        try:
+            await slot_controller.acquire()
+        except BaseException:
+            for controller in reversed(controllers):
+                await controller.release()
+            raise
+        controllers.append(slot_controller)
+        pause_boundary, resume_boundary = _compose_pause_boundaries(tuple(controllers))
+        control = replace(control, pause_boundary=pause_boundary, resume_boundary=resume_boundary)
+        try:
+            await self._execute_download_child(
+                parent_id,
+                state,
+                child,
+                worker_id=worker_id,
+                control=control,
+            )
+        finally:
+            for controller in reversed(controllers):
+                await controller.release()
 
     def _child_sequence(self, parent_id: str, child_id: str) -> int:
         for sequence, child in enumerate(self._store.list_children(parent_id)):
@@ -777,6 +935,7 @@ class BatchPipeline:
         child: DownloadChild,
         *,
         worker_id: str,
+        control: _TaskControl,
     ) -> None:
         downloading_child = replace(child, status=DownloadChildStatus.DOWNLOADING)
         self._store.update_child(downloading_child)
@@ -795,28 +954,14 @@ class BatchPipeline:
             self._store.update_asset(child.child_id, asset)
         self._emit(state, parent_id, "child_downloading", child_id=child.child_id)
         reporter = self._reporter(state, parent_id, child_id=child.child_id)
-        control = _TaskControl(state, parent_id, child.entry_id, worker_id)
-
         failure: FailureData | None = None
         try:
-            site_slots = self._site_download_slots.get(child.package.site_id)
-            if site_slots is None:
-                async with self._download_slots:
-                    await control.wait_if_paused()
-                    if control.is_set():
-                        raise asyncio.CancelledError
-                    outcomes = await self._downloader.execute(
-                        downloading_child, assets, control, reporter
-                    )
-            else:
-                async with site_slots:
-                    async with self._download_slots:
-                        await control.wait_if_paused()
-                        if control.is_set():
-                            raise asyncio.CancelledError
-                        outcomes = await self._downloader.execute(
-                            downloading_child, assets, control, reporter
-                        )
+            await control.wait_if_paused()
+            if control.is_set():
+                raise asyncio.CancelledError
+            outcomes = await self._downloader.execute(
+                downloading_child, assets, control, reporter
+            )
             outcomes = _validate_outcomes(assets, outcomes)
         except asyncio.CancelledError:
             if not control.is_set():

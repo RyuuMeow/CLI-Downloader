@@ -70,8 +70,8 @@ an IPC routing failure:
 
 The first reproduction slice is now in `tests/test_pause_contract.py`. It adds a bounded active-lease
 diagnostic to the shared Item Scheduler and two deterministic cross-root reproductions (active-root
-pause and waiting-root pause). Both are expected failures until P5-19 supplies root suspension and
-lease unwinding; they are intentionally kept as the contract gate for that repair.
+pause and waiting-root pause). P5-19 now makes these contract tests pass; the remaining direct,
+torrent, terminal-race, and applied-control coverage continues under P5-20 and P5-21.
 
 ### Contract And Reproduction Tests
 
@@ -92,12 +92,19 @@ lease unwinding; they are intentionally kept as the contract gate for that repai
 
 ### Acceptance Criteria
 
-- The new cross-root tests fail against the current implementation for the documented reasons.
+- The cross-root tests encode the documented defects and pass once P5-19 admission and lease
+  unwinding are active.
 - Tests distinguish `Pausing` from `Paused` and never treat persisted intent as resource release.
-- The reproduction is independent of Textual timing and works through the same Owner control path
-  used by external `clid` commands.
+- The reproduction is independent of Textual timing and exercises the same Pipeline control path
+  that Owner dispatch invokes; transport-level control coverage remains in P5-21.
 
 ## P5-19 Make Scheduler Admission Pause-Aware
+
+### Status
+
+In progress. Root suspension, pending-waiter cancellation, central Item lease release/reacquisition,
+and Batch resolution/download semaphore release checkpoints are implemented. Standalone Item
+admission and the remaining acquisition race coverage are still pending.
 
 ### Scheduler Ownership
 

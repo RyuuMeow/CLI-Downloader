@@ -29,6 +29,7 @@ class _Waiter:
     sequence: int
     order: int
     event: asyncio.Event
+    cancelled: bool = False
 
 
 class ItemLease:
@@ -85,6 +86,7 @@ class ItemScheduler:
         self.max_concurrent_downloads_per_site = per_site
         self.policy = selected_policy
         self._lock = asyncio.Lock()
+        self._loop: asyncio.AbstractEventLoop | None = None
         self._pending: list[_Waiter] = []
         self._active: dict[str, _Waiter] = {}
         self._active_by_site: defaultdict[str, int] = defaultdict(int)
@@ -92,6 +94,7 @@ class ItemScheduler:
         self._root_order: list[str] = []
         self._last_root: str | None = None
         self._next_order = 0
+        self._suspended_roots: set[str] = set()
 
     async def acquire(
         self,
@@ -100,6 +103,7 @@ class ItemScheduler:
         site_id: str,
         sequence: int = 0,
     ) -> ItemLease:
+        self._loop = asyncio.get_running_loop()
         if not root_id or not site_id:
             raise ValueError("root_id and site_id must be non-empty")
         if isinstance(sequence, bool) or not isinstance(sequence, int) or sequence < 0:
@@ -131,7 +135,37 @@ class ItemScheduler:
                     self._remove_pending_locked(waiter)
                     self._grant_locked()
             raise
+        if waiter.cancelled:
+            raise asyncio.CancelledError
         return ItemLease(self, waiter)
+
+    async def suspend_root(self, root_id: str) -> None:
+        _require_root_id(root_id)
+        async with self._lock:
+            self._suspended_roots.add(root_id)
+            self._grant_locked()
+
+    async def resume_root(self, root_id: str) -> None:
+        _require_root_id(root_id)
+        async with self._lock:
+            self._suspended_roots.discard(root_id)
+            self._grant_locked()
+
+    async def cancel_root(self, root_id: str) -> None:
+        _require_root_id(root_id)
+        async with self._lock:
+            self._cancel_pending_root_locked(root_id)
+            self._suspended_roots.discard(root_id)
+            self._grant_locked()
+
+    def suspend_root_sync(self, root_id: str) -> None:
+        self._run_root_control_sync("suspend", root_id)
+
+    def resume_root_sync(self, root_id: str) -> None:
+        self._run_root_control_sync("resume", root_id)
+
+    def cancel_root_sync(self, root_id: str) -> None:
+        self._run_root_control_sync("cancel", root_id)
 
     @asynccontextmanager
     async def item(
@@ -222,6 +256,7 @@ class ItemScheduler:
         candidates = [
             waiter
             for waiter in heads.values()
+            if waiter.root_id not in self._suspended_roots
             if self._active_by_site[waiter.site_id]
             < self.max_concurrent_downloads_per_site
         ]
@@ -285,6 +320,8 @@ class ItemScheduler:
         )
 
     def _waiting_reason_locked(self, waiter: _Waiter) -> str:
+        if waiter.root_id in self._suspended_roots:
+            return "root_suspended"
         if len(self._active) >= self.max_concurrent_downloads:
             return "global_slot"
         if self._active_by_site[waiter.site_id] >= self.max_concurrent_downloads_per_site:
@@ -297,7 +334,46 @@ class ItemScheduler:
             return "root_order"
         return "fair_turn"
 
+    def _cancel_pending_root_locked(self, root_id: str) -> None:
+        for waiter in tuple(self._pending):
+            if waiter.root_id != root_id:
+                continue
+            waiter.cancelled = True
+            self._pending.remove(waiter)
+            waiter.event.set()
+
+    def _run_root_control_sync(self, action: str, root_id: str) -> None:
+        _require_root_id(root_id)
+        operation = {
+            "suspend": self.suspend_root,
+            "resume": self.resume_root,
+            "cancel": self.cancel_root,
+        }[action]
+        loop = self._loop
+        try:
+            current_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            current_loop = None
+        if loop is None or not loop.is_running() or current_loop is loop:
+            # Synchronous callers on the scheduler loop (Batch/UI tests) are
+            # between awaits, so no other scheduler mutation can interleave.
+            if action == "suspend":
+                self._suspended_roots.add(root_id)
+            elif action == "resume":
+                self._suspended_roots.discard(root_id)
+            else:
+                self._cancel_pending_root_locked(root_id)
+                self._suspended_roots.discard(root_id)
+            self._grant_locked()
+            return
+        asyncio.run_coroutine_threadsafe(operation(root_id), loop).result()
+
 
 def _positive_int(value: int, name: str) -> None:
     if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
         raise ValueError(f"{name} must be a positive integer")
+
+
+def _require_root_id(root_id: str) -> None:
+    if not isinstance(root_id, str) or not root_id:
+        raise ValueError("root_id must be a non-empty string")
