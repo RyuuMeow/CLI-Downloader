@@ -22,6 +22,7 @@ from cli_downloader.core.models import (
     ResolvedItem,
 )
 from cli_downloader.core.output import output_folder_fields
+from cli_downloader.core.task_tree import TaskKind
 from cli_downloader.core.pipeline import PipelineContext, PipelineRunner
 from cli_downloader.application.download_limiter import GalleryDownloadLimiter
 from cli_downloader.integrations.torrent import (
@@ -242,8 +243,7 @@ class DownloadService:
                 current.status is TaskStatus.PAUSED
                 or current.desired_control.value == "pause"
             )
-            checkpoint = replace(
-                current,
+            checkpoint = current.transition(
                 status=TaskStatus.PAUSED if paused else TaskStatus.PLANNED,
                 desired_control=TaskDesiredControl.PAUSE if paused else TaskDesiredControl.RUN,
                 active_run_id=None,
@@ -253,8 +253,7 @@ class DownloadService:
             self._upsert_history_record(checkpoint, finished=False)
             raise
         except asyncio.CancelledError:
-            cancelled = replace(
-                self._task_store.get(record.task_id) or record,
+            cancelled = (self._task_store.get(record.task_id) or record).transition(
                 status=TaskStatus.CANCELED,
             )
             self._task_store.upsert(cancelled)
@@ -269,8 +268,7 @@ class DownloadService:
             raise
         except Exception:
             current = self._task_store.get(record.task_id) or record
-            failed = replace(
-                current,
+            failed = current.transition(
                 status=(
                     TaskStatus.PARTIALLY_COMPLETED
                     if current.metadata.get("completed_files", 0)
@@ -356,6 +354,14 @@ class DownloadService:
             site_id=item.site_id,
             source_url=item.source_url,
             title=item.title,
+            kind=existing.kind if existing is not None else TaskKind.ITEM,
+            desired_control=(
+                existing.desired_control
+                if existing is not None
+                else TaskDesiredControl.RUN
+            ),
+            revision=existing.revision if existing is not None else 0,
+            run_generation=existing.run_generation if existing is not None else 0,
             created_at=existing.created_at if existing is not None else datetime.now(UTC),
             metadata={
                 "strategy": plan.strategy.value,
@@ -694,8 +700,7 @@ class WriteAssetsStage:
             if current is None:
                 raise RuntimeError(f"task disappeared during download: {context.task_id}")
             self._task_store.upsert(
-                replace(
-                    current,
+                current.transition(
                     metadata={
                         **current.metadata,
                         "completed_files": len(written_assets),
@@ -706,6 +711,9 @@ class WriteAssetsStage:
             )
             if self._progress is not None:
                 self._progress(len(written_assets), total)
+
+        if self._shutdown_requested():
+            raise OwnerShutdownRequested
 
         return context.with_data(written_assets=tuple(written_assets)).emit(
             name="assets_written",
@@ -893,8 +901,7 @@ class WriteAssetsStage:
             if current is None:
                 raise RuntimeError(f"task disappeared during torrent download: {context.task_id}")
             self._task_store.upsert(
-                replace(
-                    current,
+                current.transition(
                     metadata={
                         **current.metadata,
                         "completed_files": len(written_assets),
@@ -905,6 +912,9 @@ class WriteAssetsStage:
             )
             if self._progress is not None:
                 self._progress(len(written_assets), total)
+
+        if self._shutdown_requested():
+            raise OwnerShutdownRequested
 
         return context.with_data(written_assets=tuple(written_assets)).emit(
             name="torrent_assets_written",
@@ -945,7 +955,7 @@ class WriteAssetsStage:
             "download_speed": 0,
         }
         self._task_store.upsert(
-            replace(current, metadata={**current.metadata, "torrent_checkpoints": checkpoints})
+            current.transition(metadata={**current.metadata, "torrent_checkpoints": checkpoints})
         )
 
     def _torrent_checkpoint(self, task_id: str, asset: Asset) -> Mapping[str, object] | None:
@@ -983,7 +993,7 @@ class WriteAssetsStage:
         )
         checkpoints[_torrent_checkpoint_key(asset)] = checkpoint
         self._task_store.upsert(
-            replace(current, metadata={**current.metadata, "torrent_checkpoints": checkpoints})
+            current.transition(metadata={**current.metadata, "torrent_checkpoints": checkpoints})
         )
 
     async def _wait_until_runnable(
@@ -1026,7 +1036,7 @@ class WriteAssetsStage:
                     await lease_controller.acquire()
                 suspended = False
             if record.status is TaskStatus.PLANNED:
-                self._task_store.upsert(replace(record, status=TaskStatus.RUNNING))
+                self._task_store.upsert(record.transition(status=TaskStatus.RUNNING))
             return
 
     def _shutdown_requested(self) -> bool:
@@ -1064,8 +1074,7 @@ class CompleteTaskStage:
             raise TypeError("pipeline context record must be a TaskRecord")
 
         current = self._task_store.get(context.task_id) or record
-        completed = replace(
-            current,
+        completed = current.transition(
             status=TaskStatus.COMPLETED,
             metadata={
                 **current.metadata,

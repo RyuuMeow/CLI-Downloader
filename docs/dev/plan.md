@@ -226,8 +226,9 @@ Shell/UI projection refresh and rapid-control/restart lifecycle coverage remain 
 
 In progress. A typed stop signal now distinguishes `user_cancel` from `owner_shutdown`; Batch and
 standalone Item workers can checkpoint to `PLANNED` without emitting cancellation. Shell shutdown
-also publishes `STOPPING` and closes the IPC listener before draining. Bounded-drain fencing,
-paused-root preservation, and qBittorrent shutdown reconciliation remain:
+also publishes `STOPPING` and closes the IPC listener before draining. Standalone terminal
+boundaries now re-check owner shutdown and increment task revisions for checkpoints. Bounded-drain
+fencing, paused-root preservation, and qBittorrent shutdown reconciliation remain:
 
 - Historical cancellation-on-shutdown reproductions are retained in the acceptance tests as
   regression cases; the typed signal now routes owner shutdown through checkpoint paths.
@@ -273,14 +274,14 @@ paused-root preservation, and qBittorrent shutdown reconciliation remain:
 
 In progress. Startup recovery now uses `resume` instead of `retry`, returns active Batch children
 and assets to schedulable queued states without creating retry attempts, skips verified standalone
-output files when the checkpoint still exists, and clears stale standalone run leases before
-re-admission. Transactional root recovery, partial-file verification, torrent reconciliation, and
-late-writer fencing remain:
+output files when the checkpoint still exists, clears stale standalone run leases before
+re-admission, and preserves recovered Task revision/run-generation identity. Transactional root
+recovery, partial-file verification, torrent reconciliation, and late-writer fencing remain:
 
 - Recovery now normalises active Batch children/assets back to queued states and clears stale Task
   run leases for both `RUNNING` and `PLANNED` records before `resume` admission. The full
   verification gate passes (595 core tests); remaining gaps are transactional root recovery, full
-  partial-file verification, and standalone/torrent stale-writer fencing.
+  partial-file verification, torrent reconciliation, and late-writer fencing.
 
 ### Recovery Matrix
 

@@ -39,6 +39,22 @@ class FailSecondFetcher:
         return b"first asset"
 
 
+class ShutdownAfterWrite(AssetFileWriter):
+    def __init__(self, root: Path, signal: ExecutionStopSignal) -> None:
+        super().__init__(root)
+        self.signal = signal
+
+    def write(self, asset, content, **kwargs):
+        result = super().write(asset, content, **kwargs)
+        self.signal.request_shutdown()
+        return result
+
+
+class StaticFetcher:
+    async def fetch(self, _asset):
+        return b"asset written before shutdown boundary"
+
+
 class CountingTorrentFetcher:
     def __init__(self) -> None:
         self.calls = 0
@@ -242,6 +258,45 @@ class DownloadServiceTest(TestCase):
         self.assertIsNotNone(record)
         self.assertEqual(record.status, TaskStatus.PLANNED)
         self.assertTrue(record.metadata["owner_shutdown_checkpoint"])
+
+    def test_owner_shutdown_at_terminal_boundary_does_not_complete_item(self) -> None:
+        with TemporaryDirectory() as directory:
+            store = InMemoryTaskStore()
+            signal = ExecutionStopSignal()
+            stage = WriteAssetsStage(
+                fetcher=StaticFetcher(),
+                file_writer=ShutdownAfterWrite(Path(directory), signal),
+                task_store=store,
+                cancel_signal=signal,
+            )
+            store.upsert(TaskRecord("boundary-task", TaskStatus.PLANNED))
+            plan = DownloadStrategyPlan(
+                strategy=DownloadStrategy.DIRECT,
+                reason="test",
+                assets=AssetList(
+                    (Asset("https://example.test/asset", AssetKind.FILE, "boundary.txt"),)
+                ),
+            )
+
+            async def run() -> None:
+                with self.assertRaises(OwnerShutdownRequested):
+                    await stage._run(
+                        PipelineContext(
+                            "boundary-task",
+                            data={
+                                "item": ResolvedItem(
+                                    "example", "example://boundary", "Boundary"
+                                ),
+                                "plan": plan,
+                            },
+                        )
+                    )
+
+            asyncio.run(run())
+            record = store.get("boundary-task")
+            self.assertIsNotNone(record)
+            self.assertEqual(record.status, TaskStatus.RUNNING)
+            self.assertEqual(record.revision, 2)
 
     def test_standalone_pause_releases_shared_item_slot_between_assets(self) -> None:
         async def scenario(directory: Path) -> None:
@@ -547,6 +602,8 @@ class DownloadServiceTest(TestCase):
             TaskRecord(
                 task_id="task-1",
                 status=TaskStatus.PLANNED,
+                revision=5,
+                run_generation=3,
                 source_url="example://gallery/welcome",
                 metadata={"recovered": True},
             )
@@ -565,6 +622,8 @@ class DownloadServiceTest(TestCase):
 
         self.assertEqual(result.task_id, "task-1")
         self.assertTrue(result.record.metadata["recovered"])
+        self.assertGreaterEqual(result.record.revision, 5)
+        self.assertEqual(result.record.run_generation, 3)
 
     def test_download_task_applies_gallery_folder_template(self) -> None:
         registry = SiteRegistry()
