@@ -224,8 +224,10 @@ Shell/UI projection refresh and rapid-control/restart lifecycle coverage remain 
 
 ### Status
 
-Planned after the IPC lifecycle audit. The current Shell shutdown path sets every background
-worker's cancellation Event. That Event means user cancellation inside Item and Batch pipelines:
+In progress. A typed stop signal now distinguishes `user_cancel` from `owner_shutdown`; Batch and
+standalone Item workers can checkpoint to `PLANNED` without emitting cancellation. Shell shutdown
+also publishes `STOPPING` and closes the IPC listener before draining. Bounded-drain fencing,
+paused-root preservation, and qBittorrent shutdown reconciliation remain:
 
 - A running standalone Item may commit `CANCELED` after shutdown first normalises it to `PLANNED`.
 - A running Batch calls `BatchPipeline.cancel()`, which may persist unfinished entries, children,
@@ -274,11 +276,13 @@ worker's cancellation Event. That Event means user cancellation inside Item and 
 
 ### Status
 
-Planned after the startup recovery audit. Current state-only tests pass, but recovery still uses
-retry as a workaround:
+In progress. Startup recovery now uses `resume` instead of `retry`, returns active Batch children
+and assets to schedulable queued states without creating retry attempts, and skips verified
+standalone output files when the checkpoint still exists. Transactional root recovery, partial-file
+verification, torrent reconciliation, and stale-run fencing remain:
 
-- Startup converts active Batch entries, children, and assets to `CANCELLED`, then starts
-  `batches retry`; this records interruption as cancellation/retry instead of normal recovery.
+- Startup previously converted active Batch entries, children, and assets to `CANCELLED`, then
+  started `batches retry`; this recorded interruption as cancellation/retry instead of recovery.
 - `BatchResumeService.plan_resume()` includes `DOWNLOADING` children, but `BatchPipeline.run_batch()`
   initially queues only `QUEUED` children. A real downloading checkpoint is therefore not resumed
   by the resume path without the cancellation/retry conversion.
@@ -321,6 +325,12 @@ retry as a workaround:
 - Torrent recovery reuses the persisted client task and preserves its paused/running state.
 
 ## P5-24 Gate Owner Readiness And Verify Restart Lifecycles
+
+### Status
+
+In progress. The premature pre-listener `READY` publication was removed, and shutdown now marks
+the owner `STOPPING` before closing IPC admission. The readiness barrier still needs to remain in
+`RECOVERING` until recovery commands are admitted, with process-level WAIT/DETACH restart tests.
 
 ### Readiness Audit
 

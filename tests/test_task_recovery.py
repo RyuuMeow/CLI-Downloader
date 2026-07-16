@@ -230,7 +230,7 @@ class BatchRecoveryTest(TestCase):
         )
         batch_store.create_batch(parent, (entry,))
 
-    def test_pending_batch_generates_retry_command(self) -> None:
+    def test_pending_batch_generates_resume_command(self) -> None:
         with TemporaryDirectory() as directory:
             base = Path(directory)
             batch_store = StateBatchStore(base / "state.sqlite3")
@@ -241,7 +241,7 @@ class BatchRecoveryTest(TestCase):
                 batch_store=batch_store,
             )
 
-            self.assertIn(("batches", "retry", "batch-1"), commands)
+            self.assertIn(("batches", "resume", "batch-1"), commands)
 
     def test_paused_batch_skips_retry(self) -> None:
         with TemporaryDirectory() as directory:
@@ -330,14 +330,14 @@ class BatchRecoveryTest(TestCase):
                 batch_store=batch_store,
             )
 
-            self.assertIn(("batches", "retry", "resumed-batch"), commands)
+            self.assertIn(("batches", "resume", "resumed-batch"), commands)
             recovered = task_store.get("resumed-batch")
             self.assertEqual(recovered.status, TaskStatus.PLANNED)
             self.assertEqual(recovered.desired_control, TaskDesiredControl.RUN)
             self.assertIsNone(recovered.active_run_id)
             self.assertEqual(recovered.run_generation, 4)
 
-    def test_pending_resolution_entries_cancelled(self) -> None:
+    def test_pending_resolution_entries_remain_resumable(self) -> None:
         with TemporaryDirectory() as directory:
             base = Path(directory)
             batch_store = StateBatchStore(base / "state.sqlite3")
@@ -375,15 +375,15 @@ class BatchRecoveryTest(TestCase):
             )
 
             self.assertEqual(
-                batch_store.get_entry("entry-resolving").status,
-                BatchEntryStatus.CANCELLED,
+                batch_store.get_entry("entry-pending").status,
+                BatchEntryStatus.PENDING_RESOLUTION,
             )
             self.assertEqual(
-                batch_store.get_entry("entry-pending").status,
-                BatchEntryStatus.CANCELLED,
+                batch_store.get_entry("entry-resolving").status,
+                BatchEntryStatus.RESOLVING,
             )
 
-    def test_downloading_assets_are_cancelled(self) -> None:
+    def test_downloading_assets_return_to_queue(self) -> None:
         with TemporaryDirectory() as directory:
             base = Path(directory)
             batch_store = StateBatchStore(base / "state.sqlite3")
@@ -448,12 +448,9 @@ class BatchRecoveryTest(TestCase):
                 batch_store=batch_store,
             )
 
-            self.assertEqual(
-                batch_store.get_child("child-a").status,
-                DownloadChildStatus.CANCELLED,
-            )
+            self.assertEqual(batch_store.get_child("child-a").status, DownloadChildStatus.QUEUED)
             for record in batch_store.list_assets("child-a"):
-                self.assertEqual(record.status, AssetStatus.CANCELLED)
+                self.assertEqual(record.status, AssetStatus.QUEUED)
 
     def test_completed_assets_remain_untouched(self) -> None:
         with TemporaryDirectory() as directory:
@@ -543,6 +540,7 @@ class BatchRecoveryTest(TestCase):
             batch_cmds = [c for c in commands if c[0] == "batches"]
             self.assertEqual(len(task_cmds), 1)
             self.assertEqual(len(batch_cmds), 1)
+            self.assertEqual(batch_cmds[0][1], "resume")
 
     def test_recovery_without_batch_store(self) -> None:
         """Without batch_store, only task recovery runs."""

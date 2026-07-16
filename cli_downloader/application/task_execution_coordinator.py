@@ -330,6 +330,27 @@ class TaskExecutionCoordinator:
             del self._handles[handle.task_id]
             return updated
 
+    async def checkpoint_for_shutdown(
+        self,
+        handle: ExecutionHandle,
+        *,
+        expected_revision: int,
+    ) -> TaskRecord:
+        """Persist a resumable checkpoint and release the active run lease."""
+
+        async with self._lock_for(handle.task_id):
+            record = self._current_handle_record(handle, expected_revision)
+            paused = record.desired_control is TaskDesiredControl.PAUSE or record.status is TaskStatus.PAUSED
+            updated = record.transition(
+                status=TaskStatus.PAUSED if paused else TaskStatus.PLANNED,
+                desired_control=TaskDesiredControl.PAUSE if paused else TaskDesiredControl.RUN,
+                active_run_id=None,
+                metadata={**record.metadata, "owner_shutdown_checkpoint": True},
+            )
+            self._commit(record, updated)
+            del self._handles[handle.task_id]
+            return updated
+
     def active_handle(self, task_id: str) -> ExecutionHandle | None:
         """Return the local control token without exposing another mutation path."""
         return self._handles.get(task_id)

@@ -148,6 +148,17 @@ class InteractiveShellTest(TestCase):
         self.assertIn("download <url> --dry-run", output.getvalue())
         self.assertNotIn("confirm-live-network", output.getvalue())
 
+    def test_startup_ready_callback_runs_once_for_plain_shell(self) -> None:
+        output = StringIO()
+        callbacks: list[str] = []
+        shell = InteractiveShell(startup_ready_callback=lambda: callbacks.append("ready"))
+
+        self.assertEqual(
+            shell.run(input_stream=StringIO("exit\n"), output_stream=output),
+            0,
+        )
+        self.assertEqual(callbacks, ["ready"])
+
     def test_shell_warns_before_releasing_owner_with_unfinished_tasks(self) -> None:
         output = StringIO()
         shell = InteractiveShell(

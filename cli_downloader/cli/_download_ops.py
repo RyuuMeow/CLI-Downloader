@@ -326,7 +326,16 @@ async def _run_cancellable_batch(
     cancel_sent = False
     while not task.done():
         if cancellation.is_set() and not cancel_sent:
-            cancel_sent = pipeline.cancel(parent_id)
+            shutdown = getattr(cancellation, "is_owner_shutdown", None)
+            if callable(shutdown) and shutdown():
+                shutdown_pipeline = getattr(pipeline, "shutdown", None)
+                cancel_sent = (
+                    shutdown_pipeline(parent_id)
+                    if callable(shutdown_pipeline)
+                    else pipeline.cancel(parent_id)
+                )
+            else:
+                cancel_sent = pipeline.cancel(parent_id)
         await asyncio.wait((task,), timeout=0.05)
     return await task
 

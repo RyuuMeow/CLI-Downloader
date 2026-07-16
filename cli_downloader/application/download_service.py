@@ -8,6 +8,7 @@ from typing import Callable, Mapping, Protocol
 from uuid import uuid4
 
 from cli_downloader.core.environment import EnvironmentContext, diagnose_environment
+from cli_downloader.application.execution_control import OwnerShutdownRequested
 from cli_downloader.core.errors import AdapterResolutionError
 from cli_downloader.core.events import TaskEvent
 from cli_downloader.core.fetch import AssetFetcher
@@ -36,7 +37,12 @@ from cli_downloader.sites.registry import SiteRegistry
 from cli_downloader.storage.completion_store import CompletionStore
 from cli_downloader.storage.file_writer import AssetFileWriter, WrittenAsset
 from cli_downloader.storage.history_store import HistoryStore
-from cli_downloader.storage.task_store import TaskRecord, TaskStatus, TaskStore
+from cli_downloader.storage.task_store import (
+    TaskDesiredControl,
+    TaskRecord,
+    TaskStatus,
+    TaskStore,
+)
 from cli_downloader.storage.state_history_store import StateHistoryStore
 
 
@@ -230,6 +236,22 @@ class DownloadService:
                     CompleteTaskStage(self._task_store),
                 )
             ).run(context)
+        except OwnerShutdownRequested:
+            current = self._task_store.get(record.task_id) or record
+            paused = (
+                current.status is TaskStatus.PAUSED
+                or current.desired_control.value == "pause"
+            )
+            checkpoint = replace(
+                current,
+                status=TaskStatus.PAUSED if paused else TaskStatus.PLANNED,
+                desired_control=TaskDesiredControl.PAUSE if paused else TaskDesiredControl.RUN,
+                active_run_id=None,
+                metadata={**current.metadata, "owner_shutdown_checkpoint": True},
+            )
+            self._task_store.upsert(checkpoint)
+            self._upsert_history_record(checkpoint, finished=False)
+            raise
         except asyncio.CancelledError:
             cancelled = replace(
                 self._task_store.get(record.task_id) or record,
@@ -569,13 +591,39 @@ class WriteAssetsStage:
             raise asyncio.CancelledError
         if self._progress is not None:
             self._progress(0, total)
-        for asset in plan.assets.assets:
+        existing_outputs = record.metadata.get("output_files")
+        existing_outputs = (
+            tuple(value for value in existing_outputs if isinstance(value, str))
+            if isinstance(existing_outputs, (list, tuple))
+            else ()
+        )
+        completed_count = record.metadata.get("completed_files", 0)
+        completed_count = (
+            min(max(completed_count, 0), total)
+            if isinstance(completed_count, int) and not isinstance(completed_count, bool)
+            else 0
+        )
+        for index, asset in enumerate(plan.assets.assets):
             await self._wait_until_runnable(
                 context.task_id,
                 lease_controller=lease_controller,
             )
             if self._cancel_signal is not None and self._cancel_signal.is_set():
                 raise asyncio.CancelledError
+
+            if index < completed_count and index < len(existing_outputs):
+                existing_path = Path(existing_outputs[index])
+                if existing_path.is_file():
+                    written_assets.append(
+                        WrittenAsset(
+                            asset_url=asset.url,
+                            path=existing_path,
+                            bytes_written=existing_path.stat().st_size,
+                        )
+                    )
+                    if self._progress is not None:
+                        self._progress(len(written_assets), total)
+                    continue
 
             if hasattr(self._fetcher, "fetch_stream"):
 
@@ -585,6 +633,10 @@ class WriteAssetsStage:
                     bytes_so_far = 0
                     last_report_time = 0.0
                     async for chunk, total in self._fetcher.fetch_stream(asset):
+                        await self._wait_until_runnable(
+                            context.task_id,
+                            lease_controller=lease_controller,
+                        )
                         bytes_so_far += len(chunk)
                         if self._byte_progress is not None:
                             now = time.monotonic()
@@ -806,6 +858,8 @@ class WriteAssetsStage:
                         "cancel_requested": lambda: self._torrent_cancel_requested(context.task_id),
                         "status_callback": _status_callback,
                     }
+                    if poll_supports_argument(poll_method, "shutdown_requested"):
+                        poll_kwargs["shutdown_requested"] = self._shutdown_requested
                     if poll_supports_argument(poll_method, "pause_requested"):
                         poll_kwargs["pause_requested"] = lambda: self._torrent_pause_requested(
                             context.task_id
@@ -823,6 +877,9 @@ class WriteAssetsStage:
                     _status_callback(outcome)
 
             self._persist_torrent_outcome(context.task_id, asset, outcome)
+
+            if self._shutdown_requested():
+                raise OwnerShutdownRequested
 
             if outcome.status == "cancelled":
                 raise asyncio.CancelledError
@@ -940,6 +997,12 @@ class WriteAssetsStage:
             record = self._task_store.get(task_id)
             if record is None:
                 raise RuntimeError(f"task disappeared during download: {task_id}")
+            if self._shutdown_requested():
+                if self._download_limiter is not None:
+                    self._download_limiter.suspend_root_sync(task_id)
+                if lease_controller is not None:
+                    await lease_controller.release()
+                raise OwnerShutdownRequested
             if record.status is TaskStatus.CANCELED or (
                 self._cancel_signal is not None and self._cancel_signal.is_set()
             ):
@@ -966,7 +1029,14 @@ class WriteAssetsStage:
                 self._task_store.upsert(replace(record, status=TaskStatus.RUNNING))
             return
 
+    def _shutdown_requested(self) -> bool:
+        signal = self._cancel_signal
+        checker = getattr(signal, "is_owner_shutdown", None)
+        return callable(checker) and bool(checker())
+
     def _torrent_cancel_requested(self, task_id: str) -> bool:
+        if self._shutdown_requested():
+            return False
         if self._cancel_signal is not None and self._cancel_signal.is_set():
             return True
         record = self._task_store.get(task_id)

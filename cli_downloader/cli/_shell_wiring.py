@@ -19,6 +19,7 @@ from threading import Event, Lock, Thread, current_thread
 from time import monotonic
 
 from cli_downloader.application.task_hierarchy_service import TaskHierarchyService
+from cli_downloader.application.execution_control import ExecutionStopSignal
 from cli_downloader.application.download_limiter import GalleryDownloadLimiter
 from cli_downloader.application.operation_dispatcher import OperationDispatcher
 from cli_downloader.cli._download_ops import _build_download_limiter
@@ -36,7 +37,6 @@ from cli_downloader.cli.shell import InteractiveShell
 from cli_downloader.config.loader import ConfigLoader
 from cli_downloader.core.batch import (
     AssetStatus,
-    BatchEntryStatus,
     DownloadChildStatus,
 )
 from cli_downloader.core.environment import diagnose_environment
@@ -163,22 +163,10 @@ def _build_interactive_shell_impl(
     history_store = StateHistoryStore(StateDatabase(layout.state_db))
     startup_commands = _recover_interrupted_downloads(task_store, batch_store, history_store)
     shutdown_requested = Event()
+    startup_ready = Event()
     execution_lock = Lock()
-    active_cancellations: set[Event] = set()
+    active_cancellations: set[object] = set()
     active_workers: set[Thread] = set()
-    if owner_lease is not None:
-        ready_scope = owner_lease.scope
-        ready_session = owner_session_id or new_owner_session_id()
-        owner_lease.publish(
-            OwnerDiscoveryMetadata.for_current_process(
-                ready_scope,
-                application_version=__version__,
-                owner_mode=OwnerMode.SHELL,
-                lifecycle_state=OwnerLifecycleState.READY,
-                session_id=ready_session,
-                capabilities=("download", "task_control", "task_query", "history_query", "shell_status"),
-            )
-        )
     browser_login = BrowserLoginService(
         profile_root=environment.paths.cache_dir / "browser-auth"
     )
@@ -226,7 +214,11 @@ def _build_interactive_shell_impl(
             active_cancellations.add(cancellation)
             active_workers.add(worker)
             if shutdown_requested.is_set():
-                cancellation.set()
+                request = getattr(cancellation, "request_shutdown", None)
+                if callable(request):
+                    request()
+                else:
+                    cancellation.set()
         try:
             return background_runner(
                 shell_argv,
@@ -240,7 +232,7 @@ def _build_interactive_shell_impl(
                 active_cancellations.discard(cancellation)
                 active_workers.discard(worker)
 
-    def persist_interruption_intent() -> int:
+    def persist_interruption_intent(*, normalize_running: bool = True) -> int:
         unfinished = 0
         for record in task_store.list():
             if record.status in {
@@ -250,7 +242,7 @@ def _build_interactive_shell_impl(
                 TaskStatus.PAUSED,
             }:
                 unfinished += 1
-            if record.status is TaskStatus.RUNNING:
+            if normalize_running and record.status is TaskStatus.RUNNING:
                 task_store.upsert(
                     record.transition(
                         status=TaskStatus.PLANNED,
@@ -260,12 +252,37 @@ def _build_interactive_shell_impl(
                 )
         return unfinished
 
+    owner_server: OwnerPipeServer | None = None
+
     def request_shutdown() -> str | None:
+        first_request = not shutdown_requested.is_set()
         shutdown_requested.set()
+        if first_request and owner_lease is not None:
+            owner_lease.publish(
+                OwnerDiscoveryMetadata.for_current_process(
+                    owner_lease.scope,
+                    application_version=__version__,
+                    owner_mode=OwnerMode.SHELL,
+                    lifecycle_state=OwnerLifecycleState.STOPPING,
+                    session_id=owner_session_id or new_owner_session_id(),
+                    capabilities=("download", "task_control", "task_query", "history_query", "shell_status"),
+                )
+            )
+        if first_request and owner_server is not None:
+            owner_server.stop()
         with execution_lock:
             for cancellation in tuple(active_cancellations):
-                cancellation.set()
-        unfinished = persist_interruption_intent()
+                request = getattr(cancellation, "request_shutdown", None)
+                if callable(request):
+                    request()
+                else:
+                    # Third-party/background runners may still receive a raw
+                    # Event; preserve their existing cancellation behavior
+                    # until they adopt the typed signal.
+                    cancellation.set()
+        # Active workers own their run revisions and must checkpoint first;
+        # normalising RUNNING here would invalidate their coordinator token.
+        unfinished = persist_interruption_intent(normalize_running=False)
         if unfinished == 0:
             return None
         noun = "task" if unfinished == 1 else "tasks"
@@ -291,6 +308,21 @@ def _build_interactive_shell_impl(
         lambda url, params: _load_shell_operation(runtime, url, params)
     )
 
+    def publish_ready() -> None:
+        if startup_ready.is_set() or owner_lease is None:
+            return
+        startup_ready.set()
+        owner_lease.publish(
+            OwnerDiscoveryMetadata.for_current_process(
+                owner_lease.scope,
+                application_version=__version__,
+                owner_mode=OwnerMode.SHELL,
+                lifecycle_state=OwnerLifecycleState.READY,
+                session_id=owner_session_id or new_owner_session_id(),
+                capabilities=("download", "task_control", "task_query", "history_query", "shell_status"),
+            )
+        )
+
     shell = InteractiveShell(
         runner=runner,
         background_runner=run_background,
@@ -309,9 +341,9 @@ def _build_interactive_shell_impl(
         plugins_dir=plugins_dir,
         cache_dir=environment.paths.cache_dir,
         shutdown_warning=request_shutdown,
+        startup_ready_callback=publish_ready,
     )
 
-    owner_server = None
     if owner_lease is not None and owner_session_id is not None:
         owner_server = OwnerPipeServer(
             owner_lease.scope,
@@ -331,19 +363,10 @@ def _build_interactive_shell_impl(
                 task_service_loader=load_task_service,
                 notify_tasks=shell.notify_external_tasks,
                 is_shutting_down=shutdown_requested.is_set,
+                is_ready=startup_ready.is_set,
             ),
         )
         owner_server.start()
-        owner_lease.publish(
-            OwnerDiscoveryMetadata.for_current_process(
-                owner_lease.scope,
-                application_version=__version__,
-                owner_mode=OwnerMode.SHELL,
-                lifecycle_state=OwnerLifecycleState.READY,
-                session_id=owner_session_id,
-                capabilities=("download", "task_control", "task_query", "history_query", "shell_status"),
-            )
-        )
     try:
         return shell.run()
     finally:
@@ -403,6 +426,7 @@ def _handle_owner_request(
     task_service_loader: Callable[[], TaskHierarchyService],
     notify_tasks: Callable[[], None] | None = None,
     is_shutting_down: Callable[[], bool] | None = None,
+    is_ready: Callable[[], bool] | None = None,
 ) -> None:
     """Run one externally submitted download inside the Shell owner.
 
@@ -413,6 +437,8 @@ def _handle_owner_request(
 
     if is_shutting_down is not None and is_shutting_down():
         raise OwnerError("Shell is stopping and is not accepting new commands")
+    if is_ready is not None and not is_ready():
+        raise OwnerError("Shell is recovering and is not accepting commands yet")
     if request.command is OwnerCommand.TASK_CONTROL:
         _handle_owner_control(
             request,
@@ -468,7 +494,7 @@ def _handle_owner_download(
     finished = Event()
     heartbeat_stop = Event()
     sequence_lock = Lock()
-    cancellation = Event()
+    cancellation = ExecutionStopSignal()
     accepted_task: dict[str, str] = {}
     pipe_closed = Event()
 
@@ -657,7 +683,7 @@ def _handle_owner_control(
             with redirect_stdout(output):
                 exit_code = run_background(
                     ("batches", subcommand, task_id, "--json"),
-                    Event(),
+                    ExecutionStopSignal(),
                     lambda _reason, _payload: None,
                     None,
                 )
@@ -666,7 +692,7 @@ def _handle_owner_control(
             with redirect_stdout(output):
                 exit_code = run_background(
                     ("tasks", "resume", task_id, "--json"),
-                    Event(),
+                    ExecutionStopSignal(),
                     lambda _reason, _payload: None,
                     None,
                 )
@@ -675,7 +701,7 @@ def _handle_owner_control(
             with redirect_stdout(output):
                 exit_code = run_background(
                     ("tasks", "hard-retry", task_id, "--json"),
-                    Event(),
+                    ExecutionStopSignal(),
                     lambda _reason, _payload: None,
                     None,
                 )
@@ -824,32 +850,23 @@ def _recover_interrupted_downloads(
                     task_store.upsert(parent_record)
                 for entry_id in batch_store.get_snapshot(parent_id).parent.entry_ids:
                     entry = batch_store.get_entry(entry_id)
-                    if entry:
-                        if entry.status in {
-                            BatchEntryStatus.PENDING_RESOLUTION,
-                            BatchEntryStatus.RESOLVING,
-                        }:
-                            batch_store.update_entry(
-                                replace(entry, status=BatchEntryStatus.CANCELLED)
+                    if entry is None or entry.child_id is None:
+                        continue
+                    child = batch_store.get_child(entry.child_id)
+                    if child is None or child.status is not DownloadChildStatus.DOWNLOADING:
+                        continue
+                    # A process restart is not a user cancellation. Return the
+                    # child to the scheduler while retaining completed assets
+                    # and any persisted direct/torrent checkpoints.
+                    for asset in batch_store.list_assets(child.child_id):
+                        if asset.status is AssetStatus.DOWNLOADING:
+                            batch_store.update_asset(
+                                child.child_id,
+                                replace(asset, status=AssetStatus.QUEUED),
                             )
-                        if entry.child_id is not None:
-                            child = batch_store.get_child(entry.child_id)
-                            if child and child.status in {
-                                DownloadChildStatus.QUEUED,
-                                DownloadChildStatus.DOWNLOADING,
-                            }:
-                                for asset in batch_store.list_assets(child.child_id):
-                                    if asset.status in {
-                                        AssetStatus.QUEUED,
-                                        AssetStatus.DOWNLOADING,
-                                    }:
-                                        batch_store.update_asset(
-                                            child.child_id,
-                                            replace(asset, status=AssetStatus.CANCELLED),
-                                        )
-                                batch_store.update_child(
-                                    replace(child, status=DownloadChildStatus.CANCELLED)
-                                )
+                    batch_store.update_child(
+                        replace(child, status=DownloadChildStatus.QUEUED)
+                    )
 
-                commands.append(("batches", "retry", parent_id))
+                commands.append(("batches", "resume", parent_id))
     return tuple(commands)

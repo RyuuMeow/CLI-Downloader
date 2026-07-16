@@ -9,6 +9,7 @@ from typing import Protocol
 from uuid import uuid4
 
 from cli_downloader.application.download_limiter import GalleryDownloadLimiter
+from cli_downloader.application.execution_control import OwnerShutdownRequested
 from cli_downloader.core.batch import (
     AssetRecord,
     AssetStatus,
@@ -108,12 +109,14 @@ class BatchRunResult:
     resolution_queue_peak: int
     download_queue_peak: int
     task_status: TaskStatus | None = None
+    stopped: bool = False
 
 
 @dataclass
 class _RunState:
     run_id: str | None = None
     cancel_event: asyncio.Event = field(default_factory=asyncio.Event)
+    shutdown_event: asyncio.Event = field(default_factory=asyncio.Event)
     events: list[TaskEvent] = field(default_factory=list)
     resolution_waiting: int = 0
     download_waiting: int = 0
@@ -145,6 +148,9 @@ class _TaskControl:
     def is_set(self) -> bool:
         return self.state.cancel_event.is_set() or self.task_id in self.state.cancelled_ids
 
+    def is_shutdown_requested(self) -> bool:
+        return self.state.shutdown_event.is_set()
+
     def is_paused(self) -> bool:
         return self.parent_id in self.state.paused_ids or self.task_id in self.state.paused_ids
 
@@ -164,6 +170,10 @@ class _TaskControl:
             task.result()
 
     async def wait_if_paused(self) -> None:
+        if self.is_shutdown_requested():
+            if self.pause_boundary is not None:
+                await self.pause_boundary()
+            raise OwnerShutdownRequested
         paused_targets = tuple(
             target_id
             for target_id in (self.parent_id, self.task_id)
@@ -183,6 +193,8 @@ class _TaskControl:
                 _mark_worker_boundary(self.state, self.parent_id, self.worker_id, False)
             if self.is_set():
                 break
+            if self.is_shutdown_requested():
+                raise OwnerShutdownRequested
         if not self.is_set() and self.resume_boundary is not None:
             await self.resume_boundary()
 
@@ -431,6 +443,20 @@ class BatchPipeline:
         self._emit(state, root_id, "task_cancel_requested", task_id=parent_id)
         return True
 
+    def shutdown(self, parent_id: str) -> bool:
+        """Stop an owner without converting active work into user cancellation."""
+
+        active = self._active_task(parent_id)
+        if active is None:
+            return False
+        root_id, state = active
+        state.shutdown_event.set()
+        if self._download_limiter is not None:
+            self._download_limiter.suspend_root_sync(root_id)
+        self._release_pause(state, parent_id)
+        self._emit(state, root_id, "task_shutdown_requested", task_id=parent_id)
+        return True
+
     def pause(self, task_id: str) -> bool:
         active = self._active_task(task_id)
         if active is None:
@@ -570,6 +596,14 @@ class BatchPipeline:
                 raise state.worker_error
 
             snapshot = self._store.get_snapshot(parent_id)
+            if state.shutdown_event.is_set():
+                return BatchRunResult(
+                    snapshot=snapshot,
+                    events=tuple(state.events),
+                    resolution_queue_peak=state.resolution_peak,
+                    download_queue_peak=state.download_peak,
+                    stopped=True,
+                )
             self._emit(
                 state,
                 parent_id,
@@ -648,6 +682,8 @@ class BatchPipeline:
                 state.resolution_waiting -= 1
                 self._resolution_capacity.release()
                 try:
+                    if state.shutdown_event.is_set():
+                        continue
                     if state.worker_error is not None:
                         continue
                     control = _TaskControl(state, parent_id, entry.entry_id, worker_id)
@@ -663,6 +699,8 @@ class BatchPipeline:
                             worker_id=worker_id,
                             control=control,
                         )
+                except OwnerShutdownRequested:
+                    continue
                 except Exception as error:
                     state.worker_error = state.worker_error or error
                     state.cancel_event.set()
@@ -707,6 +745,8 @@ class BatchPipeline:
             if control.is_set():
                 raise asyncio.CancelledError
             package = await self._resolve_package(resolving, state, control, reporter)
+        except OwnerShutdownRequested:
+            return
         except asyncio.CancelledError:
             if not control.is_set():
                 raise
@@ -740,6 +780,8 @@ class BatchPipeline:
         finally:
             await slot_controller.release()
 
+        if control.is_shutdown_requested():
+            return
         if control.is_set():
             self._cancel_entry(state, resolving)
             return
@@ -862,6 +904,8 @@ class BatchPipeline:
                 state.download_waiting -= 1
                 self._download_capacity.release()
                 try:
+                    if state.shutdown_event.is_set():
+                        continue
                     if state.worker_error is not None:
                         continue
                     control = _TaskControl(state, parent_id, child.entry_id, worker_id)
@@ -875,6 +919,8 @@ class BatchPipeline:
                             worker_id=worker_id,
                             control=control,
                         )
+                except OwnerShutdownRequested:
+                    continue
                 except Exception as error:
                     state.worker_error = state.worker_error or error
                     state.cancel_event.set()
@@ -894,6 +940,8 @@ class BatchPipeline:
         control: _TaskControl,
     ) -> None:
         await control.wait_if_paused()
+        if control.is_shutdown_requested():
+            return
         if control.is_set():
             self._cancel_child(state, child)
             return
@@ -911,6 +959,8 @@ class BatchPipeline:
             try:
                 await lease_controller.acquire()
             except asyncio.CancelledError:
+                if control.is_shutdown_requested():
+                    return
                 if control.is_set():
                     self._cancel_child(state, child)
                     return
@@ -931,6 +981,10 @@ class BatchPipeline:
                 await controller.release()
             raise
         controllers.append(slot_controller)
+        if control.is_shutdown_requested():
+            for controller in reversed(controllers):
+                await controller.release()
+            return
         pause_boundary, resume_boundary = _compose_pause_boundaries(tuple(controllers))
         control = replace(
             control,
@@ -991,6 +1045,8 @@ class BatchPipeline:
                 downloading_child, assets, control, reporter
             )
             outcomes = _validate_outcomes(assets, outcomes)
+        except OwnerShutdownRequested:
+            return
         except asyncio.CancelledError:
             if not control.is_set():
                 raise

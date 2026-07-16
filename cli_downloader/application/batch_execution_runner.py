@@ -79,6 +79,13 @@ class CoordinatedBatchRunner:
             control_monitor.cancel()
             await asyncio.gather(control_monitor, return_exceptions=True)
 
+        if result.stopped:
+            committed = await self._coordinator.checkpoint_for_shutdown(
+                handle,
+                expected_revision=handle.revision,
+            )
+            return replace(result, task_status=committed.status)
+
         status = _terminal_task_status(result.snapshot.counts)
         committed = await self._finish_task(
             handle,

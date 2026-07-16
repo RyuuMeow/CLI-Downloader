@@ -6,6 +6,7 @@ from unittest import TestCase
 
 from cli_downloader.application.download_service import DownloadService, WriteAssetsStage
 from cli_downloader.application.download_limiter import GalleryDownloadLimiter
+from cli_downloader.application.execution_control import ExecutionStopSignal, OwnerShutdownRequested
 from cli_downloader.core.models import (
     Asset,
     AssetKind,
@@ -218,6 +219,30 @@ class RecordingTorrentClient:
 
 
 class DownloadServiceTest(TestCase):
+    def test_owner_shutdown_keeps_standalone_task_planned(self) -> None:
+        registry = SiteRegistry()
+        registry.register(ExampleAdapter())
+        store = InMemoryTaskStore()
+        signal = ExecutionStopSignal()
+        signal.request_shutdown()
+        service = DownloadService(registry=registry, task_store=store)
+
+        async def run() -> None:
+            with self.assertRaises(OwnerShutdownRequested):
+                await service.download_task(
+                    "example://gallery/shutdown",
+                    fetcher=ExampleAssetFetcher(),
+                    file_writer=AssetFileWriter(Path("downloads")),
+                    cancel_signal=signal,
+                    task_id="shutdown-task",
+                )
+
+        asyncio.run(run())
+        record = store.get("shutdown-task")
+        self.assertIsNotNone(record)
+        self.assertEqual(record.status, TaskStatus.PLANNED)
+        self.assertTrue(record.metadata["owner_shutdown_checkpoint"])
+
     def test_standalone_pause_releases_shared_item_slot_between_assets(self) -> None:
         async def scenario(directory: Path) -> None:
             limiter = GalleryDownloadLimiter(1, item_site_limit=1)

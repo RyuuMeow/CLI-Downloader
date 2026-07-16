@@ -43,6 +43,7 @@ from cli_downloader.application.release_update_service import (
     ReleaseUpdateService,
     ReleaseUpdateStatus,
 )
+from cli_downloader.application.execution_control import ExecutionStopSignal
 from cli_downloader.application.task_hierarchy_service import TaskHierarchyService
 from cli_downloader.config.loader import ConfigLoader
 from cli_downloader.config.schema import ConfigField, SettingsRegistry
@@ -225,6 +226,7 @@ class InteractiveShell:
         cache_dir: Path | None = None,
         plugin_catalog_service: PluginCatalogService | None = None,
         shutdown_warning: ShutdownWarning | None = None,
+        startup_ready_callback: Callable[[], None] | None = None,
     ) -> None:
         self._prompt = prompt
         self._runner = runner
@@ -249,6 +251,8 @@ class InteractiveShell:
             catalog_cache
         )
         self._shutdown_warning_callback = shutdown_warning
+        self._startup_ready_callback = startup_ready_callback
+        self._startup_ready_notified = False
 
     @property
     def translator(self) -> TranslationService:
@@ -277,6 +281,14 @@ class InteractiveShell:
             # Shutdown must never be prevented by a best-effort status probe.
             return None
         return warning if isinstance(warning, str) and warning.strip() else None
+
+    def _notify_startup_ready(self) -> None:
+        if self._startup_ready_notified:
+            return
+        self._startup_ready_notified = True
+        callback = self._startup_ready_callback
+        if callback is not None:
+            callback()
 
     def _write_shutdown_warning(self, output_stream: TextIO) -> None:
         warning = self.shutdown_warning()
@@ -315,6 +327,7 @@ class InteractiveShell:
 
         input_stream = input_stream or sys.stdin
         output_stream = output_stream or sys.stdout
+        self._notify_startup_ready()
         output_stream.write(self._translator("shell.welcome") + "\n")
 
         while True:
@@ -692,6 +705,7 @@ class TextualShellApp(App[int]):
         self.query_one("#shell-output", RichLog).write(ASCII_BANNER)
         for argv in self._shell._startup_commands:
             self._start_background(shlex.join(argv), argv)
+        self._shell._notify_startup_ready()
 
     def _apply_translations(self, *, reset_neutral: bool = False) -> None:
         """Refresh static Shell chrome after the configured language is loaded."""
@@ -1345,7 +1359,7 @@ class TextualShellApp(App[int]):
             command_argv.append("--json")
         operation_name = command_argv[0] if command_argv else "command"
         concurrent = bool(selected_items) or operation_name in ("download", "batches")
-        cancellation = Event()
+        cancellation = ExecutionStopSignal()
         job_id = id(cancellation)
         block = block or self._new_command_block(command_line)
         block.status = "running"

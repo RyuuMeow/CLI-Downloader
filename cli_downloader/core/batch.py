@@ -166,6 +166,7 @@ _CHILD_TRANSITIONS = {
     ),
     DownloadChildStatus.DOWNLOADING: frozenset(
         {
+            DownloadChildStatus.QUEUED,
             DownloadChildStatus.COMPLETED,
             DownloadChildStatus.PARTIALLY_COMPLETED,
             DownloadChildStatus.FAILED,
