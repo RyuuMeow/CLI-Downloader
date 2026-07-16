@@ -283,10 +283,10 @@ before re-admission and late writes are rejected. Remaining work is transactiona
 full prefix/hash verification, and end-to-end torrent client reconciliation:
 
 - Recovery now normalises active Batch children/assets back to queued states and clears stale Task
-  run leases for both `RUNNING` and `PLANNED` records before `resume` admission. The full
-  verification gate passes before the latest readiness/fencing regression slice; the remaining
-  gaps are transactional root recovery, full partial-file prefix/hash verification, and restart
-  reconciliation against an existing torrent client task.
+  run leases for both `RUNNING` and `PLANNED` records before `resume` admission. The latest full
+  verification gate passes with 602 core tests; the remaining gaps are transactional root
+  recovery, full partial-file prefix/hash verification, and restart reconciliation against an
+  existing torrent client task.
 
 ### Recovery Matrix
 
