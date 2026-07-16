@@ -29,7 +29,12 @@ from cli_downloader.storage.history_store import InMemoryHistoryStore
 from cli_downloader.storage.state_database import StateDatabase
 from cli_downloader.storage.state_history_store import StateHistoryStore
 from cli_downloader.storage.state_task_store import StateTaskStore
-from cli_downloader.storage.task_store import InMemoryTaskStore, TaskRecord, TaskStatus
+from cli_downloader.storage.task_store import (
+    InMemoryTaskStore,
+    TaskDesiredControl,
+    TaskRecord,
+    TaskStatus,
+)
 
 
 class FailSecondFetcher:
@@ -57,6 +62,22 @@ class ShutdownAfterWrite(AssetFileWriter):
 class StaticFetcher:
     async def fetch(self, _asset):
         return b"asset written before shutdown boundary"
+
+
+class ShutdownStreamFetcher:
+    def __init__(self, signal: ExecutionStopSignal) -> None:
+        self.signal = signal
+
+    async def fetch_stream(self, _asset):
+        yield b"a", 2
+        self.signal.request_shutdown()
+        yield b"b", 2
+
+
+class FullStreamFetcher:
+    async def fetch_stream(self, _asset):
+        yield b"a", 2
+        yield b"b", 2
 
 
 class CountingTorrentFetcher:
@@ -342,6 +363,67 @@ class DownloadServiceTest(TestCase):
 
             asyncio.run(run())
             self.assertEqual(store.get("fenced-task").status, TaskStatus.PLANNED)
+
+    def test_stream_shutdown_persists_partial_and_resume_rebuilds_asset(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = InMemoryTaskStore()
+            store.upsert(
+                TaskRecord(
+                    "partial-task",
+                    TaskStatus.PLANNED,
+                    metadata={"execution_fence": "owner-1"},
+                )
+            )
+            signal = ExecutionStopSignal()
+            plan = DownloadStrategyPlan(
+                strategy=DownloadStrategy.DIRECT,
+                reason="test",
+                assets=AssetList(
+                    (Asset("https://example.test/asset", AssetKind.FILE, "partial.txt"),)
+                ),
+            )
+            context = PipelineContext(
+                "partial-task",
+                data={
+                    "item": ResolvedItem("example", "example://partial", "Partial"),
+                    "plan": plan,
+                },
+            )
+            first = WriteAssetsStage(
+                fetcher=ShutdownStreamFetcher(signal),
+                file_writer=AssetFileWriter(root),
+                task_store=store,
+                cancel_signal=signal,
+                execution_fence="owner-1",
+            )
+
+            async def stop() -> None:
+                with self.assertRaises(OwnerShutdownRequested):
+                    await first.run(context)
+
+            asyncio.run(stop())
+            checkpoint = store.get("partial-task")
+            partial = checkpoint.metadata["partial_files"]["https://example.test/asset"]
+            self.assertEqual(partial["bytes"], 1)
+            self.assertEqual(Path(partial["path"]).read_bytes(), b"a")
+
+            store.upsert(
+                checkpoint.transition(
+                    status=TaskStatus.PLANNED,
+                    desired_control=TaskDesiredControl.RUN,
+                )
+            )
+            resumed = WriteAssetsStage(
+                fetcher=FullStreamFetcher(),
+                file_writer=AssetFileWriter(root),
+                task_store=store,
+                execution_fence="owner-1",
+            )
+            asyncio.run(resumed._run(context))
+            output = root / "partial-task" / "partial.txt"
+            self.assertEqual(output.read_bytes(), b"ab")
+            self.assertEqual(store.get("partial-task").metadata["partial_files"], {})
 
     def test_standalone_pause_releases_shared_item_slot_between_assets(self) -> None:
         async def scenario(directory: Path) -> None:

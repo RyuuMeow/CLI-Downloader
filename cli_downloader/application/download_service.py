@@ -553,6 +553,8 @@ class WriteAssetsStage:
         self._torrent_client = torrent_client
         self._auto_delete_torrent_file = auto_delete_torrent_file
         self._execution_fence = execution_fence
+        self._active_asset: Asset | None = None
+        self._active_partial_path: Path | None = None
 
     async def run(self, context: PipelineContext) -> PipelineContext:
         controller = None
@@ -571,6 +573,9 @@ class WriteAssetsStage:
             await controller.acquire()
         try:
             return await self._run(context, lease_controller=controller)
+        except OwnerShutdownRequested:
+            self._record_partial_checkpoint(context.task_id)
+            raise
         finally:
             if controller is not None:
                 await controller.release()
@@ -630,6 +635,13 @@ class WriteAssetsStage:
             else 0
         )
         for index, asset in enumerate(plan.assets.assets):
+            self._active_asset = asset
+            self._active_partial_path = self._file_writer.paths(
+                asset,
+                task_id=context.task_id,
+                folder_fields=folder_fields,
+                folder_template=folder_template,
+            )[1]
             await self._wait_until_runnable(
                 context.task_id,
                 lease_controller=lease_controller,
@@ -650,6 +662,8 @@ class WriteAssetsStage:
                     )
                     if self._progress is not None:
                         self._progress(len(written_assets), total)
+                    self._active_asset = None
+                    self._active_partial_path = None
                     continue
 
             if hasattr(self._fetcher, "fetch_stream"):
@@ -730,9 +744,20 @@ class WriteAssetsStage:
                         "completed_files": len(written_assets),
                         "total_files": total,
                         "output_files": [str(item.path) for item in written_assets],
+                        "partial_files": {
+                            key: value
+                            for key, value in (
+                                current.metadata.get("partial_files", {})
+                                if isinstance(current.metadata.get("partial_files", {}), Mapping)
+                                else {}
+                            ).items()
+                            if key != asset.url
+                        },
                     },
                 )
             )
+            self._active_asset = None
+            self._active_partial_path = None
             if self._progress is not None:
                 self._progress(len(written_assets), total)
 
@@ -1082,6 +1107,27 @@ class WriteAssetsStage:
         actual = current.metadata.get("execution_fence")
         if actual != self._execution_fence:
             raise OwnerExecutionFenced(f"execution fence changed for task: {task_id}")
+
+    def _record_partial_checkpoint(self, task_id: str) -> None:
+        asset = self._active_asset
+        partial = self._active_partial_path
+        if asset is None or partial is None or not partial.is_file():
+            return
+        self._assert_execution_fence(task_id)
+        current = self._task_store.get(task_id)
+        if current is None:
+            return
+        existing = current.metadata.get("partial_files", {})
+        partial_files = dict(existing) if isinstance(existing, Mapping) else {}
+        partial_files[asset.url] = {
+            "path": str(partial),
+            "bytes": partial.stat().st_size,
+        }
+        self._task_store.upsert(
+            current.transition(
+                metadata={**current.metadata, "partial_files": partial_files}
+            )
+        )
 
     def _torrent_cancel_requested(self, task_id: str) -> bool:
         if self._shutdown_requested():
