@@ -44,7 +44,7 @@ failed.
 
 ```text
 <cli> history --json
-<cli> history --task-id <task-id> --json
+<cli> history show <task-id> --json
 <cli> history --query <keyword> --json
 <cli> history --child --json
 ```

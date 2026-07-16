@@ -44,11 +44,11 @@ CLI-Downloader 提供一致的任務、歷史紀錄、設定與使用者介面�
 
 ### Windows Installer
 
-從 [GitHub Releases](https://github.com/RyuuMeow/CLI-Downloader/releases/latest) 下載最新的 `windows-x64-setup.exe`。Installer 採個人使用者安裝，可將 CLI-Downloader 加入使用者 `PATH`，且不需要系統管理員權限。
+從 [GitHub Releases](https://github.com/RyuuMeow/CLI-Downloader/releases/latest) 下載最新的 `CLI-Downloader-<version>-windows-x64-setup.exe`。Installer 採個人使用者安裝，可將 CLI-Downloader 加入使用者 `PATH`，且不需要系統管理員權限。
 
 ### Windows Portable
 
-下載並解壓縮最新的 `windows-x64-portable.zip`。執行 `CLI-Downloader.exe` 可直接開啟互動式 Shell；使用 `clid.cmd` 則可轉發命令列參數，且不會修改 `PATH`。
+下載並解壓縮最新的 `CLI-Downloader-<version>-windows-x64-portable.zip`。執行 `CLI-Downloader.exe` 可直接開啟互動式 Shell；使用 `clid.cmd` 則可轉發命令列參數，且不會修改 `PATH`。
 
 ### 從原始碼執行
 
@@ -74,6 +74,8 @@ clid
 ```powershell
 clid download <url> --dry-run
 clid download <url>
+clid download <list-url>
+clid download <list-url> --select <item-id>
 clid tasks
 clid history
 clid plugins list
@@ -81,6 +83,9 @@ clid doctor
 ```
 
 使用 `clid <command> --help` 查看各指令選項。支援 `--json` 的指令可供腳本及其他工具讀取。
+
+命令列中的清單或 Batch 網址若未指定 `--select`，會下載該 operation 回傳的全部項目；可重複
+使用 `--select <item-id>` 將 Batch 限制為指定子集。互動式 Shell 仍會顯示插件提供的勾選頁面。
 
 若由 Agent 協助操作，請讓下載留在使用者看得到的 Shell owner 中：
 
@@ -155,7 +160,7 @@ flowchart LR
 - 在開始下載前使用 dry run 驗證網址路由；
 - 取得使用者明確授權後建立並確認下載任務；
 - 診斷不支援的網址與插件路由問題；以及
-- 研究、建立、測試並撰寫外部網站插件文件。
+- 研究、建立、測試並撰寫外部網站插件文件；以及
 - 將取得授權的工作送入可視化 Shell owner，並透過 JSON 指令控制結果 Task。
 
 Agent Skill 不會取得額外權限、不會略過確認要求，也不代表第三方插件可信。Agent 仍須遵守使用者授權與其執行環境的安全邊界。

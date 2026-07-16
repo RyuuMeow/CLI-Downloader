@@ -45,11 +45,11 @@ CLI-Downloader provides one consistent task, history, configuration, and user-in
 
 ### Windows Installer
 
-Download the latest `windows-x64-setup.exe` from [GitHub Releases](https://github.com/RyuuMeow/CLI-Downloader/releases/latest). The per-user Installer can add CLI-Downloader to your user `PATH` and does not require administrator privileges.
+Download the latest `CLI-Downloader-<version>-windows-x64-setup.exe` from [GitHub Releases](https://github.com/RyuuMeow/CLI-Downloader/releases/latest). The per-user Installer can add CLI-Downloader to your user `PATH` and does not require administrator privileges.
 
 ### Windows Portable
 
-Download and extract the latest `windows-x64-portable.zip`. Run `CLI-Downloader.exe` to open the interactive shell, or use `clid.cmd` to forward command-line arguments without modifying `PATH`.
+Download and extract the latest `CLI-Downloader-<version>-windows-x64-portable.zip`. Run `CLI-Downloader.exe` to open the interactive shell, or use `clid.cmd` to forward command-line arguments without modifying `PATH`.
 
 ### Run from Source
 
@@ -75,6 +75,8 @@ Route a URL through an installed plugin, inspect the plan first, and query persi
 ```powershell
 clid download <url> --dry-run
 clid download <url>
+clid download <list-url>
+clid download <list-url> --select <item-id>
 clid tasks
 clid history
 clid plugins list
@@ -82,6 +84,10 @@ clid doctor
 ```
 
 Use `clid <command> --help` for command-specific options. Commands that support `--json` can be consumed by scripts and other tools.
+
+A command-line list or Batch URL without `--select` downloads every item returned by that
+operation. Repeat `--select <item-id>` to restrict the Batch to a subset. The interactive Shell
+continues to show the plugin-provided selection page.
 
 For Agent-assisted work, keep downloads in the visible Shell owner:
 
@@ -157,7 +163,7 @@ This repository includes a ready-to-use [CLI-Downloader Agent Skill](skills/cli-
 - validate URL routing with a dry run before starting a download;
 - add and verify download tasks with explicit user authorization;
 - diagnose unsupported URLs and plugin routing problems; and
-- research, scaffold, test, and document external website plugins.
+- research, scaffold, test, and document external website plugins; and
 - submit authorized work to the visible Shell owner and control the resulting Task through JSON commands.
 
 The Agent Skill does not grant additional permissions, bypass confirmation requirements, or make third-party plugins trustworthy. Agents must still follow the user's authorization and the security boundaries of their host environment.

@@ -54,7 +54,7 @@ Read [references/cli-operations.md](references/cli-operations.md) for exact task
 - Use `tasks list --json` to inspect current persisted work.
 - Use `tasks show <task-id>` when one task needs detail.
 - Use `history --json` to inspect durable download records.
-- Narrow history with `--task-id`, `--query`, or `--child` instead of parsing the SQLite database directly.
+- Use `history show <task-id>` for one Task. Use `--query` or `--child` to narrow list/show output instead of parsing the SQLite database directly.
 - Do not create state merely to answer a read request. An empty result is valid.
 - Summarize identifiers, site, title, status, progress or file counts, and relevant timestamps. Keep tasks (current control/lifecycle) distinct from history (durable download records).
 
