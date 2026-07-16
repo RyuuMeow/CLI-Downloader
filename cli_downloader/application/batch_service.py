@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
+from datetime import UTC, datetime
 from hashlib import sha256
 from pathlib import Path
 from types import MappingProxyType
@@ -134,6 +135,143 @@ class BatchService:
             )
         )
 
+    def begin_enumeration(
+        self,
+        *,
+        plugin_id: str,
+        site_id: str,
+        source_operation_id: str,
+        source_url: str,
+        title: str,
+        parent_id: str | None = None,
+    ) -> str:
+        """Persist an empty Batch root before a potentially slow list scan.
+
+        The returned identity is safe to expose as an owner acceptance: the
+        public Task, execution root, History aggregate, and audit event all
+        exist before this method returns. ``confirm_selection`` later rebuilds
+        this empty graph atomically with the enumerated entries.
+        """
+
+        if self._store is None or self._task_store is None:
+            raise RuntimeError("batch and task storage are required to begin enumeration")
+        parent_id = parent_id or uuid4().hex
+        parent = BatchParent(parent_id=parent_id, entry_ids=(), title=title)
+        task = TaskRecord(
+            task_id=parent_id,
+            status=TaskStatus.PENDING,
+            kind=TaskKind.BATCH,
+            site_id=site_id,
+            source_url=source_url,
+            title=title,
+            metadata={
+                "batch_enumeration": {
+                    "state": "enumerating",
+                    "plugin_id": plugin_id,
+                    "site_id": site_id,
+                    "source_operation_id": source_operation_id,
+                },
+                "scheduler": {
+                    "root_id": parent_id,
+                    "enqueue_sequence": 0,
+                    "site_id": site_id,
+                    "entry_order": {},
+                },
+            },
+        )
+        event = TaskEvent(
+            task_id=parent_id,
+            name="batch_enumeration_started",
+            reason="list_enumeration_started",
+            payload={
+                "plugin_id": plugin_id,
+                "site_id": site_id,
+                "source_operation_id": source_operation_id,
+                "source_url": source_url,
+                "title": title,
+            },
+        )
+        history_record = DownloadHistoryRecord(
+            record_id=parent_id,
+            task_id=parent_id,
+            kind=HistoryKind.BATCH,
+            plugin_id=plugin_id,
+            site_id=site_id,
+            title=title,
+            source_url=source_url,
+            status=TaskStatus.PENDING.value,
+        )
+        if _uses_shared_state_stores(self._store, self._task_store, self._history_store):
+            self._store.create_task_and_batch(
+                task,
+                parent,
+                (),
+                (event,),
+                history_records=(history_record,),
+            )
+            return parent_id
+
+        self._task_store.upsert(task)
+        try:
+            self._store.create_batch(parent, ())
+        except Exception:
+            self._task_store.delete(parent_id)
+            raise
+        if self._history_store is not None:
+            self._history_store.append(event)
+            if isinstance(self._history_store, StateHistoryStore):
+                self._history_store.upsert_record(history_record)
+        return parent_id
+
+    def fail_enumeration(self, parent_id: str, message: str, *, cancelled: bool = False) -> None:
+        """Close a provisional Batch when its list scan cannot be completed."""
+
+        if self._store is None or self._task_store is None:
+            raise RuntimeError("batch and task storage are required to fail enumeration")
+        current = self._task_store.get(parent_id)
+        if current is None or current.kind is not TaskKind.BATCH:
+            raise RuntimeError(f"provisional batch task not found: {parent_id}")
+        status = TaskStatus.CANCELED if cancelled else TaskStatus.FAILED
+        task = current.transition(
+            status=status,
+            metadata={
+                **current.metadata,
+                "batch_enumeration": {
+                    **dict(current.metadata.get("batch_enumeration", {})),
+                    "state": "cancelled" if cancelled else "failed",
+                    "error": message,
+                },
+                "failure": {"stage": "list_enumeration", "message": message},
+            },
+        )
+        event = TaskEvent(
+            task_id=parent_id,
+            name="batch_enumeration_finished",
+            reason="list_enumeration_cancelled" if cancelled else "list_enumeration_failed",
+            payload={"error": message},
+        )
+        history_record = None
+        if isinstance(self._history_store, StateHistoryStore):
+            current_history = self._history_store.get_record(parent_id)
+            if current_history is not None:
+                history_record = replace(
+                    current_history,
+                    status=status.value,
+                    finished_at=datetime.now(UTC),
+                )
+        if isinstance(self._store, StateBatchStore):
+            self._store.update_batch_task_and_history(
+                task,
+                history_events=(event,),
+                history_record=history_record,
+            )
+            return
+        self._task_store.upsert(task)
+        if self._history_store is not None:
+            self._history_store.append(event)
+            if history_record is not None:
+                self._history_store.upsert_record(history_record)
+
     def confirm_selection(
         self,
         *,
@@ -162,7 +300,23 @@ class BatchService:
             for item in selected:
                 if self._completion_store.is_completed(site_id, item.source_url):
                     duplicates[item.item_id] = DuplicateKind.COMPLETED
+        provisional_parent_id = parent_id
         parent_id = parent_id or uuid4().hex
+        existing_task = (
+            self._task_store.get(parent_id) if provisional_parent_id is not None else None
+        )
+        if provisional_parent_id is not None:
+            existing_parent = parent_id in self._store.list_parent_ids()
+            if (existing_task is None) != (not existing_parent):
+                raise RuntimeError(f"incomplete provisional batch state: {parent_id}")
+        if existing_task is not None:
+            enumeration = existing_task.metadata.get("batch_enumeration")
+            if (
+                existing_task.kind is not TaskKind.BATCH
+                or not isinstance(enumeration, Mapping)
+                or enumeration.get("state") != "enumerating"
+            ):
+                raise RuntimeError(f"batch identity is not an active enumeration: {parent_id}")
 
         def _is_duplicate(item: ListItemData) -> bool:
             if force:
@@ -195,14 +349,7 @@ class BatchService:
             entry_ids=tuple(entry.entry_id for entry in entries),
             title=title or parent_id[:8],
         )
-        task_record = TaskRecord(
-            task_id=parent_id,
-            status=TaskStatus.PENDING,
-            kind=TaskKind.BATCH,
-            site_id=site_id,
-            source_url=source_url,
-            title=parent.title,
-            metadata={
+        task_metadata = {
                 "batch_selection": {
                     "plugin_id": plugin_id,
                     "site_id": site_id,
@@ -225,7 +372,36 @@ class BatchService:
                         entry.entry_id: sequence for sequence, entry in enumerate(entries)
                     },
                 },
-            },
+            }
+        if existing_task is None:
+            task_record = TaskRecord(
+                task_id=parent_id,
+                status=TaskStatus.PENDING,
+                kind=TaskKind.BATCH,
+                site_id=site_id,
+                source_url=source_url,
+                title=parent.title,
+                metadata=task_metadata,
+            )
+        else:
+            task_record = existing_task.transition(
+                site_id=site_id,
+                source_url=source_url,
+                title=parent.title,
+                metadata={
+                    **existing_task.metadata,
+                    **task_metadata,
+                    "batch_enumeration": {
+                        **dict(existing_task.metadata["batch_enumeration"]),
+                        "state": "completed",
+                        "item_count": len(entries),
+                    },
+                },
+            )
+        existing_history = (
+            self._history_store.get_record(parent_id)
+            if existing_task is not None and isinstance(self._history_store, StateHistoryStore)
+            else None
         )
         parent_history_record = DownloadHistoryRecord(
             record_id=parent_id,
@@ -236,6 +412,7 @@ class BatchService:
             title=parent.title,
             source_url=source_url,
             status=TaskStatus.PENDING.value,
+            created_at=(existing_history.created_at if existing_history is not None else datetime.now(UTC)),
         )
         provisional_snapshot = derive_batch_snapshot(parent, entries, ())
         events_to_append = tuple(
@@ -273,21 +450,38 @@ class BatchService:
             ]
         )
         if _uses_shared_state_stores(self._store, self._task_store, self._history_store):
-            snapshot = self._store.create_task_and_batch(
-                task_record,
-                parent,
-                entries,
-                events_to_append,
-                history_records=(parent_history_record,),
-            )
+            if existing_task is not None:
+                snapshot = self._store.rebuild_task_and_batch(
+                    task_record,
+                    parent,
+                    entries,
+                    events_to_append,
+                    history_record=parent_history_record,
+                )
+            else:
+                snapshot = self._store.create_task_and_batch(
+                    task_record,
+                    parent,
+                    entries,
+                    events_to_append,
+                    history_records=(parent_history_record,),
+                )
         else:
             self._task_store.upsert(task_record)
             try:
-                self._store.create_batch(parent, entries)
+                if existing_task is not None and isinstance(self._store, StateBatchStore):
+                    snapshot = self._store.rebuild_task_and_batch(
+                        task_record,
+                        parent,
+                        entries,
+                    )
+                else:
+                    self._store.create_batch(parent, entries)
+                    snapshot = self._store.get_snapshot(parent_id)
             except Exception:
-                self._task_store.delete(task_record.task_id)
+                if existing_task is None:
+                    self._task_store.delete(task_record.task_id)
                 raise
-            snapshot = self._store.get_snapshot(parent_id)
             if self._history_store is not None:
                 self._history_store.append_many(events_to_append)
                 if isinstance(self._history_store, StateHistoryStore):

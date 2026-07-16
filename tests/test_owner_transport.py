@@ -349,6 +349,68 @@ class OwnerPipeTransportTests(unittest.TestCase):
             self.assertEqual(events[-1].kind.value, "owner_disconnected")
             self.assertEqual(events[-1].payload["outcome"], "accepted_completion_unknown")
 
+    def test_pre_acceptance_wait_uses_acceptance_timeout_not_response_idle_timeout(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            scope = OwnerScope.from_data_root(directory)
+
+            def handler(request, emit):
+                time.sleep(0.05)
+                emit(
+                    OwnerResponseEvent.accepted(
+                        request.request_id,
+                        1,
+                        owner_session_id="owner-session",
+                        accepted_at=datetime.now(UTC),
+                        task_id="slow-accept-task",
+                        task_kind="batch",
+                    )
+                )
+
+            server = OwnerPipeServer(
+                scope,
+                handshake=OwnerHandshake(
+                    OWNER_PROTOCOL_VERSION,
+                    "owner-session",
+                    OwnerMode.SHELL,
+                    "0.1.5",
+                    ("download",),
+                ),
+                handler=handler,
+            )
+            server.start()
+            try:
+                session = "client-session"
+                events = OwnerPipeClient(
+                    scope,
+                    wait_policy=OwnerWaitPolicy(
+                        acceptance_timeout=0.5,
+                        response_idle_timeout=0.01,
+                    ),
+                ).request(
+                    OwnerRequest(
+                        OWNER_PROTOCOL_VERSION,
+                        "slow-accept-request",
+                        OwnerSource.CLI,
+                        OwnerCommand.DOWNLOAD,
+                        OwnerResponseMode.DETACH,
+                        {"url": "https://example.test/list"},
+                        session,
+                    ),
+                    handshake=OwnerHandshake(
+                        OWNER_PROTOCOL_VERSION,
+                        session,
+                        OwnerMode.FOREGROUND,
+                        "0.1.5",
+                        ("download",),
+                        ("download",),
+                    ),
+                )
+            finally:
+                server.stop()
+
+        self.assertEqual([event.kind.value for event in events], ["accepted"])
+        self.assertEqual(events[0].payload["task_id"], "slow-accept-task")
+
     def test_crashed_owner_does_not_leave_wait_client_blocked_and_replays_task_identity(self) -> None:
         context = multiprocessing.get_context("spawn")
         with tempfile.TemporaryDirectory() as directory:

@@ -472,7 +472,12 @@ class OwnerPipeClient:
                 raise OwnerTransportError("owner handshake did not return a result")
             connection.send_bytes(request.to_bytes())
             while True:
-                raw = self._recv_bytes(connection, self.wait_policy.response_idle_timeout)
+                wait_timeout = (
+                    self.wait_policy.response_idle_timeout
+                    if stream.accepted
+                    else self.wait_policy.acceptance_timeout
+                )
+                raw = self._recv_bytes(connection, wait_timeout)
                 if raw.startswith(b'{'):
                     frame = json.loads(raw.decode("utf-8"))
                     if isinstance(frame, dict) and frame.get("frame") == "transport_error":

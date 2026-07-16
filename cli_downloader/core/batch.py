@@ -222,13 +222,18 @@ def _require_datetime(value: object, path: str) -> datetime:
     return value
 
 
-def _require_unique_ids(values: object, path: str) -> tuple[str, ...]:
+def _require_unique_ids(
+    values: object,
+    path: str,
+    *,
+    allow_empty: bool = False,
+) -> tuple[str, ...]:
     if not isinstance(values, (tuple, list)):
         raise _error("invalid_sequence", path, "must be a sequence of ids")
     result = tuple(
         _require_text(value, f"{path}[{index}]", maximum=128) for index, value in enumerate(values)
     )
-    if not result:
+    if not result and not allow_empty:
         raise _error("empty_sequence", path, "must contain at least one id")
     if len(set(result)) != len(result):
         raise _error("duplicate_value", path, "must not contain duplicate ids")
@@ -523,7 +528,13 @@ class BatchParent:
             self, "parent_id", _require_text(self.parent_id, "parent.parent_id", maximum=128)
         )
         object.__setattr__(
-            self, "entry_ids", _require_unique_ids(self.entry_ids, "parent.entry_ids")
+            self,
+            "entry_ids",
+            _require_unique_ids(
+                self.entry_ids,
+                "parent.entry_ids",
+                allow_empty=True,
+            ),
         )
         if self.title is not None:
             object.__setattr__(

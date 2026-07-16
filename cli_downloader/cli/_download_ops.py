@@ -69,7 +69,7 @@ from cli_downloader.storage.state_database import StateDatabase
 from cli_downloader.storage.state_history_store import StateHistoryStore
 from cli_downloader.storage.state_task_store import StateTaskStore
 from cli_downloader.storage.paths import StorageLayout
-from cli_downloader.storage.task_store import TaskRecord, TaskStatus
+from cli_downloader.storage.task_store import TaskDesiredControl, TaskRecord, TaskStatus
 
 
 AcceptanceSink = Callable[[str, str], None]
@@ -446,16 +446,57 @@ def _run_generic_download(
                 render_mode,
             )
         if selection_policy is ListSelectionPolicy.ALL:
-            items, error = _collect_all_list_items(
-                result,
-                dispatcher=dispatcher,
-                url=url,
-                operation_params=operation_params,
-                profile=profile,
-                cancellation=cancellation,
-            )
+            enumeration_service: BatchService | None = None
+            provisional_parent_id: str | None = None
+            if task_id is not None:
+                enumeration_service = _state_batch_service()
+                provisional_parent_id = task_id
+            elif on_accept is not None and entry is not None:
+                route = entry.instance.classify_url(url)
+                if route is not None:
+                    enumeration_service = _state_batch_service()
+                    provisional_parent_id = enumeration_service.begin_enumeration(
+                        plugin_id=entry.plugin_id,
+                        site_id=entry.site_id,
+                        source_operation_id=route.operation_id,
+                        source_url=url,
+                        title=data.title,
+                    )
+                    on_accept(provisional_parent_id, TaskKind.BATCH.value)
+            try:
+                items, error = _collect_all_list_items(
+                    result,
+                    dispatcher=dispatcher,
+                    url=url,
+                    operation_params=operation_params,
+                    profile=profile,
+                    cancellation=cancellation,
+                )
+            except Exception as failure:
+                if _owner_shutdown_requested(cancellation):
+                    print(json.dumps({"command": "download", "interrupted": True}))
+                    return 130
+                if enumeration_service is not None and provisional_parent_id is not None:
+                    enumeration_service.fail_enumeration(
+                        provisional_parent_id,
+                        str(failure),
+                        cancelled=bool(cancellation is not None and cancellation.is_set()),
+                    )
+                raise
             if error is not None:
-                return _print_batch_selection_error(error, render_mode)
+                owner_shutdown = _owner_shutdown_requested(cancellation)
+                if (
+                    not owner_shutdown
+                    and enumeration_service is not None
+                    and provisional_parent_id is not None
+                ):
+                    enumeration_service.fail_enumeration(
+                        provisional_parent_id,
+                        error,
+                        cancelled=bool(cancellation is not None and cancellation.is_set()),
+                    )
+                result_code = _print_batch_selection_error(error, render_mode)
+                return 130 if cancellation is not None and cancellation.is_set() else result_code
             return _run_selected_list_batch(
                 items,
                 batch_source_url=url,
@@ -467,7 +508,9 @@ def _run_generic_download(
                 cancellation=cancellation,
                 progress=progress,
                 download_limiter=download_limiter,
-                on_accept=on_accept,
+                on_accept=None if provisional_parent_id is not None else on_accept,
+                provisional_parent_id=provisional_parent_id,
+                enumeration_service=enumeration_service,
             )
         if render_mode is not RenderMode.INTERACTIVE:
             print(serialize_operation_result(result, render_mode))
@@ -569,6 +612,23 @@ def _collect_all_list_items(
         for item in pages[page_number].items:
             items_by_id.setdefault(item.item_id, item)
     return tuple(items_by_id.values()), None
+
+
+def _state_batch_service() -> BatchService:
+    environment = diagnose_environment()
+    layout = StorageLayout.from_app_paths(environment.paths)
+    database = StateDatabase(layout.state_db)
+    return BatchService(
+        store=StateBatchStore(database),
+        task_store=StateTaskStore(database),
+        history_store=StateHistoryStore(database),
+        completion_store=SQLiteCompletionStore(database),
+    )
+
+
+def _owner_shutdown_requested(cancellation: Event | None) -> bool:
+    predicate = getattr(cancellation, "is_owner_shutdown", None)
+    return bool(callable(predicate) and predicate())
 
 
 def _download_generic_gallery(
@@ -822,13 +882,18 @@ def _run_selected_list_batch(
     task_service: TaskHierarchyService | None = None,
     download_limiter: GalleryDownloadLimiter | None = None,
     on_accept: AcceptanceSink | None = None,
+    provisional_parent_id: str | None = None,
+    enumeration_service: BatchService | None = None,
 ) -> int:
     items = tuple(items)
+
+    def selection_error(message: str) -> int:
+        if provisional_parent_id is not None and enumeration_service is not None:
+            enumeration_service.fail_enumeration(provisional_parent_id, message)
+        return _print_batch_selection_error(message, render_mode)
+
     if not items:
-        return _print_batch_selection_error(
-            "At least one gallery must be selected.",
-            render_mode,
-        )
+        return selection_error("At least one gallery must be selected.")
 
     routes = []
     for item in items:
@@ -839,10 +904,7 @@ def _run_selected_list_batch(
             else None
         )
         if runtime_entry is None or route is None:
-            return _print_batch_selection_error(
-                f"Selected gallery is not routable: {item.item_id}",
-                render_mode,
-            )
+            return selection_error(f"Selected gallery is not routable: {item.item_id}")
         routes.append((runtime_entry, route))
     first_entry, first_route = routes[0]
     if any(
@@ -851,17 +913,11 @@ def _run_selected_list_batch(
         or route.operation_id != first_route.operation_id
         for entry, route in routes[1:]
     ):
-        return _print_batch_selection_error(
-            "Selected galleries must use the same plugin operation.",
-            render_mode,
-        )
+        return selection_error("Selected galleries must use the same plugin operation.")
 
     strategy_result = _selection_strategy(items)
     if strategy_result is None:
-        return _print_batch_selection_error(
-            "Selected galleries do not have a consistent download strategy.",
-            render_mode,
-        )
+        return selection_error("Selected galleries do not have a consistent download strategy.")
     strategy = strategy_result
 
     environment = diagnose_environment()
@@ -884,7 +940,45 @@ def _run_selected_list_batch(
         title=batch_title,
         strategy=strategy,
         force=force,
+        parent_id=provisional_parent_id,
     )
+    parent_id = creation.snapshot.parent.parent_id
+    current_task = task_store.get(parent_id)
+    if current_task is not None and (
+        current_task.status is TaskStatus.PAUSED
+        or current_task.desired_control is TaskDesiredControl.PAUSE
+    ):
+        _report_progress(progress, "batch_created", {"parent_id": parent_id})
+        print(
+            json.dumps(
+                {
+                    "command": "download",
+                    "render_mode": render_mode.value,
+                    "status": TaskStatus.PAUSED.value,
+                    "site_id": first_entry.site_id,
+                    "asset_count": 0,
+                    "batch_creation": creation.to_dict(),
+                    "batch": creation.snapshot.to_dict(),
+                    "duplicates": {
+                        candidate_id: kind.value
+                        for candidate_id, kind in creation.duplicates.items()
+                    },
+                    "output_files": [],
+                    "network_request_performed": bool(
+                        items[0].metadata.get("network_request_performed", True)
+                    ),
+                    "cancelled": False,
+                },
+                indent=None if render_mode is RenderMode.JSON else 2,
+            )
+        )
+        return 0
+    if current_task is not None and (
+        current_task.status is TaskStatus.CANCELED
+        or current_task.desired_control is TaskDesiredControl.CANCEL
+    ):
+        print(json.dumps({"command": "download", "cancelled": True, "task_id": parent_id}))
+        return 130
     loaded_config = ConfigLoader(paths=environment.paths, registry=runtime.settings_registry).load()
     runtime.configure_plugins(loaded_config.values, loaded_config.secrets)
     fetchers = dict(runtime.asset_fetchers_by_site_id)
@@ -930,7 +1024,6 @@ def _run_selected_list_batch(
             execution_coordinator=coordinator,
         )
     try:
-        parent_id = creation.snapshot.parent.parent_id
         if on_accept is not None:
             on_accept(parent_id, TaskKind.BATCH.value)
         _report_progress(progress, "batch_created", {"parent_id": parent_id})

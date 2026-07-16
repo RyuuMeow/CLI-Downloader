@@ -46,6 +46,7 @@ from cli_downloader.core.owner_protocol import (
     OwnerResponseMode,
     OwnerRequest,
     OwnerTerminalStatus,
+    OwnerWaitPolicy,
     OwnerWaitPhase,
 )
 from cli_downloader.core.owner_scope import (
@@ -622,11 +623,12 @@ def _handle_owner_download(
 
     Thread(target=worker, name=f"owner-download-{request.request_id[:8]}", daemon=True).start()
     accepted_before_deadline = False
-    for _ in range(100):
+    acceptance_deadline = monotonic() + OwnerWaitPolicy().acceptance_timeout
+    while monotonic() < acceptance_deadline:
         if accepted.is_set():
             accepted_before_deadline = True
             break
-        if finished.wait(0.1):
+        if finished.wait(min(0.1, max(0.0, acceptance_deadline - monotonic()))):
             break
     if not accepted_before_deadline and not pipe_closed.is_set() and not finished.is_set():
         push(

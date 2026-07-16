@@ -33,6 +33,7 @@ from cli_downloader.storage.completion_store import InMemoryCompletionStore
 from cli_downloader.storage.file_writer import AssetFileWriter
 from cli_downloader.storage.state_database import StateDatabase
 from cli_downloader.storage.state_history_store import StateHistoryStore
+from cli_downloader.storage.state_task_store import StateTaskStore as SQLiteTaskStore
 from cli_downloader.storage.task_store import InMemoryTaskStore, TaskRecord, TaskStatus
 
 
@@ -213,6 +214,73 @@ def _items() -> tuple[ListItemData, ...]:
 
 
 class BatchServiceTests(unittest.TestCase):
+    def test_provisional_enumeration_is_durable_before_selection_is_finalized(self) -> None:
+        with TemporaryDirectory() as directory:
+            database = StateDatabase(Path(directory) / "state.sqlite3")
+            tasks = SQLiteTaskStore(database)
+            store = StateBatchStore(database)
+            history = StateHistoryStore(database)
+            service = BatchService(store=store, task_store=tasks, history_store=history)
+
+            parent_id = service.begin_enumeration(
+                plugin_id="example",
+                site_id="example",
+                source_operation_id="browse",
+                source_url="https://example.test/list",
+                title="Example list",
+            )
+
+            provisional = tasks.get(parent_id)
+            self.assertIsNotNone(provisional)
+            assert provisional is not None
+            self.assertEqual(provisional.kind, TaskKind.BATCH)
+            self.assertEqual(provisional.metadata["batch_enumeration"]["state"], "enumerating")
+            self.assertEqual(store.get_snapshot(parent_id).parent.entry_ids, ())
+            provisional_history = history.get_record(parent_id)
+            self.assertEqual(provisional_history.status, TaskStatus.PENDING.value)
+
+            result = service.confirm_selection(
+                plugin_id="example",
+                site_id="example",
+                source_operation_id="resolve_gallery",
+                items=_items(),
+                source_url="https://example.test/list",
+                title="Example list",
+                parent_id=parent_id,
+            )
+
+            finalized = tasks.get(parent_id)
+            self.assertEqual(result.snapshot.parent.parent_id, parent_id)
+            self.assertEqual(len(result.entries), len(_items()))
+            self.assertEqual(finalized.metadata["batch_enumeration"]["state"], "completed")
+            self.assertEqual(finalized.created_at, provisional.created_at)
+            self.assertEqual(history.get_record(parent_id).created_at, provisional_history.created_at)
+
+    def test_failed_enumeration_closes_task_and_history_without_deleting_root(self) -> None:
+        with TemporaryDirectory() as directory:
+            database = StateDatabase(Path(directory) / "state.sqlite3")
+            tasks = SQLiteTaskStore(database)
+            store = StateBatchStore(database)
+            history = StateHistoryStore(database)
+            service = BatchService(store=store, task_store=tasks, history_store=history)
+            parent_id = service.begin_enumeration(
+                plugin_id="example",
+                site_id="example",
+                source_operation_id="browse",
+                source_url="https://example.test/list",
+                title="Example list",
+            )
+
+            service.fail_enumeration(parent_id, "page 2 failed")
+
+            task = tasks.get(parent_id)
+            self.assertEqual(task.status, TaskStatus.FAILED)
+            self.assertEqual(task.metadata["failure"]["stage"], "list_enumeration")
+            self.assertEqual(store.get_snapshot(parent_id).parent.entry_ids, ())
+            record = history.get_record(parent_id)
+            self.assertEqual(record.status, TaskStatus.FAILED.value)
+            self.assertIsNotNone(record.finished_at)
+
     def test_direct_prefix_checkpoint_is_never_promoted_as_complete(self) -> None:
         with TemporaryDirectory() as directory:
             root = Path(directory)

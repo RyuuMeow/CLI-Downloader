@@ -1097,6 +1097,31 @@ def main(
                     if forwarded is not None:
                         return forwarded
                 with _owned_execution(owner_claimed=_owner_claimed):
+                    task_record = StateTaskStore(StateDatabase(layout.state_db)).get(
+                        args.parent_id
+                    )
+                    enumeration = (
+                        task_record.metadata.get("batch_enumeration")
+                        if task_record is not None
+                        else None
+                    )
+                    if (
+                        task_record is not None
+                        and task_record.source_url
+                        and isinstance(enumeration, dict)
+                        and enumeration.get("state") == "enumerating"
+                    ):
+                        return _run_generic_download(
+                            task_record.source_url,
+                            runtime=get_runtime(),
+                            render_mode=render_mode,
+                            profile=args.profile,
+                            selection_policy=ListSelectionPolicy.ALL,
+                            cancellation=cancellation,
+                            progress=progress,
+                            download_limiter=download_limiter,
+                            task_id=args.parent_id,
+                        )
                     return _run_batch_retry(
                         args.parent_id,
                         runtime=get_runtime(),

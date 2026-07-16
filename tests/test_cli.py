@@ -8,9 +8,17 @@ from unittest import TestCase
 from unittest.mock import patch
 
 from cli_downloader.cli.app import _emit_hard_retry_error, _with_default_strategy, main
+from cli_downloader.cli import _download_ops
+from cli_downloader.application.batch_service import BatchService
+from cli_downloader.application.execution_control import ExecutionStopSignal
 from cli_downloader.cli.i18n import TranslationService, translation_context
 from cli_downloader.config.loader import LoadedConfig
 from cli_downloader.core.models import DownloadStrategy
+from cli_downloader.storage.state_database import StateDatabase
+from cli_downloader.storage.state_batch_store import StateBatchStore
+from cli_downloader.storage.state_history_store import StateHistoryStore
+from cli_downloader.storage.state_task_store import StateTaskStore
+from cli_downloader.storage.task_store import TaskDesiredControl, TaskStatus
 from tests.example_site import build_example_runtime
 
 
@@ -108,6 +116,168 @@ class CLITest(TestCase):
         self.assertEqual(exit_code, 0)
         self.assertEqual(payload["batch"]["counts"]["completed"], 4)
         self.assertEqual(len(payload["output_files"]), 8)
+
+    def test_owner_batch_is_accepted_before_all_pages_are_collected(self) -> None:
+        stream = StringIO()
+        accepted: list[tuple[str, str]] = []
+        original_collect = _download_ops._collect_all_list_items
+
+        def collect_after_acceptance(*args, **kwargs):
+            self.assertEqual(len(accepted), 1)
+            return original_collect(*args, **kwargs)
+
+        with TemporaryDirectory() as directory:
+            with patch.dict("os.environ", {"CLI_DOWNLOADER_DATA_ROOT": directory}):
+                with patch.object(
+                    _download_ops,
+                    "_collect_all_list_items",
+                    side_effect=collect_after_acceptance,
+                ):
+                    with redirect_stdout(stream):
+                        exit_code = _main(
+                            ["download", "https://example.test/list?page=1", "--json"],
+                            on_accept=lambda task_id, kind: accepted.append((task_id, kind)),
+                        )
+
+            database = StateDatabase(Path(directory) / "state" / "state.sqlite3")
+            task = StateTaskStore(database).get(accepted[0][0])
+
+        payload = json.loads(stream.getvalue())
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(accepted[0][1], "batch")
+        self.assertEqual(payload["batch"]["parent"]["parent_id"], accepted[0][0])
+        self.assertEqual(task.metadata["batch_enumeration"]["state"], "completed")
+
+    def test_owner_batch_enumeration_failure_closes_the_accepted_task(self) -> None:
+        stream = StringIO()
+        accepted: list[tuple[str, str]] = []
+
+        with TemporaryDirectory() as directory:
+            with patch.dict("os.environ", {"CLI_DOWNLOADER_DATA_ROOT": directory}):
+                with patch.object(
+                    _download_ops,
+                    "_collect_all_list_items",
+                    return_value=((), "fixture page failure"),
+                ):
+                    with redirect_stdout(stream):
+                        exit_code = _main(
+                            ["download", "https://example.test/list?page=1", "--json"],
+                            on_accept=lambda task_id, kind: accepted.append((task_id, kind)),
+                        )
+
+            database = StateDatabase(Path(directory) / "state" / "state.sqlite3")
+            task = StateTaskStore(database).get(accepted[0][0])
+            history = StateHistoryStore(database).get_record(accepted[0][0])
+
+        self.assertEqual(exit_code, 1)
+        self.assertEqual(len(accepted), 1)
+        self.assertEqual(task.status, TaskStatus.FAILED)
+        self.assertEqual(history.status, TaskStatus.FAILED.value)
+        self.assertIn("fixture page failure", stream.getvalue())
+
+    def test_resume_reenumerates_a_provisional_batch_with_the_same_task_id(self) -> None:
+        stream = StringIO()
+
+        with TemporaryDirectory() as directory:
+            with patch.dict("os.environ", {"CLI_DOWNLOADER_DATA_ROOT": directory}):
+                database = StateDatabase(Path(directory) / "state" / "state.sqlite3")
+                service = BatchService(
+                    store=StateBatchStore(database),
+                    task_store=StateTaskStore(database),
+                    history_store=StateHistoryStore(database),
+                )
+                parent_id = service.begin_enumeration(
+                    plugin_id="example",
+                    site_id="example",
+                    source_operation_id="list_galleries",
+                    source_url="https://example.test/list?page=1",
+                    title="Example galleries",
+                )
+
+                with redirect_stdout(stream):
+                    exit_code = _main(
+                        ["batches", "resume", parent_id, "--json"],
+                        _owner_claimed=True,
+                    )
+
+                task = StateTaskStore(database).get(parent_id)
+                snapshot = StateBatchStore(database).get_snapshot(parent_id)
+
+        payload = json.loads(stream.getvalue())
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(payload["batch"]["parent"]["parent_id"], parent_id)
+        self.assertEqual(task.status, TaskStatus.COMPLETED)
+        self.assertEqual(task.metadata["batch_enumeration"]["state"], "completed")
+        self.assertEqual(len(snapshot.parent.entry_ids), 4)
+
+    def test_owner_shutdown_keeps_provisional_batch_resumable(self) -> None:
+        stream = StringIO()
+        accepted: list[tuple[str, str]] = []
+        stop = ExecutionStopSignal()
+
+        def interrupt_collection(*_args, **_kwargs):
+            stop.request_shutdown()
+            return (), "Batch selection was cancelled."
+
+        with TemporaryDirectory() as directory:
+            with patch.dict("os.environ", {"CLI_DOWNLOADER_DATA_ROOT": directory}):
+                with patch.object(
+                    _download_ops,
+                    "_collect_all_list_items",
+                    side_effect=interrupt_collection,
+                ):
+                    with redirect_stdout(stream):
+                        exit_code = _main(
+                            ["download", "https://example.test/list?page=1", "--json"],
+                            cancellation=stop,
+                            on_accept=lambda task_id, kind: accepted.append((task_id, kind)),
+                        )
+                database = StateDatabase(Path(directory) / "state" / "state.sqlite3")
+                task = StateTaskStore(database).get(accepted[0][0])
+
+        self.assertEqual(exit_code, 130)
+        self.assertEqual(task.status, TaskStatus.PENDING)
+        self.assertEqual(task.metadata["batch_enumeration"]["state"], "enumerating")
+
+    def test_pause_during_enumeration_keeps_full_batch_paused(self) -> None:
+        stream = StringIO()
+        accepted: list[tuple[str, str]] = []
+        original_collect = _download_ops._collect_all_list_items
+
+        with TemporaryDirectory() as directory:
+            with patch.dict("os.environ", {"CLI_DOWNLOADER_DATA_ROOT": directory}):
+                database = StateDatabase(Path(directory) / "state" / "state.sqlite3")
+
+                def pause_then_collect(*args, **kwargs):
+                    store = StateTaskStore(database)
+                    current = store.get(accepted[0][0])
+                    store.upsert(
+                        current.transition(
+                            status=TaskStatus.PAUSED,
+                            desired_control=TaskDesiredControl.PAUSE,
+                        )
+                    )
+                    return original_collect(*args, **kwargs)
+
+                with patch.object(
+                    _download_ops,
+                    "_collect_all_list_items",
+                    side_effect=pause_then_collect,
+                ):
+                    with redirect_stdout(stream):
+                        exit_code = _main(
+                            ["download", "https://example.test/list?page=1", "--json"],
+                            on_accept=lambda task_id, kind: accepted.append((task_id, kind)),
+                        )
+                task = StateTaskStore(database).get(accepted[0][0])
+                snapshot = StateBatchStore(database).get_snapshot(accepted[0][0])
+
+        payload = json.loads(stream.getvalue())
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(payload["status"], TaskStatus.PAUSED.value)
+        self.assertEqual(task.status, TaskStatus.PAUSED)
+        self.assertEqual(task.desired_control, TaskDesiredControl.PAUSE)
+        self.assertEqual(len(snapshot.parent.entry_ids), 4)
 
     def test_download_example_list_json_confirms_selection_and_reports_duplicates(self) -> None:
         first_stream = StringIO()

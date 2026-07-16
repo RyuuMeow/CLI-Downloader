@@ -888,7 +888,7 @@ class OwnerRequestLedger:
 class OwnerWaitPolicy:
     connect_timeout: float = 5.0
     handshake_timeout: float = 5.0
-    acceptance_timeout: float = 10.0
+    acceptance_timeout: float = 30.0
     response_idle_timeout: float = 10.0
     max_frame_bytes: int = DEFAULT_MAX_FRAME_BYTES
 

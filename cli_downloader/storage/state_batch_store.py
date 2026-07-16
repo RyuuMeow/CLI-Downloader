@@ -514,6 +514,32 @@ class StateBatchStore:
                 raise
             raise BatchConflictError(f"batch rebuild conflict: {parent.parent_id}") from error
 
+    def update_batch_task_and_history(
+        self,
+        task: TaskRecord,
+        *,
+        history_events: tuple[TaskEvent, ...] = (),
+        history_record: DownloadHistoryRecord | None = None,
+    ) -> None:
+        """Commit a Batch root lifecycle update with its durable audit state.
+
+        This is used while a newly accepted Batch is still enumerating list
+        pages. Keeping the Task and History writes in the same transaction
+        prevents an IPC client from observing a failed Task whose history is
+        still left in the provisional pending state.
+        """
+
+        with StateUnitOfWork(self._database) as unit_of_work:
+            if task.task_id not in unit_of_work.execution.list_batch_ids():
+                raise BatchNotFoundError(f"batch parent not found: {task.task_id}")
+            current = unit_of_work.tasks.get(task.task_id)
+            if current is None or current.kind is not TaskKind.BATCH:
+                raise BatchNotFoundError(f"batch task record not found: {task.task_id}")
+            unit_of_work.tasks.upsert(task)
+            if history_record is not None:
+                unit_of_work.history_records.upsert(history_record)
+            unit_of_work.history.append_many(history_events)
+
     def delete_batch(self, parent_id: str) -> None:
         with StateUnitOfWork(self._database) as unit_of_work:
             if not unit_of_work.execution.delete_batch(parent_id):

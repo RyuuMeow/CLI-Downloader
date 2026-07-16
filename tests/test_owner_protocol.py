@@ -277,7 +277,7 @@ class LedgerAndLivenessTests(unittest.TestCase):
         tracker.observe(heartbeat, now=9)
         self.assertFalse(tracker.is_expired(now=18.9))
         self.assertTrue(tracker.is_expired(now=19))
-        self.assertEqual(policy.timeout_for(OwnerWaitPhase.ACCEPTANCE), 10)
+        self.assertEqual(policy.timeout_for(OwnerWaitPhase.ACCEPTANCE), 30)
 
     def test_in_memory_transport_bounds_silent_owner_wait(self) -> None:
         transport = InMemoryOwnerTransport(policy=OwnerWaitPolicy(acceptance_timeout=3, response_idle_timeout=5))
