@@ -65,6 +65,22 @@ class BatchTorrentClient:
         return TorrentHandle("new", "new.torrent")
 
 
+class ShutdownAwareBatchTorrentClient(BatchTorrentClient):
+    def __init__(self, status: TorrentOutcome) -> None:
+        super().__init__(status)
+        self.shutdown_seen = False
+        self.cancel_called = False
+
+    async def poll_until_complete(self, _handle, **kwargs):
+        self.poll_calls += 1
+        checker = kwargs.get("shutdown_requested")
+        self.shutdown_seen = callable(checker) and bool(checker())
+        return self.poll
+
+    async def cancel(self, _handle):
+        self.cancel_called = True
+
+
 def _batch_torrent_fixture(root: Path, outcome: TorrentOutcome):
     database = StateDatabase(root / "state.sqlite3")
     store = StateBatchStore(database)
@@ -677,6 +693,49 @@ class BatchServiceTests(unittest.TestCase):
             self.assertEqual(client.add_calls, 0)
             self.assertEqual(client.status_calls, 1)
             self.assertEqual(client.poll_calls, 0)
+
+    def test_batch_torrent_shutdown_does_not_cancel_client_task(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            handle = TorrentHandle("existing", "item.torrent")
+            downloading = TorrentOutcome(
+                handle,
+                "downloading",
+                str(root),
+                found=True,
+                progress=0.5,
+            )
+            store, child = _batch_torrent_fixture(root, downloading)
+            client = ShutdownAwareBatchTorrentClient(downloading)
+            downloader = SystemBatchDownloader(
+                file_writer=AssetFileWriter(root),
+                store=store,
+                fetchers={"example": BatchTorrentFetcher()},
+                torrent_client=client,
+            )
+
+            class ShutdownControl:
+                def is_set(self):
+                    return False
+
+                def is_shutdown_requested(self):
+                    return True
+
+                async def wait_if_paused(self):
+                    return None
+
+            outcomes = asyncio.run(
+                downloader.execute(
+                    child,
+                    (store.list_assets(child.child_id)[0],),
+                    ShutdownControl(),
+                    lambda _reason, _data: None,
+                )
+            )
+
+            self.assertEqual(outcomes[0].status, AssetStatus.DOWNLOADING)
+            self.assertTrue(client.shutdown_seen)
+            self.assertFalse(client.cancel_called)
 
 
 if __name__ == "__main__":

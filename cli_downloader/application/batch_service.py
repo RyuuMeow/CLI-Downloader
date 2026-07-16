@@ -848,7 +848,14 @@ class SystemBatchDownloader(BatchDownloadExecutor):
         for idx, handle, written_record in pending:
 
             def _cancel_requested() -> bool:
+                shutdown = getattr(cancel_event, "is_shutdown_requested", None)
+                if callable(shutdown) and shutdown():
+                    return False
                 return cancel_event.is_set()
+
+            def _shutdown_requested() -> bool:
+                shutdown = getattr(cancel_event, "is_shutdown_requested", None)
+                return callable(shutdown) and bool(shutdown())
 
             def _status_callback(outcome: TorrentOutcome) -> None:
                 current = outcomes[idx]
@@ -882,6 +889,8 @@ class SystemBatchDownloader(BatchDownloadExecutor):
                         "cancel_requested": _cancel_requested,
                         "status_callback": _status_callback,
                     }
+                    if poll_supports_argument(poll_method, "shutdown_requested"):
+                        poll_kwargs["shutdown_requested"] = _shutdown_requested
                     if callable(getattr(cancel_event, "is_paused", None)) and poll_supports_argument(
                         poll_method, "pause_requested"
                     ):
@@ -935,6 +944,9 @@ class SystemBatchDownloader(BatchDownloadExecutor):
                 )
             if self._store is not None:
                 self._store.update_asset(child.child_id, outcomes[idx])
+
+        if _shutdown_requested():
+            return tuple(outcomes)
 
         # Phase 3: auto-delete .torrent files.
         if self._auto_delete_torrent_file:
