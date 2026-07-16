@@ -249,6 +249,11 @@ def _build_interactive_shell_impl(
                         status=TaskStatus.PLANNED,
                         desired_control=TaskDesiredControl.RUN,
                         active_run_id=None,
+                        # The bounded drain has expired.  Rotate the fence
+                        # before releasing the owner lease so a
+                        # non-cooperative worker from the old process cannot
+                        # publish a late terminal/checkpoint write.
+                        metadata={**record.metadata, "execution_fence": uuid4().hex},
                     )
                 )
         return unfinished

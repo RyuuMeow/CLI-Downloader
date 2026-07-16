@@ -159,6 +159,28 @@ class InteractiveShellTest(TestCase):
         )
         self.assertEqual(callbacks, ["ready"])
 
+    def test_plain_shell_dispatches_startup_recovery_before_ready(self) -> None:
+        output = StringIO()
+        started = Event()
+        commands: list[tuple[str, ...]] = []
+
+        def background(argv, _cancellation, _progress):
+            commands.append(tuple(argv))
+            started.set()
+            return 0
+
+        shell = InteractiveShell(
+            background_runner=background,
+            startup_commands=(("tasks", "resume", "task-1", "--json"),),
+        )
+
+        self.assertEqual(
+            shell.run(input_stream=StringIO("exit\n"), output_stream=output),
+            0,
+        )
+        self.assertTrue(started.wait(1.0))
+        self.assertEqual(commands, [("tasks", "resume", "task-1", "--json")])
+
     def test_shell_warns_before_releasing_owner_with_unfinished_tasks(self) -> None:
         output = StringIO()
         shell = InteractiveShell(

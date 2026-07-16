@@ -845,17 +845,17 @@ class SystemBatchDownloader(BatchDownloadExecutor):
         release_admission = getattr(cancel_event, "release_admission", None)
         if pending and callable(release_admission):
             await release_admission()
+
+        def _shutdown_requested() -> bool:
+            shutdown = getattr(cancel_event, "is_shutdown_requested", None)
+            return callable(shutdown) and bool(shutdown())
+
         for idx, handle, written_record in pending:
 
             def _cancel_requested() -> bool:
-                shutdown = getattr(cancel_event, "is_shutdown_requested", None)
-                if callable(shutdown) and shutdown():
+                if _shutdown_requested():
                     return False
                 return cancel_event.is_set()
-
-            def _shutdown_requested() -> bool:
-                shutdown = getattr(cancel_event, "is_shutdown_requested", None)
-                return callable(shutdown) and bool(shutdown())
 
             def _status_callback(outcome: TorrentOutcome) -> None:
                 current = outcomes[idx]

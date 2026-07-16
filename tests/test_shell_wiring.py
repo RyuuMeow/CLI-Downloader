@@ -5,6 +5,9 @@ from unittest import TestCase
 from unittest.mock import Mock, patch
 
 from cli_downloader.cli._shell_wiring import build_interactive_shell
+from cli_downloader.storage.state_database import StateDatabase
+from cli_downloader.storage.state_task_store import StateTaskStore
+from cli_downloader.storage.task_store import TaskRecord, TaskStatus
 from tests.example_site import build_example_runtime
 
 
@@ -41,3 +44,50 @@ class ShellWiringTest(TestCase):
         service_loader = kwargs["task_service_loader"]
         self.assertIs(service_loader(), service_loader())
         fake_shell.run.assert_called_once_with()
+
+    def test_shutdown_timeout_rotates_running_task_execution_fence(self) -> None:
+        runner = Mock(return_value=0)
+        background_runner = Mock(return_value=0)
+
+        with TemporaryDirectory() as directory:
+            plugins_dir = Path(directory) / "plugins"
+            store = StateTaskStore(
+                StateDatabase(Path(directory) / "state" / "state.sqlite3")
+            )
+            with patch.dict(os.environ, {"CLI_DOWNLOADER_DATA_ROOT": directory}):
+                runtime = build_example_runtime()
+                fake_shell = Mock()
+
+                def run_shell():
+                    store.upsert(
+                        TaskRecord(
+                            task_id="late-worker",
+                            status=TaskStatus.RUNNING,
+                            source_url="https://example.test/gallery/late-worker",
+                            metadata={
+                                "scheduler_managed": True,
+                                "execution_fence": "old-owner",
+                            },
+                        )
+                    )
+                    return 0
+
+                fake_shell.run.side_effect = run_shell
+                with patch(
+                    "cli_downloader.cli._shell_wiring.InteractiveShell",
+                    return_value=fake_shell,
+                ):
+                    self.assertEqual(
+                        build_interactive_shell(
+                            runtime=runtime,
+                            plugins_dir=plugins_dir,
+                            runner=runner,
+                            background_runner=background_runner,
+                        ),
+                        0,
+                    )
+
+            recovered = store.get("late-worker")
+            self.assertIsNotNone(recovered)
+            self.assertEqual(recovered.status, TaskStatus.PLANNED)
+            self.assertNotEqual(recovered.metadata.get("execution_fence"), "old-owner")

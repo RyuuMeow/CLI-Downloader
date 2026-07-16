@@ -292,6 +292,37 @@ class InteractiveShell:
         if callback is not None:
             callback()
 
+    def _start_plain_startup_commands(self, output_stream: TextIO) -> None:
+        """Dispatch persisted recovery work before advertising plain-shell readiness.
+
+        The Textual path starts these commands from ``on_mount``.  The
+        non-TTY shell used by redirected/embedded sessions must do the same;
+        otherwise a restart can publish ``READY`` while its recovery command
+        list is silently discarded.  Dispatch is asynchronous so the prompt
+        remains usable, while the owner wiring still tracks these workers for
+        bounded shutdown.
+        """
+
+        for argv in self._startup_commands:
+            command = tuple(argv)
+
+            def run_startup(command: Sequence[str] = command) -> None:
+                try:
+                    self.run_background(
+                        command,
+                        output_stream,
+                        ExecutionStopSignal(),
+                        lambda _reason, _payload: None,
+                    )
+                except Exception as error:
+                    output_stream.write(f"{type(error).__name__}: {error}\n")
+
+            Thread(
+                target=run_startup,
+                name="shell-startup-recovery",
+                daemon=True,
+            ).start()
+
     def _write_shutdown_warning(self, output_stream: TextIO) -> None:
         warning = self.shutdown_warning()
         if warning is not None:
@@ -329,6 +360,7 @@ class InteractiveShell:
 
         input_stream = input_stream or sys.stdin
         output_stream = output_stream or sys.stdout
+        self._start_plain_startup_commands(output_stream)
         self._notify_startup_ready()
         output_stream.write(self._translator("shell.welcome") + "\n")
 
