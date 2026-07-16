@@ -287,8 +287,8 @@ client:
   run leases for both `RUNNING` and `PLANNED` records before `resume` admission. Parent, graph, and
   asset transitions commit atomically; a failed graph checkpoint rolls back the complete recovery
   transaction. Recovery verifies direct completed assets with their persisted SHA-256 and rolls
-  corrupt outputs back to `QUEUED` in the same child/asset transaction. The focused P5 suites pass;
-  the full verification gate is rerun after this checkpoint.
+  corrupt outputs back to `QUEUED` in the same child/asset transaction. The latest full
+  verification gate passes with 610 core tests plus all three isolated plugin suites.
 
 ### Recovery Matrix
 
