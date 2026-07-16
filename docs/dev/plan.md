@@ -272,12 +272,14 @@ paused-root preservation, and qBittorrent shutdown reconciliation remain:
 ### Status
 
 In progress. Startup recovery now uses `resume` instead of `retry`, returns active Batch children
-and assets to schedulable queued states without creating retry attempts, and skips verified
-standalone output files when the checkpoint still exists. Transactional root recovery, partial-file
-verification, torrent reconciliation, and stale-run fencing remain:
+and assets to schedulable queued states without creating retry attempts, skips verified standalone
+output files when the checkpoint still exists, and clears stale standalone run leases before
+re-admission. Transactional root recovery, partial-file verification, torrent reconciliation, and
+late-writer fencing remain:
 
 - Recovery now normalises active Batch children/assets back to queued states and clears stale Task
-  run leases before `resume` admission. Remaining gaps are transactional root recovery, full
+  run leases for both `RUNNING` and `PLANNED` records before `resume` admission. The full
+  verification gate passes (595 core tests); remaining gaps are transactional root recovery, full
   partial-file verification, and standalone/torrent stale-writer fencing.
 
 ### Recovery Matrix
