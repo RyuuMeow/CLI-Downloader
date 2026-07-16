@@ -287,7 +287,7 @@ preserves the accepted handle, paused/running state, and output identity.
   asset transitions commit atomically; a failed graph checkpoint rolls back the complete recovery
   transaction. Recovery verifies direct completed assets with their persisted SHA-256 and rolls
   corrupt outputs back to `QUEUED` in the same child/asset transaction. The latest full
-  verification gate passes with 611 core tests plus all three isolated plugin suites.
+  verification gate passes with 612 core tests plus all three isolated plugin suites.
 
 ### Recovery Matrix
 
