@@ -15,6 +15,7 @@ from cli_downloader.application.batch_pipeline import (
     BatchPackageResolver,
     ProgressReporter,
 )
+from cli_downloader.application.execution_control import OwnerShutdownRequested
 from cli_downloader.application.download_limiter import GalleryDownloadLimiter
 from cli_downloader.core.batch import (
     AssetRecord,
@@ -450,25 +451,47 @@ class SystemBatchDownloader(BatchDownloadExecutor):
                 append_outcome(replace(record, status=AssetStatus.CANCELLED))
                 continue
             legacy_asset = _legacy_asset(record.asset)
-            # A direct-stream checkpoint is a verified prefix, not a complete
-            # asset.  The current fetcher contract has no range-resume
-            # capability, so never promote it with ``AssetFileWriter.resume``.
-            # Validate the prefix for diagnostics and let the next write
-            # safely replace it from byte zero.
+            resumed = None
             if record.partial_path is not None and record.content_sha256 is not None:
-                partial = Path(record.partial_path)
-                try:
-                    if partial.is_file():
-                        digest = sha256()
-                        with partial.open("rb") as stream:
-                            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
-                                digest.update(chunk)
-                        if digest.hexdigest() != record.content_sha256:
-                            partial.unlink(missing_ok=True)
-                except OSError:
-                    # The subsequent fetch/write path remains authoritative;
-                    # an inaccessible prefix must not become a completion.
-                    pass
+                # An interrupted stream is explicitly marked partial and must
+                # be fetched again because the current fetcher contract has no
+                # range-resume capability. Older checkpoints represent a
+                # complete response whose atomic rename was interrupted; the
+                # writer promotes those only after verifying its hash.
+                if record.metadata.get("checkpoint_kind") != "partial":
+                    resumed = self._file_writer.resume(
+                        _legacy_asset(record.asset, include_plugin_asset_key=False),
+                        task_id=child.child_id,
+                        partial_path=record.partial_path,
+                        content_sha256=record.content_sha256,
+                        folder_fields=_package_folder_fields(child.package),
+                        folder_template=child.package.folder_template,
+                    )
+                    if resumed is None:
+                        resumed = self._file_writer.resume(
+                            legacy_asset,
+                            task_id=child.child_id,
+                            partial_path=record.partial_path,
+                            content_sha256=record.content_sha256,
+                            folder_fields=_package_folder_fields(child.package),
+                            folder_template=child.package.folder_template,
+                        )
+            if resumed is not None:
+                append_outcome(
+                    replace(
+                        record,
+                        status=AssetStatus.COMPLETED,
+                        failure=None,
+                        partial_path=None,
+                        final_path=str(resumed.path),
+                        metadata={**record.metadata, "checkpoint_kind": "complete"},
+                    )
+                )
+                progress(
+                    "asset_resumed",
+                    {"asset_id": record.asset.asset_id, "path": str(resumed.path)},
+                )
+                continue
             fetcher = self._fetchers.get(record.asset.site_id)
             if hasattr(fetcher, "fetch_stream"):
                 hash_obj = sha256()
@@ -503,6 +526,8 @@ class SystemBatchDownloader(BatchDownloadExecutor):
                                 )
                                 last_report_time = now
                             yield chunk
+                    except OwnerShutdownRequested:
+                        raise
                     except Exception as e:
                         raise FetchErrorWrap() from e
 
@@ -526,6 +551,23 @@ class SystemBatchDownloader(BatchDownloadExecutor):
                         else await fetch_and_write()
                     )
                     digest = hash_obj.hexdigest()
+                except OwnerShutdownRequested:
+                    _target, partial = self._file_writer.paths(
+                        legacy_asset,
+                        task_id=child.child_id,
+                        folder_fields=_package_folder_fields(child.package),
+                        folder_template=child.package.folder_template,
+                    )
+                    append_outcome(
+                        replace(
+                            record,
+                            status=AssetStatus.DOWNLOADING,
+                            partial_path=str(partial) if partial.exists() else None,
+                            content_sha256=hash_obj.hexdigest(),
+                            metadata={**record.metadata, "checkpoint_kind": "partial"},
+                        )
+                    )
+                    return tuple(outcomes)
                 except Exception as error:
                     _target, partial = self._file_writer.paths(
                         legacy_asset,
@@ -544,6 +586,7 @@ class SystemBatchDownloader(BatchDownloadExecutor):
                             _failed_record(record, actual_error, stage),
                             partial_path=str(partial) if partial.exists() else None,
                             content_sha256=hash_obj.hexdigest(),
+                            metadata={**record.metadata, "checkpoint_kind": "partial"},
                         )
                     )
                     continue
@@ -586,6 +629,7 @@ class SystemBatchDownloader(BatchDownloadExecutor):
                             _failed_record(record, error, FailureStage.WRITE),
                             partial_path=str(partial) if partial.exists() else None,
                             content_sha256=digest,
+                            metadata={**record.metadata, "checkpoint_kind": "complete"},
                         )
                     )
                     continue
@@ -597,6 +641,7 @@ class SystemBatchDownloader(BatchDownloadExecutor):
                     partial_path=None,
                     final_path=str(written.path),
                     content_sha256=digest,
+                    metadata={**record.metadata, "checkpoint_kind": "complete"},
                 )
             )
             progress(

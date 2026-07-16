@@ -228,6 +228,7 @@ class BatchServiceTests(unittest.TestCase):
                     status=AssetStatus.DOWNLOADING,
                     partial_path=str(partial),
                     content_sha256=sha256(b"prefix").hexdigest(),
+                    metadata={"checkpoint_kind": "partial"},
                 ),
             )
             fetcher = BatchDirectFetcher()

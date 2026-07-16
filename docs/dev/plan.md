@@ -276,9 +276,9 @@ output files when the checkpoint still exists, clears stale standalone run lease
 re-admission, and preserves recovered Task revision/run-generation identity. Direct streams persist
 an unfinished `.part` checkpoint and safely rebuild it on resume; stale owner fences are rotated
 before re-admission and late writes are rejected. Batch root recovery is transactional, partial
-prefix checkpoints are never promoted to complete assets, and the last observed torrent state is
-persisted on owner shutdown. Remaining work is completed-asset verification for interrupted Batch
-roots and end-to-end restart reconciliation against a live torrent client:
+explicitly partial checkpoints are never promoted to complete assets, and the last observed torrent
+state is persisted on owner shutdown. Remaining work is completed-asset verification for
+interrupted Batch roots and end-to-end restart reconciliation against a live torrent client:
 
 - Recovery now normalises active Batch children/assets back to queued states and clears stale Task
   run leases for both `RUNNING` and `PLANNED` records before `resume` admission. Parent, graph, and
