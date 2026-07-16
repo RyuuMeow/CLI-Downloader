@@ -283,7 +283,8 @@ interrupted Batch roots and end-to-end restart reconciliation against a live tor
 - Recovery now normalises active Batch children/assets back to queued states and clears stale Task
   run leases for both `RUNNING` and `PLANNED` records before `resume` admission. Parent, graph, and
   asset transitions commit atomically; a failed graph checkpoint rolls back the complete recovery
-  transaction. The latest full verification gate before this slice passed with 602 core tests.
+  transaction. The latest full verification gate passes with 607 core tests plus all three
+  isolated plugin suites.
 
 ### Recovery Matrix
 
