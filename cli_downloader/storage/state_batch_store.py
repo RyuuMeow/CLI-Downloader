@@ -178,6 +178,79 @@ class StateBatchStore:
                     )
             return updated
 
+    def requeue_corrupt_completed_assets(
+        self,
+        parent_id: str,
+        asset_ids_by_child: dict[str, tuple[str, ...]],
+    ) -> tuple[str, ...]:
+        """Requeue completed direct assets whose output failed recovery verification.
+
+        A completed asset is normally immutable.  Recovery is the one explicit
+        exception: if the persisted digest no longer matches the owned output,
+        clear the completion fields and make the containing child schedulable
+        again.  The graph changes are committed atomically so a second owner
+        cannot observe a completed child with a queued asset (or vice versa).
+        """
+
+        if not asset_ids_by_child:
+            return ()
+        changed: list[str] = []
+        with StateUnitOfWork(self._database) as unit_of_work:
+            if parent_id not in unit_of_work.execution.list_batch_ids():
+                raise BatchNotFoundError(f"batch not found: {parent_id}")
+            valid_child_ids = {
+                child_id
+                for _entry_id, _status, _payload, child_id in unit_of_work.execution.list_entry_payloads(
+                    parent_id
+                )
+                if isinstance(child_id, str) and child_id
+            }
+            for child_id, asset_ids in asset_ids_by_child.items():
+                if child_id not in valid_child_ids:
+                    raise BatchConflictError(f"child does not belong to batch: {child_id}")
+                child_payload = unit_of_work.execution.get_child_payload(child_id)
+                if child_payload is None:
+                    raise BatchNotFoundError(f"download child not found: {child_id}")
+                child = _child_from_payload(child_payload)
+                changed_child = False
+                requested = set(asset_ids)
+                for asset_payload in unit_of_work.execution.list_asset_payloads(child_id):
+                    asset = _asset_record_from_payload(asset_payload)
+                    if asset.asset.asset_id not in requested or asset.status is not AssetStatus.COMPLETED:
+                        continue
+                    updated_asset = replace(
+                        asset,
+                        status=AssetStatus.QUEUED,
+                        failure=None,
+                        partial_path=None,
+                        final_path=None,
+                        content_sha256=None,
+                        metadata={
+                            **asset.metadata,
+                            "recovery_reason": "completed_output_integrity_failed",
+                        },
+                    )
+                    unit_of_work.execution.update_asset(
+                        child_id,
+                        asset.asset.asset_id,
+                        updated_asset.status.value,
+                        updated_asset.to_dict(),
+                    )
+                    changed.append(asset.asset.asset_id)
+                    changed_child = True
+                if changed_child and child.status is not DownloadChildStatus.QUEUED:
+                    queued_child = replace(
+                        child,
+                        status=DownloadChildStatus.QUEUED,
+                        failure=None,
+                    )
+                    unit_of_work.execution.update_child(
+                        child_id,
+                        queued_child.status.value,
+                        queued_child.to_dict(),
+                    )
+        return tuple(changed)
+
     def find_entry_ids(self, task_ids: tuple[str, ...]) -> frozenset[str]:
         """Return matching Batch entry IDs in one bounded SQL query.
 

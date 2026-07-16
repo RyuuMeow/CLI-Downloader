@@ -1,8 +1,10 @@
 import json
+import multiprocessing
 import tempfile
 import time
 import unittest
 from datetime import UTC, datetime
+from threading import Thread
 
 from cli_downloader.core.owner_protocol import (
     OWNER_PROTOCOL_VERSION,
@@ -18,6 +20,46 @@ from cli_downloader.core.owner_protocol import (
 )
 from cli_downloader.core.owner_scope import OwnerScope
 from cli_downloader.core.owner_transport import OwnerPipeClient, OwnerPipeServer, OwnerTransportError
+
+
+def _orphan_owner_process(directory: str, ready, accepted, hold) -> None:
+    """Keep an accepted WAIT request alive until the parent simulates a crash."""
+
+    scope = OwnerScope.from_data_root(directory)
+    owner_session = "orphan-owner"
+
+    def handler(request, emit):
+        emit(
+            OwnerResponseEvent.accepted(
+                request.request_id,
+                1,
+                owner_session_id=owner_session,
+                accepted_at=datetime.now(UTC),
+                task_id="orphan-task",
+                task_kind="item",
+            )
+        )
+        accepted.set()
+        hold.wait(30)
+
+    server = OwnerPipeServer(
+        scope,
+        handshake=OwnerHandshake(
+            OWNER_PROTOCOL_VERSION,
+            owner_session,
+            OwnerMode.SHELL,
+            "0.1.5",
+            ("download",),
+            scope_fingerprint=scope.scope_fingerprint,
+        ),
+        handler=handler,
+    )
+    server.start()
+    ready.set()
+    try:
+        hold.wait(30)
+    finally:
+        server.stop()
 
 
 class OwnerPipeTransportTests(unittest.TestCase):
@@ -345,6 +387,85 @@ class OwnerPipeTransportTests(unittest.TestCase):
 
             self.assertEqual(events[-1].kind.value, "owner_disconnected")
             self.assertEqual(events[-1].payload["outcome"], "accepted_completion_unknown")
+
+    def test_crashed_owner_does_not_leave_wait_client_blocked_and_replays_task_identity(self) -> None:
+        context = multiprocessing.get_context("spawn")
+        with tempfile.TemporaryDirectory() as directory:
+            scope = OwnerScope.from_data_root(directory)
+            ready = context.Event()
+            accepted = context.Event()
+            hold = context.Event()
+            process = context.Process(
+                target=_orphan_owner_process,
+                args=(directory, ready, accepted, hold),
+            )
+            process.start()
+            self.assertTrue(ready.wait(15), "owner process did not publish its endpoint")
+            session = "orphan-client"
+            request = OwnerRequest(
+                OWNER_PROTOCOL_VERSION,
+                "orphan-request",
+                OwnerSource.CLI,
+                OwnerCommand.DOWNLOAD,
+                OwnerResponseMode.WAIT,
+                {"url": "https://example.test/item/1"},
+                session,
+            )
+            handshake = OwnerHandshake(
+                OWNER_PROTOCOL_VERSION,
+                session,
+                OwnerMode.FOREGROUND,
+                "0.1.5",
+                ("download",),
+                ("download",),
+                scope.scope_fingerprint,
+            )
+            events: list[object] = []
+
+            def wait_for_result() -> None:
+                events.extend(
+                    OwnerPipeClient(
+                        scope,
+                        wait_policy=OwnerWaitPolicy(response_idle_timeout=1.0),
+                    ).request(request, handshake=handshake)
+                )
+
+            client_thread = Thread(target=wait_for_result, daemon=True)
+            client_thread.start()
+            self.assertTrue(accepted.wait(15), "owner did not accept the WAIT request")
+            process.terminate()
+            process.join(15)
+            self.assertFalse(process.is_alive())
+            client_thread.join(5)
+            self.assertFalse(client_thread.is_alive(), "WAIT client remained blocked after owner crash")
+            self.assertTrue(events)
+            self.assertEqual(events[-1].kind.value, "owner_disconnected")
+            self.assertEqual(events[-1].payload["known_task_id"], "orphan-task")
+
+            # A new owner can start and the same request remains authoritative;
+            # persistence replays acceptance instead of invoking a replacement.
+            restarted = OwnerPipeServer(
+                scope,
+                handshake=OwnerHandshake(
+                    OWNER_PROTOCOL_VERSION,
+                    "restarted-owner",
+                    OwnerMode.SHELL,
+                    "0.1.5",
+                    ("download",),
+                    scope_fingerprint=scope.scope_fingerprint,
+                ),
+                handler=lambda _request, _emit: self.fail("replayed request was re-executed"),
+            )
+            restarted.start()
+            try:
+                replay = OwnerPipeClient(
+                    scope,
+                    wait_policy=OwnerWaitPolicy(response_idle_timeout=0.2),
+                ).request(request, handshake=handshake)
+            finally:
+                restarted.stop()
+            self.assertEqual(replay[0].kind.value, "accepted")
+            self.assertEqual(replay[0].payload["task_id"], "orphan-task")
 
     def test_endpoint_metadata_scope_mismatch_is_rejected_before_connect(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

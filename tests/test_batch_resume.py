@@ -2,6 +2,7 @@ from tests.state_store_support import StateBatchStore, StateTaskStore
 import asyncio
 from contextlib import redirect_stdout
 from dataclasses import replace
+from hashlib import sha256
 from io import StringIO
 import json
 from pathlib import Path
@@ -228,6 +229,112 @@ class ResumePlanTests(TestCase):
                 tid for p in plan.plans if p.scope is RetryScope.CHILD for tid in p.target_ids
             }
             self.assertNotIn(child.child_id, child_ids)
+
+    def test_plan_resume_requeues_completed_child_when_output_hash_is_invalid(self) -> None:
+        with TemporaryDirectory() as d:
+            root = Path(d)
+            store = StateBatchStore(root / "state.sqlite3")
+            item = _entry("integrity")
+            store.create_batch(BatchParent("parent-1", (item.entry_id,)), (item,))
+            store.update_entry(replace(item, status=BatchEntryStatus.RESOLVING))
+            child = DownloadChild(
+                child_id="child-integrity",
+                parent_id="parent-1",
+                entry_id=item.entry_id,
+                package=_package(item),
+            )
+            store.attach_child(item.entry_id, child)
+            assets = store.list_assets(child.child_id)
+            output = root / "asset-1.jpg"
+            output.write_bytes(b"tampered")
+            completed = replace(
+                assets[0],
+                status=AssetStatus.COMPLETED,
+                final_path=str(output),
+                content_sha256="0" * 64,
+            )
+            store.update_asset(
+                child.child_id,
+                replace(assets[0], status=AssetStatus.DOWNLOADING),
+            )
+            store.update_asset(child.child_id, completed)
+            store.update_child(replace(child, status=DownloadChildStatus.DOWNLOADING))
+            store.update_child(
+                replace(
+                    child,
+                    status=DownloadChildStatus.PARTIALLY_COMPLETED,
+                    failure=FailureData(
+                        origin=FailureOrigin.SYSTEM,
+                        stage=FailureStage.FETCH,
+                        code="integrity_failed",
+                        message="output integrity failed",
+                        retryable=True,
+                    ),
+                )
+            )
+
+            plan = BatchResumeService(store=store, resolver=object()).plan_resume("parent-1")
+
+            recovered_asset = store.list_assets(child.child_id)[0]
+            self.assertEqual(recovered_asset.status, AssetStatus.QUEUED)
+            self.assertIsNone(recovered_asset.final_path)
+            self.assertIsNone(recovered_asset.content_sha256)
+            self.assertEqual(
+                store.get_child(child.child_id).status,
+                DownloadChildStatus.QUEUED,
+            )
+            self.assertIn(
+                child.child_id,
+                {
+                    target
+                    for retry in plan.plans
+                    if retry.scope is RetryScope.CHILD
+                    for target in retry.target_ids
+                },
+            )
+
+    def test_plan_resume_keeps_verified_completed_child_immutable(self) -> None:
+        with TemporaryDirectory() as d:
+            root = Path(d)
+            store = StateBatchStore(root / "state.sqlite3")
+            item = _entry("verified")
+            store.create_batch(BatchParent("parent-1", (item.entry_id,)), (item,))
+            store.update_entry(replace(item, status=BatchEntryStatus.RESOLVING))
+            child = DownloadChild(
+                child_id="child-verified",
+                parent_id="parent-1",
+                entry_id=item.entry_id,
+                package=_package(item),
+            )
+            store.attach_child(item.entry_id, child)
+            for index, record in enumerate(store.list_assets(child.child_id), start=1):
+                output = root / f"asset-{index}.jpg"
+                content = f"asset-{index}".encode()
+                output.write_bytes(content)
+                store.update_asset(
+                    child.child_id,
+                    replace(
+                        record,
+                        status=AssetStatus.DOWNLOADING,
+                    ),
+                )
+                store.update_asset(
+                    child.child_id,
+                    replace(
+                        record,
+                        status=AssetStatus.COMPLETED,
+                        final_path=str(output),
+                        content_sha256=sha256(content).hexdigest(),
+                    ),
+                )
+            store.update_child(replace(child, status=DownloadChildStatus.DOWNLOADING))
+            store.update_child(replace(child, status=DownloadChildStatus.COMPLETED))
+
+            plan = BatchResumeService(store=store, resolver=object()).plan_resume("parent-1")
+
+            self.assertEqual(store.get_child(child.child_id).status, DownloadChildStatus.COMPLETED)
+            self.assertTrue(all(record.status is AssetStatus.COMPLETED for record in store.list_assets(child.child_id)))
+            self.assertEqual(plan.plans, ())
 
 
 class FakeResolver:

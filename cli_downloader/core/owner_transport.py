@@ -98,8 +98,23 @@ def _write_endpoint_metadata(path: Path, *, family: str, address: object, scope:
             os.fsync(stream.fileno())
         if os.name != "nt":
             os.chmod(temporary, 0o600)
-        os.replace(temporary, path)
-        temporary = None
+        # Windows may briefly deny replacing the discovery file while a
+        # client is re-reading it during an AF_PIPE -> loopback fallback.
+        # Keep the operation atomic, but retry the transient sharing violation
+        # for a bounded interval instead of killing the owner listener thread.
+        replaced = False
+        for _attempt in range(20):
+            try:
+                os.replace(temporary, path)
+            except PermissionError:
+                sleep(0.01)
+            else:
+                replaced = True
+                temporary = None
+                break
+        if not replaced:
+            os.replace(temporary, path)
+            temporary = None
     finally:
         if temporary is not None:
             temporary.unlink(missing_ok=True)
