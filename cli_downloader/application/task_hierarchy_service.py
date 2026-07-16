@@ -281,7 +281,9 @@ class TaskHierarchyService:
             return self._batch_control("pause", task_id)
         record = self._task_store.get(task_id)
         if record is not None and record.kind is TaskKind.ITEM:
-            return self._standalone_lifecycle.pause(task_id)
+            result = self._standalone_lifecycle.pause(task_id)
+            self._scheduler_root_control("suspend", task_id)
+            return result
         raise TaskNotFoundError(f"task not found: {task_id}")
 
     def resume(self, task_id: str) -> object:
@@ -290,7 +292,9 @@ class TaskHierarchyService:
             return self._batch_control("resume", task_id)
         record = self._task_store.get(task_id)
         if record is not None and record.kind is TaskKind.ITEM:
-            return self._standalone_lifecycle.resume(task_id)
+            result = self._standalone_lifecycle.resume(task_id)
+            self._scheduler_root_control("resume", task_id)
+            return result
         raise TaskNotFoundError(f"task not found: {task_id}")
 
     def cancel(self, task_id: str) -> object:
@@ -299,7 +303,9 @@ class TaskHierarchyService:
             return self._batch_control("cancel", task_id)
         record = self._task_store.get(task_id)
         if record is not None and record.kind is TaskKind.ITEM:
-            return self._standalone_lifecycle.cancel(task_id)
+            result = self._standalone_lifecycle.cancel(task_id)
+            self._scheduler_root_control("cancel", task_id)
+            return result
         raise TaskNotFoundError(f"task not found: {task_id}")
 
     async def retry(self, task_id: str) -> object:
@@ -400,6 +406,11 @@ class TaskHierarchyService:
             raise InvalidTaskTransitionError(
                 "Batch item controls are unavailable; control the Batch task instead"
             )
+
+    def _scheduler_root_control(self, action: str, task_id: str) -> None:
+        method = getattr(self._scheduler, f"{action}_root_sync", None)
+        if callable(method):
+            method(task_id)
 
     def _batch_root_summary(self, parent_id: str) -> TaskRootSummary:
         summary = self._batch_store.get_summary(parent_id)

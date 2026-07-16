@@ -447,6 +447,36 @@ class PersistPlannedTaskStage:
         )
 
 
+class _StandaloneLeaseController:
+    """Pause-safe central Item lease for a standalone task."""
+
+    def __init__(
+        self,
+        limiter: GalleryDownloadLimiter,
+        *,
+        task_id: str,
+        site_id: str,
+        cancelled: Callable[[], bool],
+    ) -> None:
+        self._limiter = limiter
+        self._task_id = task_id
+        self._site_id = site_id
+        self._cancelled = cancelled
+        self._lease = None
+
+    async def acquire(self) -> None:
+        if self._lease is None and not self._cancelled():
+            self._lease = await self._limiter.acquire_item(
+                root_id=self._task_id,
+                site_id=self._site_id,
+            )
+
+    async def release(self) -> None:
+        lease, self._lease = self._lease, None
+        if lease is not None:
+            await lease.release()
+
+
 class WriteAssetsStage:
     name = "write_assets"
 
@@ -474,17 +504,32 @@ class WriteAssetsStage:
         self._auto_delete_torrent_file = auto_delete_torrent_file
 
     async def run(self, context: PipelineContext) -> PipelineContext:
+        controller = None
         if self._download_limiter is not None:
             item = context.data.get("item")
             site_id = item.site_id if isinstance(item, ResolvedItem) else "unknown"
-            async with self._download_limiter.item(
-                root_id=context.task_id,
+            controller = _StandaloneLeaseController(
+                self._download_limiter,
+                task_id=context.task_id,
                 site_id=site_id,
-            ):
-                return await self._run(context)
-        return await self._run(context)
+                cancelled=lambda: self._torrent_cancel_requested(context.task_id),
+            )
+            record = self._task_store.get(context.task_id)
+            if record is not None and record.status is TaskStatus.PAUSED:
+                self._download_limiter.suspend_root_sync(context.task_id)
+            await controller.acquire()
+        try:
+            return await self._run(context, lease_controller=controller)
+        finally:
+            if controller is not None:
+                await controller.release()
 
-    async def _run(self, context: PipelineContext) -> PipelineContext:
+    async def _run(
+        self,
+        context: PipelineContext,
+        *,
+        lease_controller: _StandaloneLeaseController | None = None,
+    ) -> PipelineContext:
         plan = context.data["plan"]
         if not isinstance(plan, DownloadStrategyPlan):
             raise TypeError("pipeline context plan must be a DownloadStrategyPlan")
@@ -493,7 +538,12 @@ class WriteAssetsStage:
             raise TypeError("pipeline context item must be a ResolvedItem")
 
         if plan.strategy is DownloadStrategy.TORRENT:
-            return await self._run_torrent(context, item, plan)
+            return await self._run_torrent(
+                context,
+                item,
+                plan,
+                lease_controller=lease_controller,
+            )
 
         written_assets: list[WrittenAsset] = []
         total = len(plan.assets.assets)
@@ -506,13 +556,19 @@ class WriteAssetsStage:
         folder_template = record.metadata.get("output_folder_template")
         if not isinstance(folder_template, str):
             folder_template = None
-        await self._wait_until_runnable(context.task_id)
+        await self._wait_until_runnable(
+            context.task_id,
+            lease_controller=lease_controller,
+        )
         if self._cancel_signal is not None and self._cancel_signal.is_set():
             raise asyncio.CancelledError
         if self._progress is not None:
             self._progress(0, total)
         for asset in plan.assets.assets:
-            await self._wait_until_runnable(context.task_id)
+            await self._wait_until_runnable(
+                context.task_id,
+                lease_controller=lease_controller,
+            )
             if self._cancel_signal is not None and self._cancel_signal.is_set():
                 raise asyncio.CancelledError
 
@@ -606,6 +662,8 @@ class WriteAssetsStage:
         context: PipelineContext,
         item: ResolvedItem,
         plan: DownloadStrategyPlan,
+        *,
+        lease_controller: _StandaloneLeaseController | None = None,
     ) -> PipelineContext:
         if self._torrent_client is None:
             raise TorrentClientError(
@@ -637,7 +695,10 @@ class WriteAssetsStage:
         if self._progress is not None:
             self._progress(0, total)
         for asset in plan.assets.assets:
-            await self._wait_until_runnable(context.task_id)
+            await self._wait_until_runnable(
+                context.task_id,
+                lease_controller=lease_controller,
+            )
             if self._cancel_signal is not None and self._cancel_signal.is_set():
                 raise asyncio.CancelledError
 
@@ -857,18 +918,42 @@ class WriteAssetsStage:
             replace(current, metadata={**current.metadata, "torrent_checkpoints": checkpoints})
         )
 
-    async def _wait_until_runnable(self, task_id: str) -> None:
+    async def _wait_until_runnable(
+        self,
+        task_id: str,
+        *,
+        lease_controller: _StandaloneLeaseController | None = None,
+    ) -> None:
+        suspended = False
         while True:
             record = self._task_store.get(task_id)
             if record is None:
                 raise RuntimeError(f"task disappeared during download: {task_id}")
-            if record.status is TaskStatus.CANCELED:
+            if record.status is TaskStatus.CANCELED or (
+                self._cancel_signal is not None and self._cancel_signal.is_set()
+            ):
+                if lease_controller is not None:
+                    await lease_controller.release()
+                    self._download_limiter.cancel_root_sync(task_id)
                 raise asyncio.CancelledError
-            if record.status is not TaskStatus.PAUSED:
-                if record.status is TaskStatus.PLANNED:
-                    self._task_store.upsert(replace(record, status=TaskStatus.RUNNING))
-                return
-            await asyncio.sleep(0.05)
+            if record.status is TaskStatus.PAUSED:
+                if not suspended:
+                    if self._download_limiter is not None:
+                        self._download_limiter.suspend_root_sync(task_id)
+                    if lease_controller is not None:
+                        await lease_controller.release()
+                    suspended = True
+                await asyncio.sleep(0.05)
+                continue
+            if suspended:
+                if self._download_limiter is not None:
+                    self._download_limiter.resume_root_sync(task_id)
+                if lease_controller is not None:
+                    await lease_controller.acquire()
+                suspended = False
+            if record.status is TaskStatus.PLANNED:
+                self._task_store.upsert(replace(record, status=TaskStatus.RUNNING))
+            return
 
     def _torrent_cancel_requested(self, task_id: str) -> bool:
         if self._cancel_signal is not None and self._cancel_signal.is_set():

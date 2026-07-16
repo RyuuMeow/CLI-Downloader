@@ -5,6 +5,7 @@ from threading import Event
 from unittest import TestCase
 
 from cli_downloader.application.download_service import DownloadService, WriteAssetsStage
+from cli_downloader.application.download_limiter import GalleryDownloadLimiter
 from cli_downloader.core.models import (
     Asset,
     AssetKind,
@@ -217,6 +218,93 @@ class RecordingTorrentClient:
 
 
 class DownloadServiceTest(TestCase):
+    def test_standalone_pause_releases_shared_item_slot_between_assets(self) -> None:
+        async def scenario(directory: Path) -> None:
+            limiter = GalleryDownloadLimiter(1, item_site_limit=1)
+            store_a = InMemoryTaskStore()
+            store_b = InMemoryTaskStore()
+            store_a.upsert(TaskRecord("task-a", TaskStatus.PLANNED))
+            store_b.upsert(TaskRecord("task-b", TaskStatus.PLANNED))
+            item_a = ResolvedItem("example", "example://a", "A")
+            item_b = ResolvedItem("example", "example://b", "B")
+            plan_a = DownloadStrategyPlan(
+                strategy=DownloadStrategy.DIRECT,
+                reason="test",
+                assets=AssetList(
+                    (
+                        Asset("https://example.test/a/1", AssetKind.FILE, "a-1.txt"),
+                        Asset("https://example.test/a/2", AssetKind.FILE, "a-2.txt"),
+                    )
+                ),
+            )
+            plan_b = DownloadStrategyPlan(
+                strategy=DownloadStrategy.DIRECT,
+                reason="test",
+                assets=AssetList((Asset("https://example.test/b/1", AssetKind.FILE, "b-1.txt"),)),
+            )
+            b_started = asyncio.Event()
+            b_release = asyncio.Event()
+
+            class Fetcher:
+                def __init__(
+                    self,
+                    started: asyncio.Event | None = None,
+                    release: asyncio.Event | None = None,
+                ) -> None:
+                    self.started = started
+                    self.release = release
+
+                async def fetch(self, asset):
+                    if self.started is not None:
+                        self.started.set()
+                    if self.release is not None:
+                        await self.release.wait()
+                    return asset.filename.encode()
+
+            def pause_after_first(current: int, _total: int) -> None:
+                if current == 1:
+                    record = store_a.get("task-a")
+                    assert record is not None
+                    store_a.upsert(record.transition(status=TaskStatus.PAUSED))
+
+            stage_a = WriteAssetsStage(
+                fetcher=Fetcher(),
+                file_writer=AssetFileWriter(directory / "a"),
+                task_store=store_a,
+                progress=pause_after_first,
+                download_limiter=limiter,
+            )
+            stage_b = WriteAssetsStage(
+                fetcher=Fetcher(b_started, b_release),
+                file_writer=AssetFileWriter(directory / "b"),
+                task_store=store_b,
+                download_limiter=limiter,
+            )
+            task_a = asyncio.create_task(
+                stage_a.run(PipelineContext("task-a", {"item": item_a, "plan": plan_a}))
+            )
+            await asyncio.sleep(0)
+            task_b = asyncio.create_task(
+                stage_b.run(PipelineContext("task-b", {"item": item_b, "plan": plan_b}))
+            )
+            try:
+                await asyncio.wait_for(b_started.wait(), timeout=1)
+                active = await limiter.active_snapshot()
+                self.assertEqual({row["root_id"] for row in active}, {"task-b"})
+                b_release.set()
+                record = store_a.get("task-a")
+                assert record is not None
+                store_a.upsert(record.transition(status=TaskStatus.PLANNED))
+                await asyncio.gather(task_a, task_b)
+            finally:
+                for task in (task_a, task_b):
+                    if not task.done():
+                        task.cancel()
+                await asyncio.gather(task_a, task_b, return_exceptions=True)
+
+        with TemporaryDirectory() as directory:
+            asyncio.run(scenario(Path(directory)))
+
     def test_torrent_checkpoint_persists_client_progress(self) -> None:
         store = InMemoryTaskStore()
         store.upsert(TaskRecord("task-1", TaskStatus.PLANNED))
