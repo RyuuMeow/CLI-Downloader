@@ -157,10 +157,32 @@ class ItemScheduler:
         async with self._lock:
             return self._waiting_snapshot_locked()
 
+    async def active_snapshot(self) -> tuple[dict[str, object], ...]:
+        """Return the currently granted Item leases for bounded diagnostics."""
+
+        async with self._lock:
+            return self._active_snapshot_locked()
+
     def waiting_snapshot_sync(self) -> tuple[dict[str, object], ...]:
         """Return a best-effort synchronous view for the synchronous Tasks UI."""
 
         return self._waiting_snapshot_locked()
+
+    def active_snapshot_sync(self) -> tuple[dict[str, object], ...]:
+        """Return a best-effort synchronous active-lease view for diagnostics."""
+
+        return self._active_snapshot_locked()
+
+    def _active_snapshot_locked(self) -> tuple[dict[str, object], ...]:
+        rows = [
+            {
+                "root_id": waiter.root_id,
+                "site_id": waiter.site_id,
+                "sequence": waiter.sequence,
+            }
+            for waiter in self._active.values()
+        ]
+        return tuple(sorted(rows, key=lambda row: (str(row["root_id"]), int(row["sequence"]))))
 
     def _waiting_snapshot_locked(self) -> tuple[dict[str, object], ...]:
         rows = []

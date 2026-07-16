@@ -100,3 +100,20 @@ class ItemSchedulerTest(IsolatedAsyncioTestCase):
         self.assertEqual(snapshot[0]["reason"], "global_slot")
         await first.release()
         await (await waiting).release()
+
+    async def test_active_snapshot_exposes_granted_root_and_site(self) -> None:
+        scheduler = ItemScheduler(2, 1)
+        first = await scheduler.acquire(root_id="batch-a", site_id="pixiv", sequence=3)
+        second = await scheduler.acquire(root_id="item-b", site_id="ehentai", sequence=0)
+
+        self.assertEqual(
+            await scheduler.active_snapshot(),
+            (
+                {"root_id": "batch-a", "site_id": "pixiv", "sequence": 3},
+                {"root_id": "item-b", "site_id": "ehentai", "sequence": 0},
+            ),
+        )
+
+        await first.release()
+        await second.release()
+        self.assertEqual(await scheduler.active_snapshot(), ())

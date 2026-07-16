@@ -51,7 +51,7 @@ and CLI argument forms remains out of scope.
 
 ### Status
 
-Planned. Investigation confirmed that the current behavior is an execution-boundary defect, not
+In progress. Investigation confirmed that the current behavior is an execution-boundary defect, not
 an IPC routing failure:
 
 - Owner IPC calls the same `TaskHierarchyService.pause()` path as the Shell, but returns a
@@ -67,6 +67,11 @@ an IPC routing failure:
 - The current pause tests prove only that a worker blocks at a cooperative boundary. They do not
   assert that another root can start, that active leases are zero, or that an IPC success means the
   task is actually quiescent. All 31 related existing tests pass despite the reported defect.
+
+The first reproduction slice is now in `tests/test_pause_contract.py`. It adds a bounded active-lease
+diagnostic to the shared Item Scheduler and two deterministic cross-root reproductions (active-root
+pause and waiting-root pause). Both are expected failures until P5-19 supplies root suspension and
+lease unwinding; they are intentionally kept as the contract gate for that repair.
 
 ### Contract And Reproduction Tests
 

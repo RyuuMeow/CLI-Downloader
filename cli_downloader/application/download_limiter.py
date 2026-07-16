@@ -108,8 +108,14 @@ class GalleryDownloadLimiter:
     async def waiting_snapshot(self) -> tuple[dict[str, object], ...]:
         return await self._scheduler.waiting_snapshot()
 
+    async def active_snapshot(self) -> tuple[dict[str, object], ...]:
+        return await self._scheduler.active_snapshot()
+
     def waiting_snapshot_sync(self) -> tuple[dict[str, object], ...]:
         return self._scheduler.waiting_snapshot_sync()
+
+    def active_snapshot_sync(self) -> tuple[dict[str, object], ...]:
+        return self._scheduler.active_snapshot_sync()
 
     async def request(
         self,
