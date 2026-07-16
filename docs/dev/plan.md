@@ -140,9 +140,9 @@ In progress. Batch direct streams now checkpoint each completed asset immediatel
 boundaries through the pause-aware control signal, and release both central and pipeline admission
 while paused. Successful Batch torrent submission invokes an admission-release callback so Core no
 longer occupies an Item slot during client polling. Standalone torrent polling releases its Item
-lease after the persisted client handle is known. Standalone completed-output hashes and direct
-partial checkpoints are verified; remaining work is completed-asset verification for interrupted
-Batch roots and a live-client restart matrix.
+lease after the persisted client handle is known. Standalone and Batch completed direct outputs
+are now hash-verified during recovery; a mismatched or missing output is requeued in one atomic
+child/asset update. Remaining work is the live-client torrent restart matrix.
 
 ### Direct Downloads
 
@@ -225,8 +225,10 @@ standalone Item workers can checkpoint to `PLANNED` without emitting cancellatio
 also publishes `STOPPING` and closes the IPC listener before draining. Standalone terminal
 boundaries now re-check owner shutdown and increment task revisions for checkpoints. Bounded drain
 now rotates the execution fence before the owner lease is released, late non-cooperative workers
-are discarded, and qBittorrent shutdown leaves the client task intact. Remaining work is full
-process-level restart coverage and repeated shutdown callback coverage:
+are discarded, and qBittorrent shutdown leaves the client task intact. An abrupt owner-process
+test now proves a WAIT client becomes a bounded typed disconnect with the accepted Task ID, and a
+replacement owner replays that request instead of executing it twice. Remaining work is full
+process-level Shell restart coverage and repeated shutdown callback coverage:
 
 - Historical cancellation-on-shutdown reproductions are retained in the acceptance tests as
   regression cases; the typed signal now routes owner shutdown through checkpoint paths.
@@ -276,15 +278,17 @@ output files when the checkpoint still exists, clears stale standalone run lease
 re-admission, and preserves recovered Task revision/run-generation identity. Direct streams persist
 an unfinished `.part` checkpoint and safely rebuild it on resume; stale owner fences are rotated
 before re-admission and late writes are rejected. Batch root recovery is transactional, partial
-explicitly partial checkpoints are never promoted to complete assets, and the last observed torrent
-state is persisted on owner shutdown. Remaining work is completed-asset verification for
-interrupted Batch roots and end-to-end restart reconciliation against a live torrent client:
+explicitly partial checkpoints are never promoted to complete assets, completed direct outputs are
+verified and atomically requeued when corrupted, and the last observed torrent state is persisted
+on owner shutdown. Remaining work is end-to-end restart reconciliation against a live torrent
+client:
 
 - Recovery now normalises active Batch children/assets back to queued states and clears stale Task
   run leases for both `RUNNING` and `PLANNED` records before `resume` admission. Parent, graph, and
   asset transitions commit atomically; a failed graph checkpoint rolls back the complete recovery
-  transaction. The latest full verification gate passes with 607 core tests plus all three
-  isolated plugin suites.
+  transaction. Recovery verifies direct completed assets with their persisted SHA-256 and rolls
+  corrupt outputs back to `QUEUED` in the same child/asset transaction. The focused P5 suites pass;
+  the full verification gate is rerun after this checkpoint.
 
 ### Recovery Matrix
 
@@ -327,8 +331,9 @@ In progress. The premature pre-listener `READY` publication was removed, and shu
 the owner `STOPPING` before closing IPC admission. Mutation requests remain rejected during
 `RECOVERING`; Textual and plain/embedded Shell paths now dispatch tracked startup recovery
 commands before publishing `READY`. Same-request retry after a typed RECOVERING rejection is now
-safe, and fully wired readiness/DETACH behavior is covered. Remaining work is process-level
-WAIT/DETACH restart testing and a deterministic second-restart readiness race test.
+safe, fully wired readiness/DETACH behavior is covered, and an abrupt owner-process WAIT test
+proves bounded disconnect plus request replay after restart. Remaining work is process-level
+Shell WAIT/DETACH restart testing and a deterministic second-restart readiness race test.
 
 ### Readiness Audit
 
