@@ -1428,7 +1428,12 @@ def _delete_task_records(
     blocked = tuple(
         node.task_id
         for node in candidates
-        if node.state in {TaskState.PREPARING, TaskState.QUEUED, TaskState.RUNNING}
+        if node.state in {
+            TaskState.PREPARING,
+            TaskState.QUEUED,
+            TaskState.RUNNING,
+            TaskState.PAUSING,
+        }
     )
     payload = {
         "matched": len(candidates),

@@ -102,7 +102,9 @@ BrowserAuthRunner = Callable[[str, BrowserAuthSchema], str]
 BrowserAuthValidator = Callable[[str, str], bool]
 ShutdownWarning = Callable[[], str | None]
 
-_AUTO_REFRESH_TASK_STATES = frozenset({TaskState.PREPARING, TaskState.QUEUED, TaskState.RUNNING})
+_AUTO_REFRESH_TASK_STATES = frozenset(
+    {TaskState.PREPARING, TaskState.QUEUED, TaskState.RUNNING, TaskState.PAUSING}
+)
 _PLUGIN_STATUS_MIN_WIDTH = 18
 
 
@@ -3362,6 +3364,7 @@ class TextualShellApp(App[int]):
             TaskState.PREPARING,
             TaskState.QUEUED,
             TaskState.RUNNING,
+            TaskState.PAUSING,
             TaskState.PAUSED,
         }
         cancel.display = allow_lifecycle_control and not cancel.disabled
@@ -4059,6 +4062,7 @@ def _display_status(value: str, translator: TranslationService | None = None) ->
         "pending_resolution": "status.waiting",
         "resolving": "status.preparing",
         "running": "status.in_progress",
+        "pausing": "status.pausing",
         "queued": "status.queued",
         "downloading": "status.downloading",
         "completed": "status.completed",
@@ -4078,6 +4082,7 @@ def _display_status(value: str, translator: TranslationService | None = None) ->
         "pending_resolution": "Waiting",
         "resolving": "Preparing",
         "running": "In progress",
+        "pausing": "Pausing",
         "queued": "Queued",
         "downloading": "Downloading",
         "completed": "Completed",

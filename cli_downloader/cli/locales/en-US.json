@@ -63,6 +63,7 @@
   "status.waiting": "Waiting",
   "status.preparing": "Preparing",
   "status.in_progress": "In progress",
+  "status.pausing": "Pausing",
   "status.queued": "Queued",
   "status.downloading": "Downloading",
   "status.completed": "Completed",

@@ -16,6 +16,7 @@ class TaskState(StrEnum):
     PREPARING = "preparing"
     QUEUED = "queued"
     RUNNING = "running"
+    PAUSING = "pausing"
     PAUSED = "paused"
     COMPLETED = "completed"
     PARTIALLY_COMPLETED = "partially_completed"

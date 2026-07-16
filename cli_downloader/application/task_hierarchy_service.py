@@ -488,7 +488,7 @@ class TaskHierarchyService:
         return TaskRootSummary(
             task_id=parent_id,
             kind=TaskKind.BATCH,
-            state=_STANDALONE_STATES[record.status],
+            state=_task_state_for_record(record),
             title=summary.title or parent_id[:8],
             progress=TaskProgress(
                 completed_files=summary.completed_files,
@@ -730,7 +730,7 @@ class TaskHierarchyService:
         record = self._task_store.get(task_id)
         if record is None or record.kind is not TaskKind.BATCH:
             raise TaskNotFoundError(f"batch task record not found: {task_id}")
-        return _STANDALONE_STATES[record.status]
+        return _task_state_for_record(record)
 
     def _standalone_node(self, record: TaskRecord) -> TaskNode:
         output_files = tuple(
@@ -790,7 +790,7 @@ class TaskHierarchyService:
         return TaskNode(
             task_id=record.task_id,
             kind=TaskKind.ITEM,
-            state=_STANDALONE_STATES[record.status],
+            state=_task_state_for_record(record),
             title=record.title or record.task_id,
             progress=TaskProgress(
                 completed_files=completed,
@@ -899,6 +899,15 @@ def _control_is_applied(record: TaskRecord, action: str) -> bool:
         record.desired_control is TaskDesiredControl.CANCEL
         and record.status in _TERMINAL_TASK_STATUSES
     )
+
+
+def _task_state_for_record(record: TaskRecord) -> TaskState:
+    if (
+        record.status is TaskStatus.RUNNING
+        and record.desired_control is TaskDesiredControl.PAUSE
+    ):
+        return TaskState.PAUSING
+    return _STANDALONE_STATES[record.status]
 
 
 def _folder_from_task_metadata(metadata: Mapping[str, object]) -> str | None:
