@@ -229,15 +229,10 @@ standalone Item workers can checkpoint to `PLANNED` without emitting cancellatio
 also publishes `STOPPING` and closes the IPC listener before draining. Bounded-drain fencing,
 paused-root preservation, and qBittorrent shutdown reconciliation remain:
 
-- A running standalone Item may commit `CANCELED` after shutdown first normalises it to `PLANNED`.
-- A running Batch calls `BatchPipeline.cancel()`, which may persist unfinished entries, children,
-  and assets as `CANCELLED` and finish the parent as canceled.
-- A paused Batch still owns a live worker. Shell shutdown releases its pause wait through the same
-  cancel path, so a task that should remain paused may become canceled before process exit.
-- Torrent polling interprets the Event as a client cancel request, so closing the Shell may cancel
-  the external torrent instead of leaving a recoverable checkpoint.
-- The final shutdown normalisation intentionally leaves terminal statuses unchanged, so a late
-  worker `CANCELED` commit wins over the earlier recoverable `PLANNED` state.
+- Historical cancellation-on-shutdown reproductions are retained in the acceptance tests as
+  regression cases; the typed signal now routes owner shutdown through checkpoint paths.
+- Remaining lifecycle work is bounded drain behavior for non-cooperative workers, paused-root
+  preservation across the full Shell close path, and fencing standalone late writers.
 
 ### Shutdown Control Model
 
@@ -281,15 +276,9 @@ and assets to schedulable queued states without creating retry attempts, and ski
 standalone output files when the checkpoint still exists. Transactional root recovery, partial-file
 verification, torrent reconciliation, and stale-run fencing remain:
 
-- Startup previously converted active Batch entries, children, and assets to `CANCELLED`, then
-  started `batches retry`; this recorded interruption as cancellation/retry instead of recovery.
-- `BatchResumeService.plan_resume()` includes `DOWNLOADING` children, but `BatchPipeline.run_batch()`
-  initially queues only `QUEUED` children. A real downloading checkpoint is therefore not resumed
-  by the resume path without the cancellation/retry conversion.
-- Standalone recovery reuses the Task ID and metadata but does not yet prove that completed assets
-  are skipped. Re-resolving a gallery may download completed files again.
-- Running standalone recovery changes `RUNNING` to `PLANNED` without clearing the stale active run
-  lease in the same normalisation step.
+- Recovery now normalises active Batch children/assets back to queued states and clears stale Task
+  run leases before `resume` admission. Remaining gaps are transactional root recovery, full
+  partial-file verification, and standalone/torrent stale-writer fencing.
 
 ### Recovery Matrix
 
