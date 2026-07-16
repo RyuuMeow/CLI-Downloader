@@ -463,9 +463,10 @@ class _StandaloneLeaseController:
         self._site_id = site_id
         self._cancelled = cancelled
         self._lease = None
+        self._detached = False
 
     async def acquire(self) -> None:
-        if self._lease is None and not self._cancelled():
+        if self._lease is None and not self._detached and not self._cancelled():
             self._lease = await self._limiter.acquire_item(
                 root_id=self._task_id,
                 site_id=self._site_id,
@@ -475,6 +476,10 @@ class _StandaloneLeaseController:
         lease, self._lease = self._lease, None
         if lease is not None:
             await lease.release()
+
+    async def detach(self) -> None:
+        self._detached = True
+        await self.release()
 
 
 class WriteAssetsStage:
@@ -771,6 +776,12 @@ class WriteAssetsStage:
                     descriptor_path=written.path,
                     status="submitted",
                 )
+
+            # qBittorrent owns the long-running transfer after the handle is
+            # known. Core no longer consumes an Item admission slot while it
+            # polls that external task.
+            if lease_controller is not None:
+                await lease_controller.detach()
 
             def _status_callback(outcome: TorrentOutcome) -> None:
                 self._persist_torrent_outcome(context.task_id, asset, outcome)

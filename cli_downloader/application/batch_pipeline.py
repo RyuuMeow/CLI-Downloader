@@ -140,6 +140,7 @@ class _TaskControl:
     worker_id: str | None = None
     pause_boundary: Callable[[], Awaitable[None]] | None = None
     resume_boundary: Callable[[], Awaitable[None]] | None = None
+    admission_release: Callable[[], Awaitable[None]] | None = None
 
     def is_set(self) -> bool:
         return self.state.cancel_event.is_set() or self.task_id in self.state.cancelled_ids
@@ -185,6 +186,10 @@ class _TaskControl:
         if not self.is_set() and self.resume_boundary is not None:
             await self.resume_boundary()
 
+    async def release_admission(self) -> None:
+        if self.admission_release is not None:
+            await self.admission_release()
+
 
 class _ItemLeaseController:
     """Release and reacquire one central Item lease around pause checkpoints."""
@@ -204,9 +209,10 @@ class _ItemLeaseController:
         self._sequence = sequence
         self._cancelled = cancelled
         self._lease = None
+        self._detached = False
 
     async def acquire(self) -> None:
-        if self._lease is None and not self._cancelled():
+        if self._lease is None and not self._detached and not self._cancelled():
             self._lease = await self._limiter.acquire_item(
                 root_id=self._root_id,
                 site_id=self._site_id,
@@ -224,6 +230,10 @@ class _ItemLeaseController:
     async def resume_boundary(self) -> None:
         await self.acquire()
 
+    async def detach(self) -> None:
+        self._detached = True
+        await self.release()
+
 
 class _SemaphoreLeaseController:
     """Make pipeline backpressure permits pause-safe and idempotently releasable."""
@@ -231,9 +241,10 @@ class _SemaphoreLeaseController:
     def __init__(self, *semaphores: asyncio.Semaphore) -> None:
         self._semaphores = semaphores
         self._acquired = 0
+        self._detached = False
 
     async def acquire(self) -> None:
-        while self._acquired < len(self._semaphores):
+        while not self._detached and self._acquired < len(self._semaphores):
             try:
                 await self._semaphores[self._acquired].acquire()
             except BaseException:
@@ -252,6 +263,10 @@ class _SemaphoreLeaseController:
     async def resume_boundary(self) -> None:
         await self.acquire()
 
+    async def detach(self) -> None:
+        self._detached = True
+        await self.release()
+
 
 def _compose_pause_boundaries(
     controllers: tuple[object, ...],
@@ -265,6 +280,14 @@ def _compose_pause_boundaries(
             await controller.resume_boundary()
 
     return pause, resume
+
+
+def _compose_admission_release(controllers: tuple[object, ...]) -> Callable[[], Awaitable[None]]:
+    async def release() -> None:
+        for controller in controllers:
+            await controller.detach()
+
+    return release
 
 
 def _mark_worker_boundary(state: _RunState, parent_id: str, worker_id: str, is_safe: bool) -> None:
@@ -909,7 +932,12 @@ class BatchPipeline:
             raise
         controllers.append(slot_controller)
         pause_boundary, resume_boundary = _compose_pause_boundaries(tuple(controllers))
-        control = replace(control, pause_boundary=pause_boundary, resume_boundary=resume_boundary)
+        control = replace(
+            control,
+            pause_boundary=pause_boundary,
+            resume_boundary=resume_boundary,
+            admission_release=_compose_admission_release(tuple(controllers)),
+        )
         try:
             await self._execute_download_child(
                 parent_id,

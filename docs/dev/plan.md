@@ -141,6 +141,15 @@ admission and the remaining acquisition race coverage are still pending.
 
 ## P5-20 Add Quiescent Direct And Torrent Checkpoints
 
+### Status
+
+In progress. Batch direct streams now checkpoint each completed asset immediately, wait at chunk
+boundaries through the pause-aware control signal, and release both central and pipeline admission
+while paused. Successful Batch torrent submission invokes an admission-release callback so Core no
+longer occupies an Item slot during client polling. Standalone torrent polling releases its Item
+lease after the persisted client handle is known. Partial-file close/resume integrity and full
+restart reconciliation remain to be verified.
+
 ### Direct Downloads
 
 - Change the Batch executor contract from one opaque whole-child call to checkpointed asset

@@ -436,12 +436,18 @@ class SystemBatchDownloader(BatchDownloadExecutor):
         if child.package.strategy == DownloadStrategy.TORRENT:
             return await self._execute_torrent(child, assets, cancel_event, progress)
         outcomes: list[AssetRecord] = []
+
+        def append_outcome(outcome: AssetRecord) -> None:
+            outcomes.append(outcome)
+            if self._store is not None:
+                self._store.update_asset(child.child_id, outcome)
+
         for record in assets:
             wait_if_paused = getattr(cancel_event, "wait_if_paused", None)
             if callable(wait_if_paused):
                 await wait_if_paused()
             if cancel_event.is_set():
-                outcomes.append(replace(record, status=AssetStatus.CANCELLED))
+                append_outcome(replace(record, status=AssetStatus.CANCELLED))
                 continue
             legacy_asset = _legacy_asset(record.asset)
             resumed = None
@@ -464,7 +470,7 @@ class SystemBatchDownloader(BatchDownloadExecutor):
                         folder_template=child.package.folder_template,
                     )
             if resumed is not None:
-                outcomes.append(
+                append_outcome(
                     replace(
                         record,
                         status=AssetStatus.COMPLETED,
@@ -492,6 +498,8 @@ class SystemBatchDownloader(BatchDownloadExecutor):
                     last_report_time = 0.0
                     try:
                         async for chunk, total in fetcher.fetch_stream(legacy_asset):
+                            if callable(wait_if_paused):
+                                await wait_if_paused()
                             hash_obj.update(chunk)
                             bytes_so_far += len(chunk)
                             now = time.monotonic()
@@ -546,7 +554,7 @@ class SystemBatchDownloader(BatchDownloadExecutor):
                     actual_error = error.__cause__ if is_fetch_error and error.__cause__ else error
                     stage = FailureStage.FETCH if is_fetch_error else FailureStage.WRITE
 
-                    outcomes.append(
+                    append_outcome(
                         replace(
                             _failed_record(record, actual_error, stage),
                             partial_path=str(partial) if partial.exists() else None,
@@ -570,7 +578,7 @@ class SystemBatchDownloader(BatchDownloadExecutor):
                         else await fetch_asset()
                     )
                 except Exception as error:
-                    outcomes.append(_failed_record(record, error, FailureStage.FETCH))
+                    append_outcome(_failed_record(record, error, FailureStage.FETCH))
                     continue
                 digest = sha256(content).hexdigest()
                 try:
@@ -588,7 +596,7 @@ class SystemBatchDownloader(BatchDownloadExecutor):
                         folder_fields=_package_folder_fields(child.package),
                         folder_template=child.package.folder_template,
                     )
-                    outcomes.append(
+                    append_outcome(
                         replace(
                             _failed_record(record, error, FailureStage.WRITE),
                             partial_path=str(partial) if partial.exists() else None,
@@ -597,7 +605,7 @@ class SystemBatchDownloader(BatchDownloadExecutor):
                     )
                     continue
 
-            outcomes.append(
+            append_outcome(
                 replace(
                     record,
                     status=AssetStatus.COMPLETED,
@@ -834,6 +842,9 @@ class SystemBatchDownloader(BatchDownloadExecutor):
             outcomes.append(resumed_record)
 
         # Phase 2: poll all added torrents until completion.
+        release_admission = getattr(cancel_event, "release_admission", None)
+        if pending and callable(release_admission):
+            await release_admission()
         for idx, handle, written_record in pending:
 
             def _cancel_requested() -> bool:
