@@ -17,6 +17,7 @@ import os
 from pathlib import Path
 from threading import Event, Lock, Thread, current_thread
 from time import monotonic
+from uuid import uuid4
 
 from cli_downloader.application.task_hierarchy_service import TaskHierarchyService
 from cli_downloader.application.execution_control import ExecutionStopSignal
@@ -814,8 +815,12 @@ def _recover_interrupted_downloads(
 
     commands = []
     for record in sorted(task_store.list(), key=lambda value: (value.created_at, value.task_id)):
-        if record.status is TaskStatus.PAUSED and record.active_run_id is not None:
-            record = record.transition(active_run_id=None)
+        if record.status is TaskStatus.PAUSED:
+            record = record.transition(
+                active_run_id=None,
+                desired_control=TaskDesiredControl.PAUSE,
+                metadata={**record.metadata, "execution_fence": uuid4().hex},
+            )
             task_store.upsert(record)
         if (
             record.status not in {TaskStatus.PLANNED, TaskStatus.RUNNING}
@@ -834,6 +839,7 @@ def _recover_interrupted_downloads(
                     status=TaskStatus.PLANNED,
                     desired_control=TaskDesiredControl.RUN,
                     active_run_id=None,
+                    metadata={**record.metadata, "execution_fence": uuid4().hex},
                 )
             )
         elif record.status is TaskStatus.PLANNED and record.active_run_id is not None:
@@ -843,6 +849,7 @@ def _recover_interrupted_downloads(
                 record.transition(
                     desired_control=TaskDesiredControl.RUN,
                     active_run_id=None,
+                    metadata={**record.metadata, "execution_fence": uuid4().hex},
                 )
             )
         commands.append(("tasks", "resume", record.task_id, "--json"))
@@ -853,6 +860,16 @@ def _recover_interrupted_downloads(
             if parent_record is None or parent_record.kind is not TaskKind.BATCH:
                 continue
             if parent_record.status is TaskStatus.PAUSED:
+                task_store.upsert(
+                    parent_record.transition(
+                        active_run_id=None,
+                        desired_control=TaskDesiredControl.PAUSE,
+                        metadata={
+                            **parent_record.metadata,
+                            "execution_fence": uuid4().hex,
+                        },
+                    )
+                )
                 continue
             if parent_record.status in {
                 TaskStatus.PENDING,
@@ -864,6 +881,18 @@ def _recover_interrupted_downloads(
                         status=TaskStatus.PLANNED,
                         desired_control=TaskDesiredControl.RUN,
                         active_run_id=None,
+                        metadata={
+                            **parent_record.metadata,
+                            "execution_fence": uuid4().hex,
+                        },
+                    )
+                    task_store.upsert(parent_record)
+                elif parent_record.status in {TaskStatus.PENDING, TaskStatus.PLANNED}:
+                    parent_record = parent_record.transition(
+                        metadata={
+                            **parent_record.metadata,
+                            "execution_fence": uuid4().hex,
+                        }
                     )
                     task_store.upsert(parent_record)
                 for entry_id in batch_store.get_snapshot(parent_id).parent.entry_ids:

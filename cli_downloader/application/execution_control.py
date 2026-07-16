@@ -10,6 +10,10 @@ class OwnerShutdownRequested(Exception):
     """Internal signal that asks a pipeline to return a resumable checkpoint."""
 
 
+class OwnerExecutionFenced(Exception):
+    """The worker belongs to an older owner/run and must not write state."""
+
+
 class ExecutionStopReason(StrEnum):
     USER_CANCEL = "user_cancel"
     OWNER_SHUTDOWN = "owner_shutdown"

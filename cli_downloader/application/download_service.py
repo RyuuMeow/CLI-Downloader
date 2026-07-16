@@ -8,7 +8,10 @@ from typing import Callable, Mapping, Protocol
 from uuid import uuid4
 
 from cli_downloader.core.environment import EnvironmentContext, diagnose_environment
-from cli_downloader.application.execution_control import OwnerShutdownRequested
+from cli_downloader.application.execution_control import (
+    OwnerExecutionFenced,
+    OwnerShutdownRequested,
+)
 from cli_downloader.core.errors import AdapterResolutionError
 from cli_downloader.core.events import TaskEvent
 from cli_downloader.core.fetch import AssetFetcher
@@ -219,6 +222,8 @@ class DownloadService:
                 events=(),
             )
 
+        execution_fence = record.metadata.get("execution_fence")
+        execution_fence = execution_fence if isinstance(execution_fence, str) else None
         try:
             result_context = await PipelineRunner(
                 (
@@ -233,6 +238,7 @@ class DownloadService:
                         download_limiter=download_limiter,
                         torrent_client=self._torrent_client,
                         auto_delete_torrent_file=self._auto_delete_torrent_file,
+                        execution_fence=execution_fence,
                     ),
                     CompleteTaskStage(self._task_store),
                 )
@@ -251,6 +257,10 @@ class DownloadService:
             )
             self._task_store.upsert(checkpoint)
             self._upsert_history_record(checkpoint, finished=False)
+            raise
+        except OwnerExecutionFenced:
+            # A newer owner has already rotated the durable execution fence.
+            # Do not overwrite its state with a failure/cancellation outcome.
             raise
         except asyncio.CancelledError:
             cancelled = (self._task_store.get(record.task_id) or record).transition(
@@ -382,6 +392,12 @@ class DownloadService:
                 "platform": self._environment.platform,
                 "terminal_interactive": self._environment.terminal.interactive,
                 "terminal_hyperlink": self._environment.terminal.hyperlink,
+                "execution_fence": (
+                    existing.metadata.get("execution_fence")
+                    if existing is not None
+                    and isinstance(existing.metadata.get("execution_fence"), str)
+                    else uuid4().hex
+                ),
                 **(
                     {
                         "output_folder_template": self._output_folder_template,
@@ -525,6 +541,7 @@ class WriteAssetsStage:
         download_limiter: GalleryDownloadLimiter | None = None,
         torrent_client: TorrentClient | None = None,
         auto_delete_torrent_file: bool = True,
+        execution_fence: str | None = None,
     ) -> None:
         self._fetcher = fetcher
         self._file_writer = file_writer
@@ -535,6 +552,7 @@ class WriteAssetsStage:
         self._download_limiter = download_limiter
         self._torrent_client = torrent_client
         self._auto_delete_torrent_file = auto_delete_torrent_file
+        self._execution_fence = execution_fence
 
     async def run(self, context: PipelineContext) -> PipelineContext:
         controller = None
@@ -569,6 +587,8 @@ class WriteAssetsStage:
         item = context.data["item"]
         if not isinstance(item, ResolvedItem):
             raise TypeError("pipeline context item must be a ResolvedItem")
+
+        self._assert_execution_fence(context.task_id)
 
         if plan.strategy is DownloadStrategy.TORRENT:
             return await self._run_torrent(
@@ -614,6 +634,7 @@ class WriteAssetsStage:
                 context.task_id,
                 lease_controller=lease_controller,
             )
+            self._assert_execution_fence(context.task_id)
             if self._cancel_signal is not None and self._cancel_signal.is_set():
                 raise asyncio.CancelledError
 
@@ -666,6 +687,7 @@ class WriteAssetsStage:
                         folder_template=folder_template,
                     )
 
+                self._assert_execution_fence(context.task_id)
                 written_asset = (
                     await self._download_limiter.request(item.site_id, fetch_and_write)
                     if self._download_limiter is not None
@@ -687,6 +709,7 @@ class WriteAssetsStage:
                 )
                 if self._cancel_signal is not None and self._cancel_signal.is_set():
                     raise asyncio.CancelledError
+                self._assert_execution_fence(context.task_id)
                 written_assets.append(
                     self._file_writer.write(
                         asset,
@@ -696,6 +719,7 @@ class WriteAssetsStage:
                         folder_template=folder_template,
                     )
                 )
+            self._assert_execution_fence(context.task_id)
             current = self._task_store.get(context.task_id)
             if current is None:
                 raise RuntimeError(f"task disappeared during download: {context.task_id}")
@@ -738,6 +762,7 @@ class WriteAssetsStage:
         record = self._task_store.get(context.task_id)
         if record is None:
             raise RuntimeError(f"task disappeared before torrent download: {context.task_id}")
+        self._assert_execution_fence(context.task_id)
         folder_fields = record.metadata.get("output_folder_fields")
         if not isinstance(folder_fields, Mapping):
             folder_fields = _item_folder_fields(item)
@@ -764,6 +789,7 @@ class WriteAssetsStage:
                 context.task_id,
                 lease_controller=lease_controller,
             )
+            self._assert_execution_fence(context.task_id)
             if self._cancel_signal is not None and self._cancel_signal.is_set():
                 raise asyncio.CancelledError
 
@@ -933,6 +959,7 @@ class WriteAssetsStage:
         descriptor_path: Path,
         status: str,
     ) -> None:
+        self._assert_execution_fence(task_id)
         current = self._task_store.get(task_id)
         if current is None:
             raise RuntimeError(f"task disappeared during torrent download: {task_id}")
@@ -971,6 +998,7 @@ class WriteAssetsStage:
     def _persist_torrent_outcome(
         self, task_id: str, asset: Asset, outcome: TorrentOutcome
     ) -> None:
+        self._assert_execution_fence(task_id)
         current = self._task_store.get(task_id)
         if current is None:
             raise RuntimeError(f"task disappeared during torrent download: {task_id}")
@@ -1007,6 +1035,7 @@ class WriteAssetsStage:
             record = self._task_store.get(task_id)
             if record is None:
                 raise RuntimeError(f"task disappeared during download: {task_id}")
+            self._assert_execution_fence(task_id)
             if self._shutdown_requested():
                 if self._download_limiter is not None:
                     self._download_limiter.suspend_root_sync(task_id)
@@ -1043,6 +1072,16 @@ class WriteAssetsStage:
         signal = self._cancel_signal
         checker = getattr(signal, "is_owner_shutdown", None)
         return callable(checker) and bool(checker())
+
+    def _assert_execution_fence(self, task_id: str) -> None:
+        if self._execution_fence is None:
+            return
+        current = self._task_store.get(task_id)
+        if current is None:
+            raise OwnerExecutionFenced(f"task disappeared during fenced execution: {task_id}")
+        actual = current.metadata.get("execution_fence")
+        if actual != self._execution_fence:
+            raise OwnerExecutionFenced(f"execution fence changed for task: {task_id}")
 
     def _torrent_cancel_requested(self, task_id: str) -> bool:
         if self._shutdown_requested():

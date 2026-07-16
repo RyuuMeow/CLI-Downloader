@@ -6,7 +6,11 @@ from unittest import TestCase
 
 from cli_downloader.application.download_service import DownloadService, WriteAssetsStage
 from cli_downloader.application.download_limiter import GalleryDownloadLimiter
-from cli_downloader.application.execution_control import ExecutionStopSignal, OwnerShutdownRequested
+from cli_downloader.application.execution_control import (
+    ExecutionStopSignal,
+    OwnerExecutionFenced,
+    OwnerShutdownRequested,
+)
 from cli_downloader.core.models import (
     Asset,
     AssetKind,
@@ -297,6 +301,47 @@ class DownloadServiceTest(TestCase):
             self.assertIsNotNone(record)
             self.assertEqual(record.status, TaskStatus.RUNNING)
             self.assertEqual(record.revision, 2)
+
+    def test_old_owner_fence_stops_standalone_worker_without_failure(self) -> None:
+        with TemporaryDirectory() as directory:
+            store = InMemoryTaskStore()
+            store.upsert(
+                TaskRecord(
+                    "fenced-task",
+                    TaskStatus.PLANNED,
+                    metadata={"execution_fence": "new-owner"},
+                )
+            )
+            stage = WriteAssetsStage(
+                fetcher=StaticFetcher(),
+                file_writer=AssetFileWriter(Path(directory)),
+                task_store=store,
+                execution_fence="old-owner",
+            )
+            plan = DownloadStrategyPlan(
+                strategy=DownloadStrategy.DIRECT,
+                reason="test",
+                assets=AssetList(
+                    (Asset("https://example.test/asset", AssetKind.FILE, "fenced.txt"),)
+                ),
+            )
+
+            async def run() -> None:
+                with self.assertRaises(OwnerExecutionFenced):
+                    await stage._run(
+                        PipelineContext(
+                            "fenced-task",
+                            data={
+                                "item": ResolvedItem(
+                                    "example", "example://fenced", "Fenced"
+                                ),
+                                "plan": plan,
+                            },
+                        )
+                    )
+
+            asyncio.run(run())
+            self.assertEqual(store.get("fenced-task").status, TaskStatus.PLANNED)
 
     def test_standalone_pause_releases_shared_item_slot_between_assets(self) -> None:
         async def scenario(directory: Path) -> None:

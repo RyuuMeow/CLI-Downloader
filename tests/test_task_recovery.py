@@ -186,6 +186,30 @@ class TaskRecoveryTest(TestCase):
             self.assertEqual(recovered.run_generation, 7)
             self.assertEqual(commands[0][2], "stale-running")
 
+    def test_recovery_rotates_execution_fence_for_old_owner(self) -> None:
+        with TemporaryDirectory() as directory:
+            store = StateTaskStore(Path(directory) / "state.sqlite3")
+            store.upsert(
+                TaskRecord(
+                    task_id="fenced-running",
+                    status=TaskStatus.RUNNING,
+                    active_run_id="old-owner-run",
+                    source_url="https://example.test/gallery/fenced-running",
+                    metadata={
+                        "scheduler_managed": True,
+                        "execution_fence": "old-owner",
+                    },
+                )
+            )
+
+            _recover_interrupted_downloads(store)
+
+            recovered = store.get("fenced-running")
+            self.assertNotEqual(
+                recovered.metadata.get("execution_fence"),
+                "old-owner",
+            )
+
     def test_non_managed_and_stable_tasks_ignored(self) -> None:
         with TemporaryDirectory() as directory:
             store = StateTaskStore(Path(directory) / "state.sqlite3")
