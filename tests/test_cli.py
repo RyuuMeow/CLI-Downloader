@@ -92,7 +92,7 @@ class CLITest(TestCase):
         self.assertEqual(payload["operation_result"]["result_kind"], "gallery")
         self.assertFalse(payload["network_request_performed"])
 
-    def test_download_example_list_json_defaults_to_all_current_items(self) -> None:
+    def test_download_example_list_json_defaults_to_all_pages(self) -> None:
         stream = StringIO()
 
         with TemporaryDirectory() as directory:
@@ -106,8 +106,8 @@ class CLITest(TestCase):
 
         payload = json.loads(stream.getvalue())
         self.assertEqual(exit_code, 0)
-        self.assertEqual(payload["batch"]["counts"]["completed"], 2)
-        self.assertEqual(len(payload["output_files"]), 4)
+        self.assertEqual(payload["batch"]["counts"]["completed"], 4)
+        self.assertEqual(len(payload["output_files"]), 8)
 
     def test_download_example_list_json_confirms_selection_and_reports_duplicates(self) -> None:
         first_stream = StringIO()

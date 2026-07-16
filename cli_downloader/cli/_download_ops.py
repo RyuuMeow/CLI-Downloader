@@ -437,10 +437,20 @@ def _run_generic_download(
                 render_mode,
             )
         if selection_policy is ListSelectionPolicy.ALL:
-            return _run_confirmed_list_batch(
+            items, error = _collect_all_list_items(
                 result,
-                tuple(item.item_id for item in data.items),
-                source_url=url,
+                dispatcher=dispatcher,
+                url=url,
+                operation_params=operation_params,
+                profile=profile,
+                cancellation=cancellation,
+            )
+            if error is not None:
+                return _print_batch_selection_error(error, render_mode)
+            return _run_selected_list_batch(
+                items,
+                batch_source_url=url,
+                batch_title=data.title,
                 runtime=runtime,
                 render_mode=render_mode,
                 profile=profile,
@@ -487,6 +497,69 @@ def _run_generic_download(
                 on_accept=on_accept,
             )
         return 1
+
+
+def _collect_all_list_items(
+    initial_result: OperationResult,
+    *,
+    dispatcher: OperationDispatcher,
+    url: str,
+    operation_params: Mapping[str, object],
+    profile: str | None,
+    cancellation: Event | None,
+) -> tuple[tuple[ListItemData, ...], str | None]:
+    """Load every page represented by a list result for CLI bulk downloads."""
+
+    initial_data = initial_result.data
+    if not isinstance(initial_data, ListPageData):
+        return (), "The current result is not a list page."
+
+    page_info = initial_data.page_info
+    total_pages = page_info.total_pages
+    if total_pages is None and page_info.total_items is not None:
+        total_pages = max(
+            1,
+            (page_info.total_items + page_info.page_size - 1) // page_info.page_size,
+        )
+
+    pages: dict[int, ListPageData] = {page_info.current_page: initial_data}
+    if total_pages is not None:
+        target_pages = range(1, total_pages + 1)
+    else:
+        # Token-only pagination still uses the core page parameter convention.
+        # Start at page 1 so a URL pointing at a later page still means all items.
+        target_pages = range(1, 10_001)
+
+    for page_number in target_pages:
+        if cancellation is not None and cancellation.is_set():
+            return (), "Batch selection was cancelled."
+        page = pages.get(page_number)
+        if page is None:
+            page_result = _dispatch_operation(
+                dispatcher,
+                url,
+                params={**operation_params, "page": page_number},
+                profile=profile,
+                confirmations=_EXPLICIT_DOWNLOAD_CONFIRMATIONS,
+            )
+            page = page_result.data if page_result.result_kind is ResultKind.LIST_PAGE else None
+            if not isinstance(page, ListPageData):
+                return (), f"Could not load Batch page {page_number}."
+            if page.page_info.current_page != page_number:
+                return (), f"Batch page {page_number} returned an unexpected page."
+            pages[page_number] = page
+
+        if total_pages is None and page.page_info.next_token is None:
+            break
+    else:
+        if total_pages is None:
+            return (), "Batch pagination exceeded the 10000-page safety limit."
+
+    items_by_id: dict[str, ListItemData] = {}
+    for page_number in sorted(pages):
+        for item in pages[page_number].items:
+            items_by_id.setdefault(item.item_id, item)
+    return tuple(items_by_id.values()), None
 
 
 def _download_generic_gallery(
