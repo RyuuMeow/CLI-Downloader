@@ -162,6 +162,30 @@ class TaskRecoveryTest(TestCase):
             self.assertEqual(len(commands), 1)
             self.assertEqual(commands[0][2], "resumed-task")
 
+    def test_running_task_recovery_clears_stale_run_lease(self) -> None:
+        with TemporaryDirectory() as directory:
+            store = StateTaskStore(Path(directory) / "state.sqlite3")
+            store.upsert(
+                TaskRecord(
+                    task_id="stale-running",
+                    status=TaskStatus.RUNNING,
+                    desired_control=TaskDesiredControl.RUN,
+                    active_run_id="old-owner-run",
+                    run_generation=7,
+                    source_url="https://example.test/gallery/stale-running",
+                    metadata={"scheduler_managed": True},
+                )
+            )
+
+            commands = _recover_interrupted_downloads(store)
+
+            recovered = store.get("stale-running")
+            self.assertEqual(recovered.status, TaskStatus.PLANNED)
+            self.assertEqual(recovered.desired_control, TaskDesiredControl.RUN)
+            self.assertIsNone(recovered.active_run_id)
+            self.assertEqual(recovered.run_generation, 7)
+            self.assertEqual(commands[0][2], "stale-running")
+
     def test_non_managed_and_stable_tasks_ignored(self) -> None:
         with TemporaryDirectory() as directory:
             store = StateTaskStore(Path(directory) / "state.sqlite3")

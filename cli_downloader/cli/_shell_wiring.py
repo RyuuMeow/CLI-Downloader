@@ -826,7 +826,25 @@ def _recover_interrupted_downloads(
         if record.status is TaskStatus.PAUSED:
             continue
         if record.status is TaskStatus.RUNNING:
-            task_store.upsert(replace(record, status=TaskStatus.PLANNED))
+            # The old owner no longer exists after a restart.  Do not leave
+            # its run lease attached to the resumable record: the next
+            # ``tasks resume`` must be able to claim a fresh generation.
+            task_store.upsert(
+                record.transition(
+                    status=TaskStatus.PLANNED,
+                    desired_control=TaskDesiredControl.RUN,
+                    active_run_id=None,
+                )
+            )
+        elif record.status is TaskStatus.PLANNED and record.active_run_id is not None:
+            # A planned task can also contain a stale lease when the previous
+            # owner stopped between its checkpoint and durable status write.
+            task_store.upsert(
+                record.transition(
+                    desired_control=TaskDesiredControl.RUN,
+                    active_run_id=None,
+                )
+            )
         commands.append(("tasks", "resume", record.task_id, "--json"))
 
     if batch_store is not None:
