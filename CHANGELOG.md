@@ -2,6 +2,14 @@
 
 All notable changes to CLI-Downloader will be documented in this file.
 
+## v0.1.1 - 2026-07-27
+
+### Fixed
+
+- Prevented `AttributeError` crash when invoking `clid plugins` without subcommands; now displays plugin command help.
+
+---
+
 ## v0.1.0 - 2026-07-27
 
 ### Initial Release
