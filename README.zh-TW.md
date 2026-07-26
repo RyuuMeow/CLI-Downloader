@@ -5,235 +5,170 @@
 </p>
 
 <p align="center">
-  <img src="assets/icon/CLI-Downloader.png" width="128" alt="CLI-Downloader 圖示">
+  <img src="assets/icon/CLI-Downloader.png" width="128" alt="CLI-Downloader icon">
 </p>
 
-<h1 align="center">CLI-Downloader</h1>
+<h1 align="center">CLI-Downloader — 互動式擴充套件下載管理器</h1>
 
 <p align="center">
-  具備持久化任務、Batch 控制、Torrent 整合<br>
-  與互動式終端介面的插件驅動下載管理器。
+  這是一個以擴充套件 (Plugin) 為核心驅動的互動式下載框架，專為瀏覽、收集以及整理來自需要登入認證網站的媒體資源而設計。<br>
+  特別針對圖片收集和圖庫型工作流程進行了最佳化。
 </p>
 
 <p align="center">
-  <a href="https://github.com/RyuuMeow/CLI-Downloader/actions/workflows/verify.yml"><img src="https://github.com/RyuuMeow/CLI-Downloader/actions/workflows/verify.yml/badge.svg" alt="驗證狀態"></a>
-  <a href="https://github.com/RyuuMeow/CLI-Downloader/releases"><img src="https://img.shields.io/github/v/release/RyuuMeow/CLI-Downloader?display_name=tag" alt="發行版本"></a>
+  <a href="https://github.com/RyuuMeow/CLI-Downloader/actions/workflows/verify.yml"><img src="https://github.com/RyuuMeow/CLI-Downloader/actions/workflows/verify.yml/badge.svg" alt="Verify"></a>
+  <a href="https://github.com/RyuuMeow/CLI-Downloader/releases"><img src="https://img.shields.io/github/v/release/RyuuMeow/CLI-Downloader?display_name=tag" alt="Release"></a>
   <img src="https://img.shields.io/badge/platform-Windows-0078D4" alt="Windows">
   <img src="https://img.shields.io/badge/Python-3.11%2B-3776AB" alt="Python 3.11+">
-  <img src="https://img.shields.io/badge/license-MIT-green" alt="MIT 授權">
+  <img src="https://img.shields.io/badge/license-MIT-green" alt="MIT License">
 </p>
 
 <p align="center">
-  <img src="assets/readme/hero.png" width="960" alt="CLI-Downloader 任務管理畫面">
+  <img src="assets/readme/hero.png" width="960" alt="CLI-Downloader 任務面板">
 </p>
 
-CLI-Downloader 提供一致的任務、歷史紀錄、設定與使用者介面層，網站支援則由可獨立維護的外部插件提供。它適合互動式終端操作、可重複執行的 Batch 下載，以及透過機器可讀輸出進行自動化。
+**狀態：** 早期預覽版。核心工作流程已可用，但外掛程式 (Plugin) API 在 v1.0 發布前仍可能發生變動。
 
-## 功能特色
+## 為什麼選擇 CLI-Downloader？
 
-- **一套程式支援多個網站。** 透過可安裝的插件加入需要的網站，不必在多套下載器之間切換。
-- **關閉程式也能接著下載。** 任務與 Batch 進度會持久保存，重新開啟後不會遺失下載狀態。
-- **大型下載仍然容易控制。** 隨時暫停、繼續、取消、重試，必要時也能完整重建 Item 或 Batch 任務。
-- **自由選擇下載方式。** 使用 Direct 下載、設定好的 Torrent Client，或由插件自動選擇最適合的方法。
-- **任務與歷史紀錄互不綁死。** 清除已完成任務時，可以保留獨立且持久的下載紀錄。
-- **直接在程式內尋找插件。** 瀏覽 Official 與 Community 清單、查看詳細資訊及可用更新。
-- **介面操作與自動化都支援。** 使用鍵盤操作的終端介面，也能透過 JSON 輸出接入腳本與其他工具。
-- **適合不同使用方式。** 可選擇 Installer 或 Portable，介面支援英文、繁體中文與簡體中文。
+你可以直接在終端機中瀏覽繪師的作品、選取多個圖庫、在需要時進行登入，並將下載結果自動整理得井然有序。
 
-## 快速開始
+CLI-Downloader 提供了一個統一的介面，讓你不再需要到處尋找零碎的腳本，或為每個網站安裝獨立的下載工具。
 
-### Windows Installer
+### 完整操作流程
 
-從 [GitHub Releases](https://github.com/RyuuMeow/CLI-Downloader/releases/latest) 下載最新的 `windows-x64-setup.exe`。Installer 採個人使用者安裝，可將 CLI-Downloader 加入使用者 `PATH`，且不需要系統管理員權限。
-
-### Windows Portable
-
-下載並解壓縮最新的 `windows-x64-portable.zip`。執行 `CLI-Downloader.exe` 可直接開啟互動式 Shell；使用 `clid.cmd` 則可轉發命令列參數，且不會修改 `PATH`。
-
-### 從原始碼執行
-
-需要 Python 3.11 或更新版本。
-
-```powershell
-git clone https://github.com/RyuuMeow/CLI-Downloader.git
-cd CLI-Downloader
-python -m pip install -e .
-clid
+```text
+安裝擴充套件 → 登入帳號 → 搜尋資源 → 選取目標 → 開始下載 → 隨時暫停與恢復
 ```
 
-## 基本用法
+## 它有什麼不同？
 
-開啟互動式 Shell：
+雖然 **yt-dlp** 是影片提取領域的王者，而 **gallery-dl** 擅長無頭 (headless) 圖庫爬蟲，但 **CLI-Downloader** 更加專注於提供「持久化」和「互動式」的收集流程。我們將這個下載器視為一個互動中心，而所有的擴充套件都是在其內部運行的微型應用程式。
 
-```powershell
-clid
-```
+## 視覺導覽
 
-透過已安裝的插件處理網址、先查看下載計畫，以及查詢持久化狀態：
+### 任務與批次管理
 
-```powershell
-clid download <url> --dry-run
-clid download <url>
-clid tasks
-clid history
-clid plugins list
-clid doctor
-```
-
-使用 `clid <command> --help` 查看各指令選項。支援 `--json` 的指令可供腳本及其他工具讀取。
-
-## 介面導覽
-
-### Tasks 與 Batches
-
-查看 Item 與 Batch 階層、進度、排隊狀態及可用的生命週期操作；重新啟動程式後，持久化工作仍會保留。
+在這裡你可以檢查單一項目與批次任務的層級、進度、佇列狀態以及生命週期操作。所有進度都會被持久化儲存，重新啟動應用程式也不會遺失下載紀錄。
 
 <p align="center">
-  <img src="assets/readme/tasks.png" width="960" alt="任務與 Batch 下載進度">
+  <img src="assets/readme/tasks.png" width="960" alt="Tasks and batch progress">
 </p>
 
-### 插件 Marketplace
+### 擴充套件市場 (Plugin Marketplace)
 
-瀏覽 Installed、Official 與 Community 插件，查看套件資訊，並在同一頁面辨識可用更新或需要重新啟動的狀態。
+從這裡你可以瀏覽已安裝的、官方的以及社群提供的擴充套件；檢視套件資訊；並在同一個畫面中辨識更新或是否需要重新啟動。
 
 <p align="center">
-  <img src="assets/readme/plugins.png" width="960" alt="插件 Marketplace">
+  <img src="assets/readme/plugins.png" width="960" alt="Plugin marketplace">
 </p>
 
-### 插件 Operations
+### 擴充套件操作 (Plugin Operations)
 
-插件可以提供具備鍵盤選取及分頁功能的清單與搜尋操作；Core 則負責建立及控制實際下載任務。
+擴充套件可以提供包含鍵盤選取和分頁功能的列表與搜尋操作，而 CLI-Downloader 核心則持續負責建立與控制下載任務。
 
 <p align="center">
-  <img src="assets/readme/operation.png" width="960" alt="插件 Batch 選取操作">
+  <img src="assets/readme/operation.png" width="960" alt="Plugin batch selection operation">
 </p>
 
-## 插件系統
+## 核心與外掛架構
 
-CLI-Downloader Core 不內建任何網站專用下載器。已安裝的插件負責分類網址、解析網站資料並宣告支援的操作；Core 負責任務建立、排程、重試、儲存、下載及歷史紀錄。
+CLI-Downloader 核心 (Core) 不包含任何特定網站的下載邏輯。由使用者安裝的外掛 (Plugin) 負責對 URL 進行分類、解析網站資料，以及宣告支援的操作；核心則接管任務建立、排程、重試、儲存、下載和歷史紀錄管理。
 
 ```mermaid
 flowchart LR
-    URL["網址或插件操作"] --> Core["CLI-Downloader Core"]
-    Core --> Plugin["外部網站插件"]
-    Plugin --> Task["Item 或 Batch 任務"]
-    Task --> Direct["Direct 下載"]
-    Task --> Torrent["Torrent Client"]
+    URL["URL 或是 Plugin 操作"] --> Core["CLI-Downloader 核心"]
+    Core --> Plugin["外部網站外掛"]
+    Plugin --> Task["項目或批次任務"]
+    Task --> Direct["直接下載 (Direct Download)"]
+    Task --> Torrent["BT 用戶端 (Torrent Client)"]
     Task --> History["持久化歷史紀錄"]
 ```
 
-遠端清單由 [CLI-Downloader Plugin Marketplace](https://github.com/RyuuMeow/CLI-Downloader-Plugin-Marketplace) 維護。啟用的插件屬於受信任的本機 Python 程式碼，並不在 Sandbox 中執行，因此請只安裝來自可信來源的插件。
+## 核心功能
 
-套件結構、啟用行為與插件開發方式請參考 [Plugins/README.md](Plugins/README.md)。
+- **互動式擴充套件頁面：** 擴充套件可以直接在終端機介面中提供搜尋頁面、分頁列表、表單、操作行為以及多選工作流程。
+- **瀏覽器登入工作階段：** 透過獨立的瀏覽器畫面完成登入，無需手動複製或提取 Cookies。
+- **資料夾模板：** 自動將下載的檔案整理進客製化的資料夾結構中。例如：
+  ```text
+  {author_name}/{artwork_id}-{title}
+  ```
+  輸出：
+  ```text
+  繪師名稱/12345-插圖標題/
+  ```
+- **持久化任務：** 下載進度、佇列與任務狀態都會被儲存下來。隨時關閉程式，下次開啟時會從中斷的地方準確恢復。
+- **多種下載策略：** 可以選擇直接下載檔案，或將任務移交給整合的 Torrent 客戶端處理。
+- **自動化準備就緒：** 比較喜歡用腳本而非互動介面 (TUI)？每個命令都支援 `--json` 輸出格式，讓你輕鬆實現自動化。
 
-想從現成結構開始開發插件，可以使用 [CLI-Downloader Plugin Template](https://github.com/RyuuMeow/CLI-Downloader-Plugin-Template)。完成後可依 [CLI-Downloader Plugin Marketplace](https://github.com/RyuuMeow/CLI-Downloader-Plugin-Marketplace) 的投稿方式提交，供清單收錄評估。
+## 支援的網站
 
-## Agent Skill
+CLI-Downloader 核心本身不包含網站爬蟲。**網站的支援功能需要透過擴充套件市場 (Plugin Marketplace) 額外安裝。**
 
-本專案提供可供相容 AI Agent 環境使用的 [CLI-Downloader Agent Skill](skills/cli-downloader/)，讓 Agent 能依照專案規範：
+目前庫內提供的官方擴充套件：
+- **[Pixiv](https://github.com/RyuuMeow/Pixiv-Plugin.git)** (圖片、插圖)
+- **[EHentai](https://github.com/RyuuMeow/EHentai-Plugin.git)** (圖庫、BT)
+- **[X / Twitter](https://github.com/RyuuMeow/X-Plugin.git)** (圖片、影片)
+- **[Douyin](https://github.com/RyuuMeow/Douyin-Plugin.git)** (圖片、影片)
 
-- 透過公開指令查看目前任務與持久化歷史，而不直接讀取資料庫；
-- 在開始下載前使用 dry run 驗證網址路由；
-- 取得使用者明確授權後建立並確認下載任務；
-- 診斷不支援的網址與插件路由問題；以及
-- 研究、建立、測試並撰寫外部網站插件文件。
+你可以直接在應用程式的「Plugin Marketplace」分頁中瀏覽並安裝，或者使用指令：`clid plugins install pixiv`。
 
-Agent Skill 不會取得額外權限、不會略過確認要求，也不代表第三方插件可信。Agent 仍須遵守使用者授權與其執行環境的安全邊界。
+## 快速上手
 
-### 安裝 Skill
+### Windows 安裝檔
 
-Clone 本專案後，請複製**完整的** `skills/cli-downloader` 目錄，才能一併保留參考文件與插件範本。
+從 [GitHub Releases](https://github.com/RyuuMeow/CLI-Downloader/releases/latest) 下載最新的 `windows-x64-setup.exe`。它會將 CLI-Downloader 加進你的使用者 `PATH` 變數中，且不需要管理員權限。
 
-**Codex** — 安裝至目前使用者：
+### 可攜版 (Portable)
 
+下載 `windows-x64-portable.zip`。解壓縮後執行 `CLI-Downloader.exe` 即可開啟互動式 Shell，或使用 `clid.cmd` 來傳遞命令列參數。
+
+### 基本使用
+
+開啟互動式 Shell：
 ```powershell
-New-Item -ItemType Directory -Force "$HOME\.agents\skills" | Out-Null
-Copy-Item -Recurse -Force ".\skills\cli-downloader" "$HOME\.agents\skills\"
+clid
 ```
 
-使用 `$cli-downloader` 可明確指定 Skill；請求內容符合時，Codex 也能自行選用。若只要在單一專案使用，請改為複製到 `<project>/.agents/skills/cli-downloader`。
-
-**Claude Code** — 安裝至目前使用者：
-
+或直接在命令列使用：
 ```powershell
-New-Item -ItemType Directory -Force "$HOME\.claude\skills" | Out-Null
-Copy-Item -Recurse -Force ".\skills\cli-downloader" "$HOME\.claude\skills\"
+clid plugins list
+clid download <url> --dry-run
+clid download <url>
 ```
 
-使用 `/cli-downloader` 可明確指定 Skill；請求內容符合時，Claude 也能自行選用。若只要在單一專案使用，請改為複製到 `<project>/.claude/skills/cli-downloader`。
+## AI 代理技能 (Agent Skill)
 
-安裝範圍、驗證、更新及其他相容 Agent Skills 環境請參考 [Agent Skill 安裝指南](skills/cli-downloader/README.md)。
+此專案包含一個開箱即用的 Agent Skill（位於 `skills/cli-downloader`）。用它來強化你的 AI 助手（例如 Claude Code 或 Codex）。
 
-**也可以請 Agent 幫忙安裝** — 你可以對相容的 Agent 說：「請從這個專案安裝 CLI-Downloader Agent Skill，並確認安裝成功。」執行前請檢查 Agent 提出的檔案操作，並依你的環境權限規則核准。
+**你可以要求 Agent 幫你：** 研究目標網站、搭建 Plugin 骨架、實作路由、新增測試，以及產生說明文件。
 
-## 下載策略
+請參閱 [Agent Skill 說明文件](skills/cli-downloader/README.md) 了解安裝方式。
 
-插件可以支援一種或多種策略：
+## 常見問題 (FAQ)
 
-- `auto` 由插件選擇最適合的可用方式。
-- `direct` 由 Core 下載插件解析出的檔案。
-- `torrent` 將 Torrent 提交至設定的 Torrent Client。
+**這可以取代 yt-dlp 嗎？**
+不行。如果你主要目的是從 YouTube 或是各大影音平台下載影片，yt-dlp 是更好的選擇。CLI-Downloader 的設計初衷是為了圖庫聚合、圖片收藏以及需要登入認證的瀏覽工作流程。
 
-```powershell
-clid download <url> --strategy auto
-clid download <url> --strategy direct
-clid download <url> --strategy torrent
-```
+**擴充套件有沙盒 (Sandbox) 保護嗎？**
+沒有。已啟用的擴充套件會作為受信任的本機 Python 程式碼執行。請務必只從你信任的來源安裝擴充套件。
 
-實際可用策略取決於所選插件與網址。
+**它可以支援需要瀏覽器登入的網站嗎？**
+可以。你可以呼叫基於瀏覽器的登入流程，它會安全地持久化儲存你的工作階段狀態，免去了複製貼上 Cookies 的麻煩。
 
-## 任務、歷史紀錄與使用者資料
+## 免責聲明與安全性
 
-Tasks 代表目前可控制的工作；History 則是獨立的持久化紀錄。因此刪除 Task 不會刪除 History，除非使用者另外明確執行歷史紀錄操作。設定、插件、日誌、下載內容、任務與歷史紀錄都保存在個人使用者資料位置，升級或解除安裝時不會一併移除。
+CLI-Downloader 是一個開源的下載框架，以「現狀 (AS IS)」提供。我們不背書也不保證任何第三方擴充套件的合法性。
 
-## 免責聲明
+- 有關安全實務與漏洞回報，請參閱 [SECURITY.md](SECURITY.md)。
+- 有關完整的條款、責任限制以及擴充套件警告，請閱讀 [DISCLAIMER.md](DISCLAIMER.md)。
 
-CLI-Downloader 是一個開源的**下載框架**。Core 本身不內建任何特定網站的支援或解析邏輯；與網站相關的行為由使用者自行安裝、獨立維護的插件提供。
-
-### 本專案的性質
-
-- Core 僅提供插件契約、任務排程、速率限制、持久化與下載管線等通用功能。
-- CLI-Downloader 不對任何插件背書，亦不保證插件安全、合法、正確或符合目標網站的服務條款。
-- 網路活動可能由已安裝插件發起，也可能由 Core 根據插件解析出的下載請求、插件清單存取或已設定的外部整合執行。
-
-### 責任限制
-
-- 本專案依 [MIT License](LICENSE) 授權，以**「現狀」（AS IS）**提供，不含任何明示或默示擔保。
-- 使用本專案及任何插件之風險由使用者自行承擔，包括但不限於帳號限制、服務封禁、法律責任、資料遺失或非預期的網路及檔案系統活動；開發者與貢獻者概不負責。
-- 使用者應自行遵守適用法律、著作權規範與目標網站服務條款，並取得所有必要授權或使用權利。
-- 請勿將本專案用於未授權存取、侵害著作權、非法散布或具濫用性的大量請求。MIT License 允許本軟體用於商業用途，但不授予任何第三方網站或下載內容的權利。
-
-### 插件
-
-插件可能包含額外的網站存取行為與補充條款。安裝或使用前，請詳閱各插件的 README。Community 插件由第三方獨立維護，其行為與風險不代表 CLI-Downloader Core 專案立場。
-
-安裝、編譯或使用 CLI-Downloader 或任何插件，即表示您已知悉本聲明及對應插件文件中的補充條款。
-
-## 文件
+## 說明文件
 
 - [專案範圍與行為](docs/CLI-Downloader.md)
-- [文件索引](docs/Index.md)
 - [系統架構](docs/structure/SystemDesign.md)
-- [專案結構](docs/structure/SystemStructure.md)
-- [變更紀錄](CHANGELOG.md)
+- [儲存庫結構](docs/structure/SystemStructure.md)
+- [更新日誌](CHANGELOG.md)
 
-## 開發
-
-安裝開發及打包依賴後，執行完整驗證：
-
-```powershell
-python -m pip install -e ".[dev,package]"
-.\Scripts\Verify.ps1
-```
-
-建立 Windows Portable 套件：
-
-```powershell
-.\Scripts\BuildPortable.ps1
-```
-
-歡迎透過 [GitHub Issues](https://github.com/RyuuMeow/CLI-Downloader/issues) 回報問題、提出功能建議、改善文件或討論插件契約。
-
-## 授權
-
-CLI-Downloader 採用 [MIT License](LICENSE) 發行。
+## 授權條款
+採用 [MIT License](LICENSE) 釋出。
