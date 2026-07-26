@@ -1,0 +1,1328 @@
+from __future__ import annotations
+
+import argparse
+import asyncio
+import json
+from collections.abc import Sequence
+from dataclasses import replace
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
+from threading import Event
+from uuid import uuid4
+
+from cli_downloader.application.download_service import DownloadService
+from cli_downloader.application.download_limiter import GalleryDownloadLimiter
+from cli_downloader.application.operation_dispatcher import OperationDispatcher
+from cli_downloader.application.task_hierarchy_service import TaskHierarchyService
+from cli_downloader.application.task_lifecycle_service import TaskLifecycleService
+from cli_downloader.cli._output import (
+    ProgressSink,
+    _EXPLICIT_DOWNLOAD_CONFIRMATIONS,
+    _download_dry_run_to_dict,
+    _plugin_activation_refusal_to_dict,
+    _plugin_activation_to_dict,
+    _plugin_inspect_to_dict,
+    _plugin_list_to_dict,
+    _plugin_roots,
+    _print_task_detail,
+    _print_task_list,
+    _task_created_at,
+    _task_details,
+    _task_summary,
+)
+from cli_downloader.cli._download_ops import (
+    _batch_details,
+    _run_batch_retry,
+    _run_generic_download,
+)
+from cli_downloader.cli import _inspect_ops
+from cli_downloader.cli import _shell_wiring
+from cli_downloader.cli.history import (
+    history_records_to_dicts,
+    print_history_record_detail,
+    print_history_record_summary,
+)
+from cli_downloader.cli.doctor import run_doctor
+from cli_downloader.cli.i18n import current_translator
+from cli_downloader.cli.rendering import RenderMode, select_render_mode, serialize_operation_result
+from cli_downloader.cli.table import TableColumn, TableSpec, print_rich_table
+from cli_downloader.cli.textual_renderer import render_interactive_result
+from cli_downloader.config.loader import ConfigLoader
+from cli_downloader.core.environment import diagnose_environment, installed_plugins_root
+from cli_downloader.about import __version__
+from cli_downloader.core.errors import CLIDownloaderError
+from cli_downloader.core.events import TaskEvent
+from cli_downloader.core.history_records import DownloadHistoryRecord
+from cli_downloader.core.batch import (
+    BatchParent,
+    BatchEntryStatus,
+)
+from cli_downloader.core.task_tree import TaskState
+from cli_downloader.core.operations import (
+    ListPageData,
+    ResultKind,
+)
+from cli_downloader.plugins.loader import (
+    scan_local_plugin_packages,
+)
+from cli_downloader.plugins.runtime import ApplicationRuntime, build_application_runtime
+from cli_downloader.sites.registry import SiteRegistry
+from cli_downloader.storage.completion_store import CompletionStore
+from cli_downloader.storage.paths import StorageLayout
+from cli_downloader.storage.sqlite_completion_store import SQLiteCompletionStore
+from cli_downloader.storage.state_database import StateDatabase
+from cli_downloader.storage.state_batch_store import StateBatchStore
+from cli_downloader.storage.state_history_store import StateHistoryStore
+from cli_downloader.storage.state_task_store import StateTaskStore
+from cli_downloader.storage.task_store import TaskDesiredControl, TaskRecord, TaskStatus
+
+# Transitional aliases keep the previous private helper imports working while
+# the implementation lives in the focused inspection module.
+_dispatch_operation = _inspect_ops.dispatch_operation
+_dispatch_plugin_operation = _inspect_ops.dispatch_plugin_operation
+_effective_strategy = _inspect_ops.effective_strategy
+_operation_supports_strategy = _inspect_ops.operation_supports_strategy
+_redacted_headers = _inspect_ops.redacted_headers
+_route_url_through_manifests = _inspect_ops.route_url_through_manifests
+_with_default_strategy = _inspect_ops.with_default_strategy
+_recover_interrupted_downloads = _shell_wiring._recover_interrupted_downloads
+build_interactive_shell = _shell_wiring.build_interactive_shell
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="clid",
+        description="Modular CLI download manager.",
+    )
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"%(prog)s {__version__}",
+        help="Print the installed CLI-Downloader version.",
+    )
+    parser.add_argument(
+        "--plugin-root",
+        action="append",
+        default=[],
+        help="Plugin root scanned during application startup. Can be repeated.",
+    )
+    parser.add_argument(
+        "--enable-external-code",
+        dest="runtime_enable_external_code",
+        action="store_true",
+        help="Allow validated external plugins to execute during application startup.",
+    )
+    subparsers = parser.add_subparsers(dest="command")
+
+    doctor_parser = subparsers.add_parser(
+        "doctor",
+        help="Run actionable local health checks.",
+    )
+    doctor_parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit stable machine-readable check results.",
+    )
+    doctor_parser.add_argument(
+        "--network",
+        action="store_true",
+        help="Enable configured integration and remote endpoint checks.",
+    )
+
+    subparsers.add_parser(
+        "diagnose",
+        help="Print environment, path, and terminal capability information.",
+    )
+    subparsers.add_parser(
+        "sites",
+        help="List registered site adapters.",
+    )
+    subparsers.add_parser(
+        "shell",
+        help="Start the interactive shell.",
+    )
+    plugins_parser = subparsers.add_parser(
+        "plugins",
+        help="Inspect local plugin packages without executing plugin code.",
+    )
+    plugins_subparsers = plugins_parser.add_subparsers(dest="plugins_command")
+    plugins_list_parser = plugins_subparsers.add_parser(
+        "list",
+        help="List local plugin package diagnostics.",
+    )
+    plugins_list_parser.add_argument(
+        "--root",
+        action="append",
+        default=[],
+        help="Plugin root directory to scan. Can be provided more than once.",
+    )
+    plugins_list_parser.add_argument(
+        "--include-ignored",
+        action="store_true",
+        help="Include direct child folders that do not contain plugin.json.",
+    )
+    plugins_inspect_parser = plugins_subparsers.add_parser(
+        "inspect",
+        help="Print full local plugin package diagnostics.",
+    )
+    plugins_inspect_parser.add_argument(
+        "--root",
+        action="append",
+        default=[],
+        help="Plugin root directory to scan. Can be provided more than once.",
+    )
+    plugins_inspect_parser.add_argument(
+        "--include-ignored",
+        action="store_true",
+        help="Include direct child folders that do not contain plugin.json.",
+    )
+    plugins_activate_parser = plugins_subparsers.add_parser(
+        "activate",
+        help="Explicitly import local plugin packages after validation.",
+    )
+    plugins_activate_parser.add_argument(
+        "--root",
+        action="append",
+        default=[],
+        help="Plugin root directory to scan. Can be provided more than once.",
+    )
+    plugins_activate_parser.add_argument(
+        "--enable-external-code",
+        action="store_true",
+        help="Required confirmation before external plugin.py files are imported.",
+    )
+    download_parser = subparsers.add_parser(
+        "download",
+        help="Route a URL through the site manifest contract.",
+    )
+    download_parser.add_argument(
+        "url",
+        help="Supported item, page, listing, search, or batch URL.",
+    )
+    download_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Classify the URL and show the planned site operation without downloading.",
+    )
+    download_parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit machine-readable JSON and never prompt for interaction.",
+    )
+    download_parser.add_argument(
+        "--profile",
+        help="Profile name passed to the selected site operation.",
+    )
+    download_parser.add_argument(
+        "--strategy",
+        choices=("auto", "direct", "torrent"),
+        help="Download strategy passed to the selected site operation.",
+    )
+    download_parser.add_argument(
+        "--select",
+        action="append",
+        default=[],
+        metavar="ITEM_ID",
+        help="Confirm a list item for batch download. Can be repeated.",
+    )
+    download_parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Create a new batch attempt even when a selected gallery is active or completed.",
+    )
+
+    operation_parser = subparsers.add_parser(
+        "operation",
+        help="Run a plugin operation directly.",
+    )
+    operation_parser.add_argument("plugin_id")
+    operation_parser.add_argument("operation_id", nargs="?", default="help")
+    operation_parser.add_argument(
+        "args",
+        nargs=argparse.REMAINDER,
+        help="Operation parameters in key=value format.",
+    )
+    operation_parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit machine-readable JSON and never prompt for interaction.",
+    )
+
+    batches_parser = subparsers.add_parser(
+        "batches",
+        help="Inspect, resume, or retry persisted batch parents.",
+    )
+    batches_subparsers = batches_parser.add_subparsers(dest="batches_command")
+    batches_show_parser = batches_subparsers.add_parser(
+        "show",
+        help="Show a batch parent, entries, children, assets, and attempts.",
+    )
+    batches_show_parser.add_argument("parent_id")
+    batches_retry_parser = batches_subparsers.add_parser(
+        "retry",
+        help="Retry failed batch work from its persisted checkpoint.",
+    )
+    batches_retry_parser.add_argument("parent_id")
+    batches_retry_parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit machine-readable JSON and never prompt for interaction.",
+    )
+    batches_retry_parser.add_argument(
+        "--profile",
+        help="Profile passed to plugin resolution when package refresh is required.",
+    )
+    batches_resume_parser = batches_subparsers.add_parser(
+        "resume",
+        help="Resume interrupted batch work without converting it to a retry.",
+    )
+    batches_resume_parser.add_argument("parent_id")
+    batches_resume_parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit machine-readable JSON and never prompt for interaction.",
+    )
+    batches_resume_parser.add_argument(
+        "--profile",
+        help="Profile passed to plugin resolution when package refresh is required.",
+    )
+    tasks_parser = subparsers.add_parser(
+        "tasks",
+        help="List or transition tasks persisted in the local task store.",
+    )
+    tasks_subparsers = tasks_parser.add_subparsers(dest="tasks_command")
+    tasks_list_parser = tasks_subparsers.add_parser(
+        "list",
+        help="List tasks persisted in the local task store.",
+    )
+    tasks_parser.add_argument(
+        "--status",
+        choices=tuple(state.value for state in TaskState),
+        help="Only show tasks with this status.",
+    )
+    tasks_list_parser.add_argument(
+        "--status",
+        choices=tuple(state.value for state in TaskState),
+        help="Only show tasks with this status.",
+    )
+    tasks_list_parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Output raw JSON data instead of a summary table.",
+    )
+    tasks_parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Output raw JSON data instead of a summary table.",
+    )
+    tasks_retry_parser = tasks_subparsers.add_parser(
+        "retry",
+        help="Move a retryable task back to planned.",
+    )
+    tasks_retry_parser.add_argument("task_id")
+    tasks_retry_parser.add_argument("--json", action="store_true")
+    tasks_resume_parser = tasks_subparsers.add_parser(
+        "resume",
+        help="Move a resumable task back to planned.",
+    )
+    tasks_resume_parser.add_argument("task_id")
+    tasks_resume_parser.add_argument("--json", action="store_true")
+    tasks_show_parser = tasks_subparsers.add_parser(
+        "show",
+        help="Show user-facing details for one Item or Batch.",
+    )
+    tasks_show_parser.add_argument("task_id")
+    tasks_delete_parser = tasks_subparsers.add_parser(
+        "delete",
+        help="Delete matching task records while preserving downloaded files.",
+    )
+    tasks_delete_parser.add_argument("task_ids", nargs="*")
+    tasks_delete_parser.add_argument(
+        "--status",
+        choices=tuple(state.value for state in TaskState),
+        help="Only match tasks with this status.",
+    )
+    tasks_delete_parser.add_argument(
+        "--older-than",
+        type=float,
+        metavar="DAYS",
+        help="Only match tasks created at least this many days ago.",
+    )
+    tasks_delete_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Preview matching records without deleting them.",
+    )
+    tasks_delete_parser.add_argument(
+        "--yes",
+        action="store_true",
+        help="Confirm deletion without an interactive prompt.",
+    )
+    tasks_delete_parser.add_argument(
+        "--all",
+        action="store_true",
+        help="Delete all task records (requires --yes).",
+    )
+    tasks_hard_retry_parser = tasks_subparsers.add_parser(
+        "hard-retry",
+        help="Delete and completely rebuild a task from its source URL.",
+    )
+    tasks_hard_retry_parser.add_argument("task_id")
+    tasks_hard_retry_parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Output raw JSON instead of a summary.",
+    )
+    tasks_cancel_parser = tasks_subparsers.add_parser(
+        "cancel",
+        help="Cancel tasks (stop running downloads and mark as canceled).",
+    )
+    tasks_cancel_parser.add_argument("task_id", nargs="?")
+    tasks_cancel_parser.add_argument(
+        "--all",
+        action="store_true",
+        help="Cancel all cancellable tasks (requires --yes).",
+    )
+    tasks_cancel_parser.add_argument(
+        "--yes",
+        action="store_true",
+        help="Confirm cancellation without an interactive prompt.",
+    )
+    tasks_cancel_parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Output raw JSON instead of a summary.",
+    )
+    history_parser = subparsers.add_parser(
+        "history",
+        help="List durable download records persisted in the local history store.",
+    )
+    history_parser.add_argument(
+        "--page",
+        type=int,
+        default=1,
+        help="Page number to display (default: 1).",
+    )
+    history_parser.add_argument(
+        "--query",
+        type=str,
+        default="",
+        help="Filter events by keyword matching title or plugin/operation.",
+    )
+    history_parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Output the same history record projection as JSON.",
+    )
+    history_parser.add_argument(
+        "--child",
+        action="store_true",
+        help="Include child tasks in history listing",
+    )
+    history_subparsers = history_parser.add_subparsers(dest="history_command")
+    history_show_parser = history_subparsers.add_parser(
+        "show",
+        help="Show one durable history record.",
+    )
+    history_show_parser.add_argument("task_id")
+    history_show_parser.add_argument("--page", type=int, default=1)
+    history_show_parser.add_argument("--query", default="")
+    history_show_parser.add_argument("--json", action="store_true")
+    history_show_parser.add_argument("--child", action="store_true")
+    history_delete_parser = history_subparsers.add_parser(
+        "delete",
+        help="Delete task events and download records from history.",
+    )
+    history_delete_parser.add_argument("task_id", nargs="?")
+    history_delete_parser.add_argument("--all", action="store_true", help="Delete all history.")
+    history_delete_parser.add_argument(
+        "--older-than",
+        type=float,
+        help="Delete history older than X days.",
+    )
+    history_delete_parser.add_argument(
+        "-y",
+        "--yes",
+        action="store_true",
+        help="Confirm deletion without an interactive prompt.",
+    )
+    config_parser = subparsers.add_parser(
+        "config",
+        help="Inspect config defaults or the effective loaded config.",
+    )
+    config_subparsers = config_parser.add_subparsers(dest="config_command")
+    config_subparsers.add_parser(
+        "defaults",
+        help="Print schema defaults.",
+    )
+    config_subparsers.add_parser(
+        "show",
+        help="Print the effective config loaded from the app config directory.",
+    )
+    return parser
+
+
+def main(
+    argv: Sequence[str] | None = None,
+    *,
+    runtime: ApplicationRuntime | None = None,
+    cancellation: Event | None = None,
+    progress: ProgressSink | None = None,
+    download_limiter: GalleryDownloadLimiter | None = None,
+) -> int:
+    if argv is None:
+        import sys
+
+        effective_argv = sys.argv[1:] or ["shell"]
+    else:
+        effective_argv = list(argv)
+
+    parser = build_parser()
+    try:
+        args = parser.parse_args(effective_argv)
+    except SystemExit as exc:
+        return exc.code if isinstance(exc.code, int) else 1
+    application_runtime = runtime
+
+    def get_runtime() -> ApplicationRuntime:
+        nonlocal application_runtime
+        if application_runtime is None:
+            application_runtime = build_application_runtime(
+                plugin_roots=(tuple(args.plugin_root) if args.plugin_root else None),
+                enable_external_code=args.runtime_enable_external_code,
+            )
+        return application_runtime
+
+    if args.command == "diagnose":
+        print(json.dumps(diagnose_environment().to_dict(), indent=2))
+        return 0
+
+    if args.command == "doctor":
+        environment = diagnose_environment()
+        report = run_doctor(
+            environment=environment,
+            config_loader=ConfigLoader(paths=environment.paths),
+            network=args.network,
+        )
+        if args.json:
+            print(report.to_json())
+        else:
+            for check in report.checks:
+                print(f"[{check.status.upper():4}] {check.check_id}: {check.summary}")
+                if check.details:
+                    print(f"       {check.details}")
+            print("Doctor: " + ("failed" if report.failed else "passed"))
+        return 1 if report.failed else 0
+
+    if args.command == "sites":
+        for adapter in get_runtime().site_registry.adapters:
+            print(f"{adapter.site_id}\t{adapter.display_name}")
+        return 0
+
+    if args.command == "shell":
+        shell_runtime = get_runtime()
+        plugins_dir = Path(args.plugin_root[0]) if args.plugin_root else installed_plugins_root()
+        return build_interactive_shell(
+            runtime=shell_runtime,
+            plugins_dir=plugins_dir,
+            runner=lambda shell_argv: main(shell_argv, runtime=shell_runtime),
+            background_runner=lambda shell_argv, cancellation, progress, download_limiter: main(
+                shell_argv,
+                runtime=shell_runtime,
+                cancellation=cancellation,
+                progress=progress,
+                download_limiter=download_limiter,
+            ),
+        )
+
+    if args.command == "plugins":
+        roots = _plugin_roots(args.root)
+        if args.plugins_command == "list":
+            report = scan_local_plugin_packages(
+                roots,
+                include_ignored=args.include_ignored,
+            )
+            print(json.dumps(_plugin_list_to_dict(report=report, roots=roots), indent=2))
+            return 0
+        if args.plugins_command == "inspect":
+            report = scan_local_plugin_packages(
+                roots,
+                include_ignored=args.include_ignored,
+            )
+            print(json.dumps(_plugin_inspect_to_dict(report=report, roots=roots), indent=2))
+            return 0
+        if args.plugins_command == "activate":
+            if not args.enable_external_code:
+                print(json.dumps(_plugin_activation_refusal_to_dict(roots=roots), indent=2))
+                return 1
+            plugin_runtime = build_application_runtime(
+                plugin_roots=roots,
+                enable_external_code=True,
+            )
+            print(
+                json.dumps(
+                    _plugin_activation_to_dict(
+                        scan_report=plugin_runtime.scan_report,
+                        activation_report=plugin_runtime.activation_report,
+                        registry=plugin_runtime.site_registry,
+                        roots=roots,
+                    ),
+                    indent=2,
+                )
+            )
+            return 0
+        parser.print_help()
+        return 0
+
+    if args.command == "download":
+        render_mode = select_render_mode(json_requested=args.json)
+        if args.dry_run:
+            result = _download_dry_run_to_dict(args.url, runtime=get_runtime())
+            result["render_mode"] = render_mode.value
+            print(json.dumps(result, indent=None if render_mode is RenderMode.JSON else 2))
+            return 0 if result["matched"] else 1
+        return _run_generic_download(
+            args.url,
+            runtime=get_runtime(),
+            render_mode=render_mode,
+            profile=args.profile,
+            strategy=args.strategy,
+            selected_item_ids=tuple(args.select),
+            force=args.force,
+            cancellation=cancellation,
+            progress=progress,
+            download_limiter=download_limiter,
+            task_id=None,
+            interactive_renderer=render_interactive_result,
+        )
+
+    if args.command == "operation":
+        render_mode = select_render_mode(json_requested=args.json)
+        environment = diagnose_environment()
+        loaded_config = ConfigLoader(
+            paths=environment.paths,
+            registry=get_runtime().settings_registry,
+        ).load()
+        get_runtime().configure_plugins(loaded_config.values, loaded_config.secrets)
+
+        dispatcher = OperationDispatcher(
+            get_runtime(),
+            config=loaded_config,
+        )
+        params = {}
+        for arg in args.args:
+            if "=" in arg:
+                k, v = arg.split("=", 1)
+                params[k] = v
+
+        result = _dispatch_plugin_operation(
+            dispatcher,
+            args.plugin_id,
+            args.operation_id,
+            params=params,
+            confirmations=_EXPLICIT_DOWNLOAD_CONFIRMATIONS,
+        )
+        if result.result_kind is ResultKind.ERROR:
+            print(
+                serialize_operation_result(
+                    result,
+                    RenderMode.PLAIN if render_mode is RenderMode.INTERACTIVE else render_mode,
+                )
+            )
+            return 1
+
+        if result.result_kind is not ResultKind.LIST_PAGE:
+            print(
+                serialize_operation_result(
+                    result,
+                    RenderMode.PLAIN if render_mode is RenderMode.INTERACTIVE else render_mode,
+                )
+            )
+            return 0
+
+        data = result.data
+        if not isinstance(data, ListPageData):
+            print(
+                serialize_operation_result(
+                    result,
+                    RenderMode.PLAIN if render_mode is RenderMode.INTERACTIVE else render_mode,
+                )
+            )
+            return 1
+
+        print(serialize_operation_result(result, render_mode))
+        return 0
+
+    if args.command == "batches":
+        render_mode = select_render_mode(json_requested=getattr(args, "json", False))
+        environment = diagnose_environment()
+        layout = StorageLayout.from_app_paths(environment.paths)
+        store = StateBatchStore(StateDatabase(layout.state_db))
+        try:
+            if args.batches_command == "show":
+                print(json.dumps(_batch_details(store, args.parent_id), indent=2))
+                return 0
+            if args.batches_command == "retry":
+                return _run_batch_retry(
+                    args.parent_id,
+                    runtime=get_runtime(),
+                    store=store,
+                    layout=layout,
+                    render_mode=render_mode,
+                    config=ConfigLoader(
+                        paths=environment.paths,
+                        registry=get_runtime().settings_registry,
+                    ).load(),
+                    profile=args.profile,
+                    cancellation=cancellation,
+                    progress=progress,
+                )
+            if args.batches_command == "resume":
+                return _run_batch_retry(
+                    args.parent_id,
+                    runtime=get_runtime(),
+                    store=store,
+                    layout=layout,
+                    render_mode=render_mode,
+                    config=ConfigLoader(
+                        paths=environment.paths,
+                        registry=get_runtime().settings_registry,
+                    ).load(),
+                    profile=args.profile,
+                    cancellation=cancellation,
+                    progress=progress,
+                    resume=True,
+                )
+        except CLIDownloaderError as error:
+            print(json.dumps({"error": str(error)}, indent=2))
+            return 1
+        parser.print_help()
+        return 0
+
+    if args.command == "tasks":
+        if args.tasks_command in {None, "list"}:
+            if not _task_storage_exists():
+                print(current_translator()("cli.no_tasks"))
+                return 0
+        service = _build_task_hierarchy_service()
+        task_id = getattr(args, "task_id", None)
+        if args.tasks_command in {None, "list"}:
+            nodes = service.list_roots()
+            if task_id:
+                nodes = tuple(node for node in nodes if node.task_id == task_id)
+            status = args.status if args.tasks_command is None else args.status
+            if status:
+                nodes = tuple(node for node in nodes if node.state.value == status)
+            if getattr(args, "json", False):
+                print(json.dumps([_task_summary(node) for node in nodes], indent=2))
+            else:
+                _print_task_list(nodes, translator=current_translator())
+            return 0
+        if args.tasks_command == "show":
+            if not task_id:
+                print(json.dumps({"error": "positional TASK_ID is required"}))
+                return 2
+            try:
+                node = service.get(task_id)
+            except CLIDownloaderError as error:
+                print(json.dumps({"error": str(error)}, indent=2))
+                return 1
+            if getattr(args, "json", False):
+                print(json.dumps(_task_details(service, node), indent=2))
+            else:
+                _print_task_detail(service, node, translator=current_translator())
+            return 0
+        if args.tasks_command == "delete":
+            return _delete_task_records(
+                service,
+                task_ids=tuple(args.task_ids),
+                status=args.status,
+                older_than_days=args.older_than,
+                dry_run=args.dry_run,
+                confirmed=args.yes,
+                delete_all=args.all,
+            )
+        if args.tasks_command == "hard-retry":
+            if not task_id:
+                print(json.dumps({"error": "positional TASK_ID is required"}))
+                return 2
+            return _hard_retry_task(
+                task_id,
+                site_registry=get_runtime().site_registry,
+                runtime=get_runtime(),
+                json_output=getattr(args, "json", False),
+            )
+        if args.tasks_command == "cancel":
+            return _cancel_tasks(
+                service,
+                task_id=task_id,
+                cancel_all=args.all,
+                confirmed=args.yes,
+                json_output=getattr(args, "json", False),
+            )
+        if not task_id:
+            print(json.dumps({"error": "positional TASK_ID is required"}))
+            return 2
+        task_store = _build_task_store()
+        lifecycle = TaskLifecycleService(task_store=task_store)
+        try:
+            if args.tasks_command == "retry":
+                result = lifecycle.retry(task_id)
+            elif args.tasks_command == "resume":
+                result = lifecycle.resume(task_id)
+            else:
+                parser.print_help()
+                return 0
+        except CLIDownloaderError as error:
+            print(json.dumps({"error": str(error)}, indent=2))
+            return 1
+        if args.tasks_command == "resume":
+            record = task_store.get(task_id)
+            if record is not None and record.kind.value == "item" and record.source_url:
+                return _run_generic_download(
+                    record.source_url,
+                    runtime=get_runtime(),
+                    render_mode=RenderMode.JSON
+                    if getattr(args, "json", False)
+                    else RenderMode.PLAIN,
+                    download_limiter=download_limiter,
+                    task_id=task_id,
+                )
+        print(json.dumps(result.to_dict(), indent=2))
+        return 0
+
+    if args.command == "history":
+        env = diagnose_environment()
+        layout = StorageLayout.from_app_paths(env.paths)
+        history_command = getattr(args, "history_command", None)
+        history_task_id = getattr(args, "task_id", None)
+        if history_command == "delete":
+            history_store = StateHistoryStore(StateDatabase(layout.state_db))
+            if not any([args.all, history_task_id, getattr(args, "older_than", None) is not None]):
+                translator = current_translator()
+                print(f"{translator('cli.error_prefix')}: {translator('cli.history_delete_usage')}")
+                return 1
+            if not getattr(args, "yes", False):
+                if not env.terminal.interactive:
+                    translator = current_translator()
+                    print(
+                        f"{translator('cli.error_prefix')}: "
+                        f"{translator('cli.interactive_prompt_unavailable')}"
+                    )
+                    return 1
+                try:
+                    response = input(current_translator()("cli.confirm_history_delete"))
+                    if response.lower() not in ("y", "yes"):
+                        print(current_translator()("cli.operation_cancelled"))
+                        return 0
+                except EOFError:
+                    print(current_translator()("cli.operation_cancelled"))
+                    return 0
+
+            if args.all:
+                history_store.clear()
+                print(current_translator()("cli.history_deleted_all"))
+            elif history_task_id:
+                history_store.delete_task(history_task_id)
+                print(current_translator()("cli.history_deleted_task", task_id=history_task_id))
+            elif getattr(args, "older_than", None) is not None:
+                history_store.delete_older_than(args.older_than)
+                print(
+                    current_translator()(
+                        "cli.history_deleted_older",
+                        days=args.older_than,
+                    )
+                )
+            return 0
+
+        history_store = StateHistoryStore(StateDatabase(layout.state_db))
+        show_child = getattr(args, "child", False)
+        if history_command not in {None, "show"}:
+            print(json.dumps({"error": f"unknown history action: {history_command}"}, indent=2))
+            return 2
+        if history_task_id:
+            if show_child:
+                records = history_store.list_records(parent_record_id=history_task_id)
+                if getattr(args, "json", False):
+                    print(json.dumps(history_records_to_dicts(records), indent=2))
+                else:
+                    print_history_record_summary(
+                        records,
+                        page=getattr(args, "page", 1),
+                        page_size=20,
+                        query=getattr(args, "query", ""),
+                        show_child=True,
+                        translator=current_translator(),
+                    )
+                return 0
+            record = history_store.get_record(history_task_id) or history_store.get_latest_record(
+                history_task_id
+            )
+            if record is None:
+                print(
+                    current_translator()(
+                        "cli.task_not_found_history",
+                        task_id=history_task_id,
+                    )
+                )
+                return 1
+            records = (record,)
+            if getattr(args, "json", False):
+                print(json.dumps(history_records_to_dicts(records), indent=2))
+            else:
+                print_history_record_detail(record, translator=current_translator())
+        else:
+            records = history_store.list_records()
+            if getattr(args, "json", False):
+                print(json.dumps(history_records_to_dicts(records), indent=2))
+            else:
+                print_history_record_summary(
+                    records,
+                    page=getattr(args, "page", 1),
+                    page_size=20,
+                    query=getattr(args, "query", ""),
+                    show_child=show_child,
+                    translator=current_translator(),
+                )
+        return 0
+
+    if args.command == "config":
+        settings_registry = get_runtime().settings_registry
+        if args.config_command == "defaults":
+            print(json.dumps(settings_registry.schema.defaults(), indent=2))
+            return 0
+        if args.config_command == "show":
+            print(json.dumps(ConfigLoader(registry=settings_registry).load().to_dict(), indent=2))
+            return 0
+        parser.print_help()
+        return 0
+
+    parser.print_help()
+    return 0
+
+
+def _load_task_records(layout: StorageLayout | None = None) -> tuple[TaskRecord, ...]:
+    if layout is None:
+        environment = diagnose_environment()
+        layout = StorageLayout.from_app_paths(environment.paths)
+    if not layout.state_db.exists():
+        return ()
+    return StateTaskStore(StateDatabase(layout.state_db)).list()
+
+
+def _build_task_store() -> StateTaskStore:
+    environment = diagnose_environment()
+    layout = StorageLayout.from_app_paths(environment.paths)
+    return StateTaskStore(StateDatabase(layout.state_db))
+
+
+def _build_task_hierarchy_service() -> TaskHierarchyService:
+    environment = diagnose_environment()
+    layout = StorageLayout.from_app_paths(environment.paths)
+    batch_store = StateBatchStore(StateDatabase(layout.state_db))
+    return TaskHierarchyService(
+        task_store=StateTaskStore(StateDatabase(layout.state_db)),
+        batch_store=batch_store,
+        history_store=StateHistoryStore(StateDatabase(layout.state_db)),
+    )
+
+
+def _task_storage_exists() -> bool:
+    environment = diagnose_environment()
+    layout = StorageLayout.from_app_paths(environment.paths)
+    return layout.state_db.exists()
+
+
+def _delete_task_records(
+    service: TaskHierarchyService,
+    *,
+    task_ids: tuple[str, ...],
+    status: str | None,
+    older_than_days: float | None,
+    dry_run: bool,
+    confirmed: bool,
+    delete_all: bool = False,
+) -> int:
+    if older_than_days is not None and older_than_days < 0:
+        print(json.dumps({"error": "--older-than must not be negative"}))
+        return 2
+    if not delete_all and not task_ids and status is None and older_than_days is None:
+        print(json.dumps({"error": "provide task ids, --status, --older-than, or --all"}))
+        return 2
+
+    candidates = (
+        tuple(service.get(task_id) for task_id in dict.fromkeys(task_ids))
+        if task_ids
+        else service.list_roots()
+    )
+    if status is not None:
+        candidates = tuple(node for node in candidates if node.state.value == status)
+    if older_than_days is not None:
+        cutoff = datetime.now(UTC) - timedelta(days=older_than_days)
+        candidates = tuple(
+            node
+            for node in candidates
+            if ((created_at := _task_created_at(node)) is not None and created_at <= cutoff)
+        )
+
+    blocked = tuple(
+        node.task_id
+        for node in candidates
+        if node.state in {TaskState.PREPARING, TaskState.QUEUED, TaskState.RUNNING}
+    )
+    payload = {
+        "matched": len(candidates),
+        "task_ids": [node.task_id for node in candidates],
+        "blocked_active": list(blocked),
+        "dry_run": dry_run,
+        "deleted": 0,
+        "downloaded_files_preserved": True,
+    }
+    if dry_run:
+        print(json.dumps(payload, indent=2))
+        return 0
+    if not confirmed:
+        payload["error"] = "rerun with --yes after reviewing --dry-run"
+        print(json.dumps(payload, indent=2))
+        return 2
+    if blocked:
+        payload["error"] = "active tasks cannot be deleted"
+        print(json.dumps(payload, indent=2))
+        return 2
+    for node in candidates:
+        service.delete(node.task_id)
+    payload["deleted"] = len(candidates)
+    print(json.dumps(payload, indent=2))
+    return 0
+
+
+def _hard_retry_task(
+    task_id: str,
+    *,
+    site_registry: SiteRegistry,
+    runtime: ApplicationRuntime,
+    json_output: bool = False,
+    _task_store: StateTaskStore | None = None,
+    _batch_store: StateBatchStore | None = None,
+    _history_store: StateHistoryStore | None = None,
+) -> int:
+    """Rebuild a task from its source URL without replacing its public identity.
+
+    Rebuild the execution plan in place while preserving the public task identity.
+    """
+    env = diagnose_environment()
+    layout = StorageLayout.from_app_paths(env.paths)
+    task_store = _task_store or StateTaskStore(StateDatabase(layout.state_db))
+    batch_store = _batch_store or StateBatchStore(StateDatabase(layout.state_db))
+    history_store = _history_store or StateHistoryStore(StateDatabase(layout.state_db))
+
+    try:
+        is_batch_parent = task_id in batch_store.list_parent_ids()
+
+        if is_batch_parent:
+            return _hard_retry_batch(
+                task_id,
+                task_store=task_store,
+                batch_store=batch_store,
+                history_store=history_store,
+                site_registry=site_registry,
+                runtime=runtime,
+                env=env,
+                json_output=json_output,
+            )
+
+        # --- Standalone task or batch entry ---
+        source_url: str | None = None
+        profile: str | None = None
+
+        record = task_store.get(task_id)
+        if record is not None and record.source_url:
+            source_url = record.source_url
+            raw_profile = record.metadata.get("profile")
+            if isinstance(raw_profile, str):
+                profile = raw_profile
+
+        entry = batch_store.get_entry(task_id)
+        if entry is not None and entry.source_url:
+            source_url = entry.source_url
+            profile = None
+
+        if not source_url:
+            _emit_hard_retry_error(
+                f"task {task_id} has no source URL to rebuild from",
+                json_output=json_output,
+            )
+            return 1
+
+        if record is None:
+            _emit_hard_retry_error(
+                f"task {task_id} is not a standalone Task; retry its Batch parent instead",
+                json_output=json_output,
+            )
+            return 1
+
+        history_store.append(
+            TaskEvent(
+                task_id=task_id,
+                name="hard_retry",
+                reason="hard_retry_requested",
+                payload={"source_url": source_url, "previous_status": record.status.value},
+            )
+        )
+
+        # Rebuild from scratch.
+        download_service = DownloadService(
+            registry=site_registry,
+            task_store=task_store,
+            history_store=history_store,
+            environment=env,
+        )
+        result = asyncio.run(
+            download_service.plan_task(
+                source_url,
+                profile=profile,
+                task_id=task_id,
+                force=True,
+            )
+        )
+        result_dict = result.to_dict()
+
+        if json_output:
+            print(json.dumps(result_dict, indent=2))
+        else:
+            _print_hard_retry_summary([result_dict])
+        return 0
+    except Exception as exc:
+        _emit_hard_retry_error(str(exc), json_output=json_output)
+        return 1
+
+
+def _hard_retry_batch(
+    parent_id: str,
+    *,
+    task_store: StateTaskStore,
+    batch_store: StateBatchStore,
+    history_store: StateHistoryStore,
+    site_registry: SiteRegistry,
+    runtime: ApplicationRuntime,
+    env: object,
+    json_output: bool,
+) -> int:
+    """Recreate a batch parent from its entry source URLs."""
+    # Gather entries BEFORE deletion.
+    entries = batch_store.list_entries(parent_id)
+    if not entries:
+        _emit_hard_retry_error(
+            f"batch {parent_id} has no entries to rebuild from",
+            json_output=json_output,
+        )
+        return 1
+
+    first_entry = entries[0]
+    runtime_entry = runtime.entry_for_url(first_entry.source_url)
+    if runtime_entry is None:
+        _emit_hard_retry_error(
+            f"no plugin found for URL: {first_entry.source_url}",
+            json_output=json_output,
+        )
+        return 1
+
+    route = runtime_entry.instance.classify_url(first_entry.source_url)
+    if route is None:
+        _emit_hard_retry_error(
+            f"URL is not routable: {first_entry.source_url}",
+            json_output=json_output,
+        )
+        return 1
+
+    if any(not entry.source_url for entry in entries):
+        _emit_hard_retry_error(
+            f"batch {parent_id} has no entries with source URLs",
+            json_output=json_output,
+        )
+        return 1
+
+    task_record = task_store.get(parent_id)
+    if task_record is None:
+        _emit_hard_retry_error(
+            f"batch {parent_id} has no Task row to rebuild safely",
+            json_output=json_output,
+        )
+        return 1
+    current_snapshot = batch_store.get_snapshot(parent_id)
+    rebuilt_entries = tuple(
+        replace(
+            entry,
+            entry_id=uuid4().hex,
+            parent_id=parent_id,
+            status=BatchEntryStatus.PENDING_RESOLUTION,
+            child_id=None,
+            failure=None,
+        )
+        for entry in entries
+    )
+    rebuilt_parent = BatchParent(
+        parent_id=parent_id,
+        entry_ids=tuple(entry.entry_id for entry in rebuilt_entries),
+        title=current_snapshot.parent.title or task_record.title or parent_id[:8],
+    )
+    rebuilt_task = task_record.transition(
+        status=TaskStatus.PLANNED,
+        active_run_id=None,
+        desired_control=TaskDesiredControl.RUN,
+        metadata={
+            **task_record.metadata,
+            "last_run_reason": "hard_retry",
+            "previous_status": task_record.status.value,
+        },
+    )
+    current_history = history_store.get_record(parent_id)
+    rebuilt_history = (
+        replace(current_history, status="pending", finished_at=None)
+        if isinstance(current_history, DownloadHistoryRecord)
+        else None
+    )
+    batch_store.rebuild_task_and_batch(
+        rebuilt_task,
+        rebuilt_parent,
+        rebuilt_entries,
+        history_events=(
+            TaskEvent(
+                task_id=parent_id,
+                name="hard_retry",
+                reason="hard_retry_requested",
+                payload={"previous_status": task_record.status.value},
+            ),
+        ),
+        history_record=rebuilt_history,
+    )
+
+    result = {
+        "parent_id": parent_id,
+        "type": "batch",
+        "title": rebuilt_parent.title,
+        "entries": len(rebuilt_parent.entry_ids),
+        "skipped": 0,
+    }
+
+    if json_output:
+        print(json.dumps(result, indent=2))
+    else:
+        _print_hard_retry_summary([result])
+    return 0
+
+
+def _emit_hard_retry_error(message: str, *, json_output: bool) -> None:
+    if json_output:
+        print(json.dumps({"error": message}, indent=2))
+    else:
+        translator = current_translator()
+        print(f"{translator('cli.error_prefix')}: {message}")
+
+
+def _print_hard_retry_summary(results: list[dict[str, object]]) -> None:
+    translator = current_translator()
+    rows: list[tuple[str, ...]] = []
+    for r in results:
+        task_id = str(r.get("task_id") or r.get("parent_id", ""))
+        task_type = str(r.get("type") or "item")
+        title = str(r.get("title") or r.get("name") or "")
+        entries = str(r.get("entries") or "-")
+        rows.append((task_id, task_type, title, entries))
+    print_rich_table(
+        TableSpec(
+            title=translator("cli.hard_retry_result"),
+            columns=(
+                TableColumn(translator("table.task_id"), style="cyan"),
+                TableColumn(translator("table.type"), style="magenta"),
+                TableColumn(translator("table.title"), style="green"),
+                TableColumn(translator("table.entries"), justify="right"),
+            ),
+            rows=tuple(rows),
+        )
+    )
+
+
+def _cancel_tasks(
+    service: TaskHierarchyService,
+    *,
+    task_id: str | None,
+    cancel_all: bool,
+    confirmed: bool,
+    json_output: bool = False,
+) -> int:
+    """Cancel tasks via CLI.
+
+    With a positional task id: cancel a single task (standalone or batch).
+    With ``--all``: cancel all cancellable tasks (requires ``--yes``).
+    """
+    from cli_downloader.application.task_lifecycle_service import CANCELLABLE_STATUSES
+    from cli_downloader.application.task_hierarchy_service import _STANDALONE_STATES
+
+    cancellable_task_states = {_STANDALONE_STATES[s].value for s in CANCELLABLE_STATUSES}
+
+    if not cancel_all and not task_id:
+        _emit_hard_retry_error("provide TASK_ID or --all", json_output=json_output)
+        return 2
+
+    if cancel_all:
+        if not confirmed:
+            _emit_hard_retry_error(
+                "rerun with --yes to confirm bulk cancellation",
+                json_output=json_output,
+            )
+            return 2
+
+        nodes = service.list_roots()
+        cancellable = [node for node in nodes if node.state.value in cancellable_task_states]
+        if not cancellable:
+            payload = {"cancelled": 0, "task_ids": []}
+            if json_output:
+                print(json.dumps(payload, indent=2))
+            else:
+                print(current_translator()("cli.no_cancellable_tasks"))
+            return 0
+
+        cancelled: list[str] = []
+        errors: list[dict[str, str]] = []
+        for node in cancellable:
+            try:
+                service.cancel(node.task_id)
+                cancelled.append(node.task_id)
+            except Exception as exc:
+                errors.append({"task_id": node.task_id, "error": str(exc)})
+
+        payload: dict[str, object] = {
+            "cancelled": len(cancelled),
+            "task_ids": cancelled,
+        }
+        if errors:
+            payload["errors"] = errors
+        if json_output:
+            print(json.dumps(payload, indent=2))
+        else:
+            from rich.console import Console
+
+            console = Console()
+            translator = current_translator()
+            console.print(translator("cli.cancelled_tasks", count=len(cancelled)))
+            if errors:
+                console.print(f"[red]{translator('cli.error_count', count=len(errors))}[/red]")
+        return 0 if not errors else 1
+
+    # Single task cancel.
+    try:
+        service.cancel(task_id)  # type: ignore[arg-type]
+    except CLIDownloaderError as error:
+        _emit_hard_retry_error(str(error), json_output=json_output)
+        return 1
+
+    if json_output:
+        print(json.dumps({"cancelled": [task_id]}))
+    else:
+        print(current_translator()("cli.cancelled_task", task_id=task_id))
+    return 0
+
+
+def _build_completion_store(layout: StorageLayout) -> CompletionStore:
+    return SQLiteCompletionStore(StateDatabase(layout.state_db))
