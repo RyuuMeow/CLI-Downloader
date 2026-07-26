@@ -1,0 +1,14 @@
+#page-header, #page-content, #page-actions { height: auto; }
+.core-title { color: #e58a32; text-style: bold; margin-bottom: 1; }
+.notice-warning { color: #ffaa55; }
+.notice-error { color: #d96c6c; }
+.metadata-key { text-style: bold; width: 24; }
+.field-label { margin-top: 1; }
+SelectionList, ListView { height: auto; max-height: 12; border: solid #3a3a3a; }
+SelectionList:focus, ListView:focus { border: solid #e58a32; }
+Input, Select { width: 100%; }
+Switch { margin-bottom: 1; }
+#page-actions { layout: horizontal; margin-top: 1; }
+#page-actions Button { margin-right: 1; }
+.pagination { height: auto; align-horizontal: center; }
+.pagination Static { width: auto; margin: 1 2; }

@@ -1,0 +1,94 @@
+Screen { layout: vertical; background: #171717; color: #e8e8e8; }
+#shell-title {
+    height: 1;
+    padding: 0 1;
+    text-style: bold;
+    background: #222222;
+    color: #e58a32;
+    border-bottom: solid #3a3a3a;
+}
+#shell-tabs { height: 1fr; }
+TabbedContent, TabPane { background: #171717; }
+ContentTabs { background: #222222; color: #999999; }
+ContentTab.-active { color: #ffaa55; text-style: bold; }
+ContentTabs:focus ContentTab.-active { background: #222222; }
+ContentTabs > Underline > .underline--bar {
+    color: #e58a32;
+    background: #222222;
+}
+TabPane { padding: 0 1 1 1; }
+#shell-output {
+    height: 1fr;
+    padding: 1;
+    background: #171717;
+    color: #e8e8e8;
+    border: tall #3a3a3a;
+    overflow-x: auto;
+    overflow-y: auto;
+}
+#shell-output:focus { border: solid #e58a32; }
+#shell-input { dock: bottom; margin: 0 1 1 1; }
+Input { background: #222222; color: #e8e8e8; border: solid #3a3a3a; }
+Input:focus { border: solid #ffaa55; }
+#command-row { height: 3; }
+#command-row #shell-input { width: 1fr; margin: 0; }
+#copy-command, #cancel-operation { width: auto; margin-left: 1; }
+Button { background: #222222; color: #e8e8e8; border: solid #3a3a3a; }
+Button:hover, Button:focus { color: #ffaa55; border: solid #e58a32; }
+#operation-status { height: 1; padding: 0 1; color: #999999; }
+.activity-refresh { width: auto; margin-bottom: 1; }
+.activity-table { height: 1fr; }
+.activity-detail { height: 2fr; padding: 1; overflow-y: auto; }
+#task-toolbar { height: 3; }
+#task-path { width: 1fr; padding: 1; color: #999999; }
+#task-toolbar Button { width: 5; min-width: 5; margin-left: 1; }
+#task-detail { height: auto; min-height: 4; padding: 1; }
+#operation-host { height: 1fr; overflow-y: auto; }
+#operation-toolbar { height: 3; }
+#operation-toolbar Button { width: auto; margin-left: 1; }
+#operation-view-status { width: 1fr; height: auto; padding: 0 1 1 1; }
+#operation-host CorePageView { height: 1fr; }
+#operation-host #page-content { height: 1fr; }
+#operation-host SelectionList, #operation-host ListView {
+    height: 1fr;
+    min-height: 5;
+    max-height: 100%;
+}
+SelectionList > .option-list--option-highlighted,
+SelectionList:focus > .option-list--option-highlighted {
+    color: #e8e8e8;
+    background: #5c4026;
+    text-style: none;
+}
+SelectionList > .selection-list--button,
+SelectionList > .selection-list--button-highlighted {
+    color: #999999;
+    background: #222222;
+}
+SelectionList > .selection-list--button-selected,
+SelectionList > .selection-list--button-selected-highlighted {
+    color: #e58a32;
+    background: #222222;
+}
+#settings-toolbar { height: 3; }
+#settings-path { width: 1fr; padding: 1; color: #999999; }
+#settings-toolbar Button { width: auto; min-width: 5; margin-left: 1; }
+#settings-table { height: 1fr; }
+#settings-detail { height: 6; padding: 1; color: #bdbdbd; }
+#settings-editor-row { height: 3; }
+#settings-editor, #settings-select { width: 1fr; }
+#settings-editor-row Button { width: auto; margin-left: 1; }
+#plugin-toolbar { height: 3; }
+#plugin-install-url { width: 1fr; margin: 0; }
+#plugin-toolbar Button { width: auto; margin-left: 1; }
+#plugins-table { height: 1fr; min-height: 8; overflow-x: auto; overflow-y: auto; }
+#plugin-info { margin: 1 1 0 1; height: 1; color: #bdbdbd; }
+#plugin-detail {
+    height: 12;
+    min-height: 8;
+    padding: 1;
+    border: tall #3a3a3a;
+    color: #bdbdbd;
+    overflow-x: auto;
+    overflow-y: auto;
+}
