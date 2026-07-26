@@ -1,0 +1,23 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.venv/
+venv/
+.idea/
+.tmp/
+build/
+dist/
+
+# Runtime data and user secrets
+config.toml
+secrets.toml
+downloads/
+cache/
+logs/
+state/
+.meta/
+.torrents/
+/Plugins

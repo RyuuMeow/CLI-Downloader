@@ -1,0 +1,8 @@
+{
+  "plugin_id": "example",
+  "display_name": "Example",
+  "version": "0.1.0",
+  "description": "Replace with a concise site capability description.",
+  "entrypoint": "plugin.py:Plugin",
+  "manifest": "site.json"
+}

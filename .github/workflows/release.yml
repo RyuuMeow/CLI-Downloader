@@ -1,0 +1,94 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build and publish Windows release
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Validate release metadata and extract curated notes
+        shell: pwsh
+        run: |
+          $tagVersion = $env:GITHUB_REF_NAME.Substring(1)
+          New-Item -ItemType Directory -Force -Path "build\release-notes" | Out-Null
+          python Scripts/release_notes.py `
+            --changelog CHANGELOG.md `
+            --project-file pyproject.toml `
+            --version $tagVersion `
+            --tag $env:GITHUB_REF_NAME `
+            --title-file "build\release-notes\title.txt" `
+            --body-file "build\release-notes\body.md"
+          if ($LASTEXITCODE -ne 0) { throw "Release metadata validation failed." }
+          "Release version: $tagVersion"
+
+      - name: Install verification and packaging dependencies
+        run: python -m pip install -e ".[dev,package]"
+
+      - name: Core verification gate
+        run: python Scripts/verify_plugin_suites.py
+
+      - name: Static and compile checks
+        run: |
+          python -m ruff check .
+          python -m compileall -q cli_downloader tests Plugins Scripts
+
+      - name: Build verified Portable bundle
+        shell: pwsh
+        run: .\Scripts\BuildPortable.ps1 -Python (Join-Path $env:pythonLocation "python.exe") -SkipVerification
+
+      - name: Install Inno Setup
+        shell: pwsh
+        run: choco install innosetup --no-progress --yes
+
+      - name: Build Installer from the Portable bundle
+        shell: pwsh
+        run: .\Scripts\BuildInstaller.ps1 -Version ($env:GITHUB_REF_NAME.Substring(1))
+
+      - name: Smoke-test Installer ownership
+        shell: pwsh
+        run: .\Scripts\InstallerSmoke.ps1 -InstallerPath "dist\CLI-Downloader-$($env:GITHUB_REF_NAME.Substring(1))-windows-x64-setup.exe"
+
+      - name: Generate SHA-256 checksums
+        shell: pwsh
+        run: |
+          $version = $env:GITHUB_REF_NAME.Substring(1)
+          $assets = @(
+            "dist\CLI-Downloader-$version-windows-x64-portable.zip",
+            "dist\CLI-Downloader-$version-windows-x64-setup.exe"
+          )
+          $lines = foreach ($asset in $assets) {
+            if (-not (Test-Path -LiteralPath $asset)) { throw "Missing release asset: $asset" }
+            $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $asset).Hash.ToLowerInvariant()
+            "$hash  $([IO.Path]::GetFileName($asset))"
+          }
+          $lines | Set-Content -LiteralPath "dist\CLI-Downloader-$version-windows-x64.sha256" -Encoding ASCII
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: pwsh
+        run: |
+          $version = $env:GITHUB_REF_NAME.Substring(1)
+          $releaseTitle = (Get-Content -Raw "build\release-notes\title.txt").Trim()
+          gh release create $env:GITHUB_REF_NAME `
+            "dist\CLI-Downloader-$version-windows-x64-portable.zip" `
+            "dist\CLI-Downloader-$version-windows-x64-setup.exe" `
+            "dist\CLI-Downloader-$version-windows-x64.sha256" `
+            --verify-tag `
+            --title $releaseTitle `
+            --notes-file "build\release-notes\body.md"

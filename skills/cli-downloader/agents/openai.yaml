@@ -1,0 +1,4 @@
+interface:
+  display_name: "CLI-Downloader"
+  short_description: "Operate downloads and build site plugins"
+  default_prompt: "Use $cli-downloader to inspect tasks, add a download, or research a URL and create a documented site plugin."

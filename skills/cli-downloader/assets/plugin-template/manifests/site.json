@@ -1,0 +1,34 @@
+{
+  "site_id": "example",
+  "display_name": "Example",
+  "domains": ["example.com"],
+  "url_rules": [
+    {
+      "name": "item",
+      "pattern": "^https://example\\.com/items/(?P<item_id>[A-Za-z0-9_-]+)/?$",
+      "input_kind": "single",
+      "operation": "single_download"
+    }
+  ],
+  "operations": {
+    "single_download": {
+      "name": "single_download",
+      "supported": true,
+      "requires_live_network_confirmation": true,
+      "params": {}
+    }
+  },
+  "settings": {},
+  "secrets": {},
+  "network": {
+    "max_concurrency": 1,
+    "min_interval_seconds": 1.0,
+    "retryable_status_codes": [429, 502, 503],
+    "max_attempts": 3,
+    "max_backoff_seconds": 120
+  },
+  "output": {
+    "fields": ["item_id"],
+    "default_folder_template": "{item_id}-{title}"
+  }
+}
