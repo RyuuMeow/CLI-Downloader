@@ -536,7 +536,13 @@ def main(
         )
 
     if args.command == "plugins":
-        roots = _plugin_roots(args.root)
+        if not getattr(args, "plugins_command", None):
+            try:
+                parser.parse_args(["plugins", "--help"])
+            except SystemExit as exc:
+                return exc.code if isinstance(exc.code, int) else 0
+            return 0
+        roots = _plugin_roots(getattr(args, "root", None) or getattr(args, "plugin_root", None) or [])
         if args.plugins_command == "list":
             report = scan_local_plugin_packages(
                 roots,

@@ -228,6 +228,14 @@ class CLITest(TestCase):
         self.assertIn('"status": "completed"', stream.getvalue())
         self.assertIn('"environment_mode":', stream.getvalue())
 
+    def test_plugins_command_without_subcommand_prints_help(self) -> None:
+        stream = StringIO()
+        with redirect_stdout(stream):
+            exit_code = _main(["plugins"])
+
+        self.assertEqual(exit_code, 0)
+        self.assertIn("usage: clid plugins", stream.getvalue())
+
     def test_plugins_list_reports_valid_plugin_without_executing_plugin_code(self) -> None:
         stream = StringIO()
 
