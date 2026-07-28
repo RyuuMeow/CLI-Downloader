@@ -2,6 +2,21 @@
 
 All notable changes to CLI-Downloader will be documented in this file.
 
+## v0.1.2 - 2026-07-28
+
+### Added
+
+- Added `clid plugins refresh` subcommand to force refresh the remote marketplace catalog cache.
+- Added support for auto-detecting GitHub Release ZIP assets and unwrapping archive directories during plugin installation.
+- Added comprehensive English CLI command reference and updated README documentation.
+
+### Fixed
+
+- Defaulted `clid plugins install` and management commands without `--root` to the per-user AppData directory (`installed_plugins_root()`), leaving `./Plugins` as a read-only dev override layer.
+- Fixed Marketplace UI in `clid shell` overwriting status of installed/local development plugins as `Not Installed`.
+
+---
+
 ## v0.1.1 - 2026-07-27
 
 ### Fixed
