@@ -65,7 +65,8 @@ function Remove-GeneratedDirectory {
         throw "Refusing to clean unexpected path: $Resolved"
     }
 
-    Remove-Item -LiteralPath $Resolved -Recurse -Force
+    Remove-Item -LiteralPath $Resolved -Recurse -Force -ErrorAction SilentlyContinue
+
 }
 
 function Test-DevToolsReady {

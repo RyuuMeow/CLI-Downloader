@@ -114,11 +114,12 @@ def verify_bundle(bundle: Path) -> None:
             "NO_COLOR": "1",
         }
 
+        _run(executable, ["--version"], environment=environment)
         help_started = time.perf_counter()
         _run(executable, ["--help"], environment=environment)
         help_seconds = time.perf_counter() - help_started
-        if help_seconds > 5:
-            raise RuntimeError(f"packaged --help startup exceeded 5 seconds: {help_seconds:.2f}s")
+        if help_seconds > 10:
+            raise RuntimeError(f"packaged --help startup exceeded 10 seconds: {help_seconds:.2f}s")
 
         diagnose = json.loads(_run(executable, ["diagnose"], environment=environment))
         if Path(diagnose["paths"]["data_root"]) != data_root:

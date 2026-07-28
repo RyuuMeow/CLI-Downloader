@@ -216,6 +216,16 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Output raw JSON data.",
     )
+    plugins_refresh_parser = plugins_subparsers.add_parser(
+        "refresh",
+        help="Force refresh the remote marketplace plugin catalog cache.",
+    )
+    plugins_refresh_parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Output raw JSON data.",
+    )
+
     plugins_install_parser = plugins_subparsers.add_parser(
         "install",
         help="Install a plugin from a Git URL or catalog ID.",
@@ -740,10 +750,11 @@ def main(
             )
             return 0
         plugins_dir = Path(roots[0]) if roots else installed_plugins_root()
-        if args.plugins_command == "remote":
+        if args.plugins_command in {"remote", "refresh"}:
             environment = diagnose_environment()
             service = PluginCatalogService(environment.paths.cache_dir)
-            catalog = service.load(force=getattr(args, "force", False))
+            force = True if args.plugins_command == "refresh" else getattr(args, "force", False)
+            catalog = service.load(force=force)
             if getattr(args, "json", False):
                 payload = {
                     "status": catalog.status,
@@ -763,7 +774,12 @@ def main(
                 }
                 print(json.dumps(payload, indent=2))
             else:
-                print(f"Plugin catalog: {catalog.status} ({len(catalog.entries)} entries)")
+                label = (
+                    "Refreshed plugin catalog"
+                    if args.plugins_command == "refresh"
+                    else "Plugin catalog"
+                )
+                print(f"{label}: {catalog.status} ({len(catalog.entries)} entries)")
                 for entry in catalog.entries:
                     author = f" by {entry.author}" if entry.author else ""
                     print(f" - {entry.plugin_id}: {entry.repository_url} [{entry.source}]{author}")

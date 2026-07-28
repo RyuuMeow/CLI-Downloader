@@ -733,6 +733,14 @@ class CLITest(TestCase):
         self.assertIn("status", payload)
         self.assertIn("entries", payload)
 
+    def test_plugins_refresh_command(self) -> None:
+        stream = StringIO()
+        with redirect_stdout(stream):
+            self.assertEqual(_main(["plugins", "refresh", "--json"]), 0)
+        payload = json.loads(stream.getvalue())
+        self.assertIn("status", payload)
+        self.assertIn("entries", payload)
+
     def test_plugins_versions_and_switch_command(self) -> None:
         with TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
