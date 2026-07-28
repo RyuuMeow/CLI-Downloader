@@ -125,9 +125,7 @@ async def reconcile_torrent_checkpoint(
         client_id=client_id,
         name=name,
         magnet_uri=(
-            checkpoint.get("magnet_uri")
-            if isinstance(checkpoint.get("magnet_uri"), str)
-            else None
+            checkpoint.get("magnet_uri") if isinstance(checkpoint.get("magnet_uri"), str) else None
         ),
     )
     get_status = getattr(client, "get_status", None)
@@ -210,8 +208,7 @@ def poll_supports_argument(poll_method: object, name: str) -> bool:
     except (TypeError, ValueError, OverflowError):
         return False
     return name in parameters or any(
-        parameter.kind is inspect.Parameter.VAR_KEYWORD
-        for parameter in parameters.values()
+        parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in parameters.values()
     )
 
 

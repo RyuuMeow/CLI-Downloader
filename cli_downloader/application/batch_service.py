@@ -711,7 +711,9 @@ class SystemBatchDownloader(BatchDownloadExecutor):
                         )
                     )
                     continue
-                descriptor_path = checkpoint.get("descriptor_path") if isinstance(checkpoint, Mapping) else None
+                descriptor_path = (
+                    checkpoint.get("descriptor_path") if isinstance(checkpoint, Mapping) else None
+                )
                 if not isinstance(descriptor_path, str) or not descriptor_path:
                     descriptor_path = record.final_path or str(
                         self._file_writer.paths(
@@ -870,9 +872,9 @@ class SystemBatchDownloader(BatchDownloadExecutor):
                         "cancel_requested": _cancel_requested,
                         "status_callback": _status_callback,
                     }
-                    if callable(getattr(cancel_event, "is_paused", None)) and poll_supports_argument(
-                        poll_method, "pause_requested"
-                    ):
+                    if callable(
+                        getattr(cancel_event, "is_paused", None)
+                    ) and poll_supports_argument(poll_method, "pause_requested"):
                         poll_kwargs["pause_requested"] = cancel_event.is_paused
                         if poll_supports_argument(poll_method, "pause_waiter"):
                             poll_kwargs["pause_waiter"] = cancel_event.wait_if_paused

@@ -238,9 +238,7 @@ class InteractiveShell:
         self._runtime = runtime
         self._plugins_dir = plugins_dir or Path("plugins")
         catalog_cache = cache_dir or Path("~/.cli-downloader/cache").expanduser()
-        self._plugin_catalog_service = plugin_catalog_service or PluginCatalogService(
-            catalog_cache
-        )
+        self._plugin_catalog_service = plugin_catalog_service or PluginCatalogService(catalog_cache)
 
     @property
     def translator(self) -> TranslationService:
@@ -978,7 +976,10 @@ class TextualShellApp(App[int]):
             for catalog_entry in self._plugin_catalog.entries:
                 url = catalog_entry.repository_url
                 metadata = fetch_remote_plugin_metadata(url)
-                if not metadata.get("fetch_error") and metadata.get("id") != catalog_entry.plugin_id:
+                if (
+                    not metadata.get("fetch_error")
+                    and metadata.get("id") != catalog_entry.plugin_id
+                ):
                     metadata["catalog_error"] = (
                         f"plugin.json ID {metadata.get('id')!r} does not match "
                         f"catalog ID {catalog_entry.plugin_id!r}"
@@ -1478,9 +1479,7 @@ class TextualShellApp(App[int]):
 
                 catalog_entry = self._catalog_entries.get(plugin_id)
                 remote_meta = self._fetched_remote_plugins.get(git_url) if git_url else None
-                available_version = (
-                    remote_meta.get("version", "-") if remote_meta else "-"
-                )
+                available_version = remote_meta.get("version", "-") if remote_meta else "-"
                 source = str(
                     registry.get(plugin_id, {}).get(
                         "source",
@@ -1527,7 +1526,9 @@ class TextualShellApp(App[int]):
                 "name": meta.display_name if meta else plugin_id,  # type: ignore[union-attr]
                 "version": meta.version if meta else version,  # type: ignore[union-attr]
                 "available_version": remote_meta.get("version", "-") if remote_meta else "-",
-                "source": str(info.get("source", catalog_entry.source if catalog_entry else "local")),
+                "source": str(
+                    info.get("source", catalog_entry.source if catalog_entry else "local")
+                ),
                 "author": (catalog_entry.author if catalog_entry and catalog_entry.author else "-"),
                 "description": (
                     meta.description  # type: ignore[union-attr]
@@ -1738,9 +1739,7 @@ class TextualShellApp(App[int]):
             self._fetch_remote_plugins()
         except Exception as e:
             self.query_one("#plugin-info", Static).update(
-                "[red]"
-                + self._shell.translator("plugin.info.install_failed", error=e)
-                + "[/red]"
+                "[red]" + self._shell.translator("plugin.info.install_failed", error=e) + "[/red]"
             )
 
     def _show_catalog_status(self) -> None:
@@ -1798,9 +1797,7 @@ class TextualShellApp(App[int]):
         except Exception as e:
             msg = str(e)
             self.query_one("#plugin-info", Static).update(
-                "[red]"
-                + self._shell.translator("plugin.info.update_failed", error=msg)
-                + "[/red]"
+                "[red]" + self._shell.translator("plugin.info.update_failed", error=msg) + "[/red]"
             )
 
     def _remove_plugin(self) -> None:
@@ -1830,9 +1827,7 @@ class TextualShellApp(App[int]):
             self._selected_plugin_installed = False
         except Exception as e:
             self.query_one("#plugin-info", Static).update(
-                "[red]"
-                + self._shell.translator("plugin.info.remove_failed", error=e)
-                + "[/red]"
+                "[red]" + self._shell.translator("plugin.info.remove_failed", error=e) + "[/red]"
             )
 
     def _open_plugin_github(self) -> None:
@@ -1876,7 +1871,16 @@ class TextualShellApp(App[int]):
         translator = self._shell.translator
         path_labels = {
             part: translator(f"settings.category.{part}")
-            for part in ("general", "interface", "download", "tasks", "torrent", "network", "plugins", "about")
+            for part in (
+                "general",
+                "interface",
+                "download",
+                "tasks",
+                "torrent",
+                "network",
+                "plugins",
+                "about",
+            )
         }
         self.query_one("#settings-path", Static).update(
             " / ".join(
@@ -2018,13 +2022,13 @@ class TextualShellApp(App[int]):
         for index, (row_id, name, value, access) in enumerate(rows, start=1):
             table.add_row(str(index), name, value, access, key=row_id)
         detail = (
-                translator(
-                    "settings.detail.about",
-                    project=PROJECT_NAME,
-                    version=__version__,
-                    update=update_text,
-                    repository=REPOSITORY_URL or translator("plugin.detail.unavailable"),
-                )
+            translator(
+                "settings.detail.about",
+                project=PROJECT_NAME,
+                version=__version__,
+                update=update_text,
+                repository=REPOSITORY_URL or translator("plugin.detail.unavailable"),
+            )
             if path == ("about",)
             else (
                 translator("settings.detail.select")
@@ -2495,9 +2499,7 @@ class TextualShellApp(App[int]):
             return
         self._enable_selection_buttons(False)
         self.query_one("#operation-view-status", Static).update(
-            self._shell.translator(
-                "operation.loading_pages_start", total=total_pages
-            )
+            self._shell.translator("operation.loading_pages_start", total=total_pages)
         )
         thread = Thread(
             target=self._run_select_all_pages,
@@ -2552,9 +2554,7 @@ class TextualShellApp(App[int]):
         if error:
             count = len(self._selected_items)
             self.query_one("#operation-view-status", Static).update(
-                self._shell.translator(
-                    "operation.selection_error", count=count, error=error
-                )
+                self._shell.translator("operation.selection_error", count=count, error=error)
             )
         else:
             self._update_selection_status()
@@ -2837,9 +2837,7 @@ class TextualShellApp(App[int]):
         if level == "roots":
             self._active_batch_id = None
             self._active_batch_name = None
-            self.query_one("#task-path", Static).update(
-                self._shell.translator("task.path")
-            )
+            self.query_one("#task-path", Static).update(self._shell.translator("task.path"))
             empty_text = self._shell.translator("task.no_tasks")
         else:
             self.query_one("#task-path", Static).update(
@@ -2851,9 +2849,7 @@ class TextualShellApp(App[int]):
         back.disabled = level == "roots"
         back.display = level != "roots"
         self.query_one("#task-detail", Static).update(
-            empty_text
-            if not nodes
-            else self._shell.translator("task.choose_detail")
+            empty_text if not nodes else self._shell.translator("task.choose_detail")
         )
         selected = self._task_nodes.get(self._active_task_id or "")
         if selected is not None:
@@ -3137,9 +3133,7 @@ class TextualShellApp(App[int]):
         self._task_level = "files"
         task_label = self._shell.translator("task.path")
         parent_path = (
-            f"{task_label} / {self._active_batch_name} / "
-            if node.parent_id
-            else f"{task_label} / "
+            f"{task_label} / {self._active_batch_name} / " if node.parent_id else f"{task_label} / "
         )
         self.query_one("#task-path", Static).update(f"{parent_path}{node.title}")
         self.query_one("#task-table", DataTable).display = False
@@ -3472,13 +3466,18 @@ def _is_embedded_operation_command(argv: Sequence[str]) -> bool:
 
 
 def _shell_task_id(argv: Sequence[str]) -> str | None:
-    if len(argv) >= 3 and argv[0] == "tasks" and argv[1] in {
-        "show",
-        "retry",
-        "resume",
-        "hard-retry",
-        "cancel",
-    }:
+    if (
+        len(argv) >= 3
+        and argv[0] == "tasks"
+        and argv[1]
+        in {
+            "show",
+            "retry",
+            "resume",
+            "hard-retry",
+            "cancel",
+        }
+    ):
         return argv[2]
     if len(argv) >= 3 and argv[0] == "batches" and argv[1] in {"show", "retry", "resume"}:
         return argv[2]

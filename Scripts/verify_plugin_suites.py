@@ -41,7 +41,8 @@ def _core_suite(loader: unittest.TestLoader) -> unittest.TestSuite:
 
 def _run_suite(label: str, suite: unittest.TestSuite) -> bool:
     print(f"\n=== {label} ===")
-    result = unittest.TextTestRunner(verbosity=1).run(suite)
+    result = unittest.TextTestRunner(stream=sys.stdout, verbosity=1).run(suite)
+
     status = "PASS" if result.wasSuccessful() else "FAIL"
     print(f"[{status}] {label}: {result.testsRun} tests")
     return result.wasSuccessful()
@@ -60,7 +61,8 @@ def _run_isolated_module(path: Path) -> bool:
     if completed.stdout:
         print(completed.stdout, end="")
     if completed.stderr:
-        print(completed.stderr, end="", file=sys.stderr)
+        print(completed.stderr, end="")
+
     success = completed.returncode == 0
     status = "PASS" if success else "FAIL"
     print(f"[{status}] {label}")
@@ -71,9 +73,7 @@ def main(argv: list[str] | None = None) -> int:
     loader = unittest.TestLoader()
     success = True
     for module_name in sorted(ISOLATED_CORE_MODULES):
-        success = (
-            _run_isolated_module(CORE_TEST_ROOT / f"{module_name}.py") and success
-        )
+        success = _run_isolated_module(CORE_TEST_ROOT / f"{module_name}.py") and success
     success = _run_suite("Core", _core_suite(loader)) and success
     print("\nVerification gate: PASS" if success else "\nVerification gate: FAIL")
     return 0 if success else 1

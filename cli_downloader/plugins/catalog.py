@@ -199,6 +199,7 @@ class PluginCatalogService:
         )
         temporary.replace(path)
 
+
 def parse_catalog_document(payload: object, *, expected_source: str) -> _CatalogDocument:
     if not isinstance(payload, dict):
         raise PluginCatalogError("catalog root must be an object")

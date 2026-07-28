@@ -682,9 +682,7 @@ class WriteAssetsStage:
                     bytes_written=0,
                 )
                 if reconciliation.outcome is not None:
-                    self._persist_torrent_outcome(
-                        context.task_id, asset, reconciliation.outcome
-                    )
+                    self._persist_torrent_outcome(context.task_id, asset, reconciliation.outcome)
             else:
                 content = await self._fetcher.fetch(asset)
                 written = self._file_writer.write(
@@ -829,9 +827,7 @@ class WriteAssetsStage:
         checkpoint = checkpoints.get(_torrent_checkpoint_key(asset))
         return checkpoint if isinstance(checkpoint, Mapping) else None
 
-    def _persist_torrent_outcome(
-        self, task_id: str, asset: Asset, outcome: TorrentOutcome
-    ) -> None:
+    def _persist_torrent_outcome(self, task_id: str, asset: Asset, outcome: TorrentOutcome) -> None:
         current = self._task_store.get(task_id)
         if current is None:
             raise RuntimeError(f"task disappeared during torrent download: {task_id}")

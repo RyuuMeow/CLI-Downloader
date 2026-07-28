@@ -200,8 +200,7 @@ class ItemScheduler:
         candidates = [
             waiter
             for waiter in heads.values()
-            if self._active_by_site[waiter.site_id]
-            < self.max_concurrent_downloads_per_site
+            if self._active_by_site[waiter.site_id] < self.max_concurrent_downloads_per_site
         ]
         if not candidates:
             return []
@@ -210,9 +209,7 @@ class ItemScheduler:
         # next child. A sole root can still borrow every idle global slot.
         if self.policy is SchedulerPolicy.ROUND_ROBIN and len(candidates) > 1:
             candidates = [
-                waiter
-                for waiter in candidates
-                if self._active_by_root[waiter.root_id] == 0
+                waiter for waiter in candidates if self._active_by_root[waiter.root_id] == 0
             ] or candidates
         return candidates
 

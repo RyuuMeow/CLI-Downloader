@@ -552,9 +552,7 @@ class TaskHierarchyService:
                     continue
                 client_id = checkpoint.get("client_id")
                 live_key = (
-                    f"{record.task_id}:torrent:{client_id}"
-                    if isinstance(client_id, str)
-                    else None
+                    f"{record.task_id}:torrent:{client_id}" if isinstance(client_id, str) else None
                 )
                 if live_key is not None and live_key in self._byte_progress_by_asset:
                     c, t = self._byte_progress_by_asset[live_key]

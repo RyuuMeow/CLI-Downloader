@@ -121,9 +121,7 @@ def validate_catalogs() -> tuple[str, ...]:
     required = set(catalogs[0].values)
     missing: list[str] = []
     for catalog in catalogs[1:]:
-        missing.extend(
-            f"{catalog.locale}:{key}" for key in sorted(required - set(catalog.values))
-        )
+        missing.extend(f"{catalog.locale}:{key}" for key in sorted(required - set(catalog.values)))
     return tuple(missing)
 
 

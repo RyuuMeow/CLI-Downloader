@@ -33,7 +33,11 @@ def extract_release_notes(text: str, version: str) -> ReleaseNotes:
     if not normalized_version:
         raise ValueError("release version must not be empty")
 
-    matches = [match for match in _HEADING_RE.finditer(text) if match.group("version") == normalized_version]
+    matches = [
+        match
+        for match in _HEADING_RE.finditer(text)
+        if match.group("version") == normalized_version
+    ]
     if len(matches) != 1:
         if not matches:
             raise ValueError(f"missing changelog entry for v{normalized_version}")
@@ -44,7 +48,9 @@ def extract_release_notes(text: str, version: str) -> ReleaseNotes:
     try:
         date.fromisoformat(release_date)
     except ValueError as error:
-        raise ValueError(f"invalid release date for v{normalized_version}: {release_date}") from error
+        raise ValueError(
+            f"invalid release date for v{normalized_version}: {release_date}"
+        ) from error
 
     next_heading = re.search(r"^## ", text[match.end() :], flags=re.MULTILINE)
     entry_end = match.end() + next_heading.start() if next_heading else len(text)

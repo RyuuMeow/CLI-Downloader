@@ -92,7 +92,9 @@ def run_doctor(
             )
             break
     else:
-        checks.append(_passed("storage.directories", "Required application directories are writable."))
+        checks.append(
+            _passed("storage.directories", "Required application directories are writable.")
+        )
 
     try:
         database = StateDatabase(paths.state_dir / "state.sqlite3")
@@ -149,9 +151,15 @@ def run_doctor(
                 probe = network_probe or _probe_url
                 try:
                     detail = probe(url)
-                    checks.append(_passed("torrent.qbittorrent", "qBittorrent endpoint is reachable.", detail))
+                    checks.append(
+                        _passed("torrent.qbittorrent", "qBittorrent endpoint is reachable.", detail)
+                    )
                 except Exception as error:
-                    checks.append(_failed("torrent.qbittorrent", "qBittorrent endpoint is unreachable.", error))
+                    checks.append(
+                        _failed(
+                            "torrent.qbittorrent", "qBittorrent endpoint is unreachable.", error
+                        )
+                    )
             else:
                 checks.append(
                     DoctorCheck(
@@ -163,7 +171,9 @@ def run_doctor(
                     )
                 )
         else:
-            checks.append(_passed("torrent.qbittorrent", "No qBittorrent integration is configured."))
+            checks.append(
+                _passed("torrent.qbittorrent", "No qBittorrent integration is configured.")
+            )
 
     if network:
         checks.append(_passed("network.enabled", "Network checks were explicitly enabled."))
@@ -187,4 +197,6 @@ def _passed(check_id: str, summary: str, details: object = "") -> DoctorCheck:
 
 
 def _failed(check_id: str, summary: str, error: object) -> DoctorCheck:
-    return DoctorCheck(check_id, "error", "fail", summary, str(error).strip() or type(error).__name__)
+    return DoctorCheck(
+        check_id, "error", "fail", summary, str(error).strip() or type(error).__name__
+    )

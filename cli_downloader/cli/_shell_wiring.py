@@ -50,9 +50,7 @@ def build_interactive_shell(
     runtime: ApplicationRuntime,
     plugins_dir: Path,
     runner: Callable[[Sequence[str]], int],
-    background_runner: Callable[
-        [Sequence[str], object, ProgressSink, GalleryDownloadLimiter], int
-    ],
+    background_runner: Callable[[Sequence[str], object, ProgressSink, GalleryDownloadLimiter], int],
     operation_runner: Callable[[str, Mapping[str, object]], object] | None = None,
 ) -> int:
     """Build and run the interactive shell for an already-loaded runtime."""
@@ -73,9 +71,7 @@ def build_interactive_shell(
     batch_store = StateBatchStore(StateDatabase(layout.state_db))
     history_store = StateHistoryStore(StateDatabase(layout.state_db))
     startup_commands = _recover_interrupted_downloads(task_store, batch_store, history_store)
-    browser_login = BrowserLoginService(
-        profile_root=environment.paths.cache_dir / "browser-auth"
-    )
+    browser_login = BrowserLoginService(profile_root=environment.paths.cache_dir / "browser-auth")
 
     def validate_browser_session(plugin_id, session):
         plugin = runtime.plugin_for_id(plugin_id)
