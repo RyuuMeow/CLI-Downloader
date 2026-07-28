@@ -165,10 +165,12 @@ CLI-Downloader is an open-source download framework provided "AS IS". We do not 
 
 ## Documentation
 
+- [CLI Command Reference](docs/CLI-Commands.md)
 - [Project scope and behavior](docs/CLI-Downloader.md)
 - [System architecture](docs/structure/SystemDesign.md)
 - [Repository structure](docs/structure/SystemStructure.md)
 - [Changelog](CHANGELOG.md)
+
 
 ## License
 Released under the [MIT License](LICENSE).

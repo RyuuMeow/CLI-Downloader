@@ -165,10 +165,12 @@ CLI-Downloader 是一个开源的下载框架，以“现状 (AS IS)”提供。
 
 ## 说明文档
 
+- [CLI 命令手册 (CLI Command Reference)](docs/CLI-Commands.md)
 - [项目范围与行为](docs/CLI-Downloader.md)
 - [系统架构](docs/structure/SystemDesign.md)
 - [存储库结构](docs/structure/SystemStructure.md)
 - [更新日志](CHANGELOG.md)
+
 
 ## 授权条款
 采用 [MIT License](LICENSE) 发布。
