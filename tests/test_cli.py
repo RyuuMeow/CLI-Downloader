@@ -402,6 +402,27 @@ class CLITest(TestCase):
         self.assertEqual(exit_code, 0)
         self.assertIn("sample\tSample", stream.getvalue())
 
+    def test_plugins_install_defaults_to_installed_plugins_root(self) -> None:
+        with TemporaryDirectory() as directory:
+            appdata_plugins = Path(directory) / "CLI-Downloader" / "plugins"
+            with patch("cli_downloader.cli.app.installed_plugins_root", return_value=appdata_plugins):
+                with patch("cli_downloader.cli.app.install_plugin", return_value="1.0.0") as mock_install:
+                    stream = StringIO()
+                    with redirect_stdout(stream):
+                        exit_code = _main(["plugins", "install", "https://github.com/example/test.git", "--json"])
+                    self.assertEqual(exit_code, 0)
+                    mock_install.assert_called_once_with(appdata_plugins, "https://github.com/example/test.git", catalog_id=None)
+
+    def test_plugins_install_honors_explicit_root(self) -> None:
+        with TemporaryDirectory() as directory:
+            custom_root = Path(directory) / "my_plugins"
+            with patch("cli_downloader.cli.app.install_plugin", return_value="1.0.0") as mock_install:
+                stream = StringIO()
+                with redirect_stdout(stream):
+                    exit_code = _main(["plugins", "install", "https://github.com/example/test.git", "--root", str(custom_root), "--json"])
+                self.assertEqual(exit_code, 0)
+                mock_install.assert_called_once_with(custom_root, "https://github.com/example/test.git", catalog_id=None)
+
     def test_tasks_lists_persisted_tasks(self) -> None:
         with TemporaryDirectory() as directory:
             with patch.dict("os.environ", {"CLI_DOWNLOADER_DATA_ROOT": directory}):

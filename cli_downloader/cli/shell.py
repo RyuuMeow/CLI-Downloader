@@ -1433,6 +1433,13 @@ class TextualShellApp(App[int]):
         table.clear()
 
         registry = load_registry(self._shell._plugins_dir)
+        dev_plugins_dir = Path("Plugins")
+        if dev_plugins_dir.is_dir() and dev_plugins_dir.resolve() != self._shell._plugins_dir.resolve():
+            dev_reg = load_registry(dev_plugins_dir)
+            for p_id, p_info in dev_reg.items():
+                if p_id not in registry:
+                    registry[p_id] = p_info
+
         plugins: dict[str, dict[str, object]] = {}
         installed_urls: set[str] = set()
         local_meta: dict[str, object] = {}
@@ -1473,11 +1480,13 @@ class TextualShellApp(App[int]):
                     else "Installed external plugin."
                 )
 
+                catalog_entry = self._catalog_entries.get(plugin_id)
                 git_url = registry.get(plugin_id, {}).get("git_url", "")
+                if not git_url and catalog_entry:
+                    git_url = catalog_entry.repository_url
                 if git_url:
                     installed_urls.add(git_url)
 
-                catalog_entry = self._catalog_entries.get(plugin_id)
                 remote_meta = self._fetched_remote_plugins.get(git_url) if git_url else None
                 available_version = remote_meta.get("version", "-") if remote_meta else "-"
                 source = str(
@@ -1549,7 +1558,7 @@ class TextualShellApp(App[int]):
         # ── Phase 2: not-installed Official and Community catalog plugins ──
         for catalog_entry in self._plugin_catalog.entries:
             git_url = catalog_entry.repository_url
-            if git_url in installed_urls:
+            if git_url in installed_urls or catalog_entry.plugin_id in plugins:
                 continue
 
             entry = self._fetched_remote_plugins.get(git_url)

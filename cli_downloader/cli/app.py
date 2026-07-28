@@ -712,9 +712,10 @@ def main(
             except SystemExit as exc:
                 return exc.code if isinstance(exc.code, int) else 0
             return 0
-        roots = _plugin_roots(
+        user_specified_roots = (
             getattr(args, "root", None) or getattr(args, "plugin_root", None) or []
         )
+        roots = _plugin_roots(user_specified_roots)
         if args.plugins_command == "list":
             report = scan_local_plugin_packages(
                 roots,
@@ -749,7 +750,9 @@ def main(
                 )
             )
             return 0
-        plugins_dir = Path(roots[0]) if roots else installed_plugins_root()
+        plugins_dir = (
+            Path(user_specified_roots[0]) if user_specified_roots else installed_plugins_root()
+        )
         if args.plugins_command in {"remote", "refresh"}:
             environment = diagnose_environment()
             service = PluginCatalogService(environment.paths.cache_dir)
