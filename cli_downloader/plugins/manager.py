@@ -8,7 +8,9 @@ from pathlib import Path
 import tempfile
 import urllib.error
 import urllib.request
+import zipfile
 from urllib.parse import urlparse
+
 
 from cli_downloader.plugins.metadata import (
     metadata_compatibility_error,
@@ -144,6 +146,12 @@ def _metadata_fallback(name: str, git_url: str) -> dict[str, object]:
 
 def _install_plugin_dependencies(plugin_dir: Path) -> None:
     """Install runtime requirements into a staging directory inside one plugin version."""
+    deps_dir = plugin_dir / "deps"
+    if deps_dir.is_dir() and any(deps_dir.iterdir()):
+        # Pre-packaged vendor dependencies exist (e.g. built by GitHub Actions into repo or release bundle).
+        # Skip running pip install on user machine.
+        return
+
     requirements = plugin_dir / "requirements.txt"
     if not requirements.is_file():
         return
@@ -190,8 +198,85 @@ def _install_plugin_dependencies(plugin_dir: Path) -> None:
             shutil.rmtree(staging, ignore_errors=True)
 
 
+def _extract_zip_archive(zip_path: Path, target_dir: Path) -> None:
+    """Extract a .zip file and unwrap single top-level directory if present."""
+    target_dir.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(zip_path, "r") as zf:
+        zf.extractall(target_dir)
+
+    entries = [
+        child for child in target_dir.iterdir() if child.name not in {".DS_Store", "__MACOSX"}
+    ]
+    if len(entries) == 1 and entries[0].is_dir() and not (target_dir / "plugin.json").exists():
+        single_dir = entries[0]
+        for child in single_dir.iterdir():
+            shutil.move(str(child), str(target_dir / child.name))
+        shutil.rmtree(single_dir, ignore_errors=True)
+
+
+def _download_and_extract_zip(zip_url: str, target_dir: Path) -> None:
+    """Download a .zip file via HTTP and extract it into target_dir."""
+    req = urllib.request.Request(zip_url, headers={"User-Agent": "cli-downloader"})
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        content = resp.read()
+
+    tmp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".zip", delete=False) as tmp_file:
+            tmp_file.write(content)
+            tmp_path = Path(tmp_file.name)
+        _extract_zip_archive(tmp_path, target_dir)
+    finally:
+        if tmp_path is not None and tmp_path.exists():
+            tmp_path.unlink(missing_ok=True)
+
+
+def _find_github_latest_release_zip_url(git_url: str) -> str | None:
+    """Query GitHub API for latest release assets and return the first .zip download URL."""
+    m = _GITHUB_URL_RE.match(git_url)
+    if m is None:
+        return None
+    owner, repo = m[1], m[2]
+    api_url = f"https://api.github.com/repos/{owner}/{repo}/releases/latest"
+    try:
+        req = urllib.request.Request(
+            api_url,
+            headers={
+                "Accept": "application/vnd.github+json",
+                "User-Agent": "cli-downloader",
+            },
+        )
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            payload = json.loads(resp.read().decode("utf-8"))
+        if (
+            isinstance(payload, dict)
+            and "assets" in payload
+            and isinstance(payload["assets"], list)
+        ):
+            for asset in payload["assets"]:
+                if isinstance(asset, dict):
+                    name = asset.get("name", "")
+                    download_url = asset.get("browser_download_url")
+                    if (
+                        isinstance(name, str)
+                        and name.lower().endswith(".zip")
+                        and isinstance(download_url, str)
+                    ):
+                        return download_url
+    except Exception:
+        pass
+    return None
+
+
 def _prepare_plugin_source(git_url: str, target_dir: Path) -> None:
-    """Materialize a plugin checkout without spawning Git for local file URLs."""
+    """Materialize a plugin checkout or release archive.
+
+    Supports:
+    - file:// URLs (directory or .zip archive)
+    - Direct .zip URLs or /releases/download/ URLs
+    - GitHub repository URLs: queries GitHub API for latest release assets,
+      downloads the first .zip asset if present, otherwise falls back to git clone.
+    """
     if git_url.startswith("file://"):
         local_path = Path(urlparse(git_url).path)
         # On Windows, file:///C:/... is parsed as /C:/... by urllib.
@@ -200,6 +285,21 @@ def _prepare_plugin_source(git_url: str, target_dir: Path) -> None:
         if local_path.is_dir():
             shutil.copytree(local_path, target_dir, dirs_exist_ok=True)
             return
+        if local_path.is_file() and local_path.name.lower().endswith(".zip"):
+            _extract_zip_archive(local_path, target_dir)
+            return
+
+    if git_url.lower().endswith(".zip") or "/releases/download/" in git_url:
+        _download_and_extract_zip(git_url, target_dir)
+        return
+
+    zip_url = _find_github_latest_release_zip_url(git_url)
+    if zip_url is not None:
+        try:
+            _download_and_extract_zip(zip_url, target_dir)
+            return
+        except Exception:
+            pass
 
     subprocess.run(
         ["git", "clone", git_url, str(target_dir)],
