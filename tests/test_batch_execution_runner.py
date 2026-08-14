@@ -195,7 +195,7 @@ class CoordinatedBatchRunnerTests(TestCase):
             resolver.release.set()
             results = await asyncio.wait_for(
                 asyncio.gather(running, duplicate, return_exceptions=True),
-                timeout=1,
+                timeout=ASYNC_TEST_TIMEOUT,
             )
 
             record = tasks.get("parent-1")
