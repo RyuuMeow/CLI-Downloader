@@ -2,6 +2,14 @@
 
 All notable changes to CLI-Downloader will be documented in this file.
 
+## v0.1.3 - 2026-08-14
+
+### Fixed
+
+- Prevented expired or incomplete Plugin browser sessions from aborting CLI startup while preserving malformed-session and Cookie-domain validation, allowing users to reauthenticate from the Shell settings.
+
+---
+
 ## v0.1.2 - 2026-07-28
 
 ### Added
