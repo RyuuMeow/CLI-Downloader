@@ -4,7 +4,7 @@ import re
 from dataclasses import dataclass
 from typing import Any, Callable
 
-from cli_downloader.core.browser_auth import browser_session_cookies, browser_session_has_cookies
+from cli_downloader.core.browser_auth import browser_session_cookies
 from cli_downloader.core.errors import ConfigValidationError
 from cli_downloader.core.output import validate_folder_template
 from cli_downloader.sites.manifest import BrowserAuthSchema, SettingSchema, SiteManifest
@@ -214,8 +214,8 @@ class SettingsRegistry:
                 for cookie in cookies
             ):
                 raise ConfigValidationError(f"browser session contains a disallowed domain: {key}")
-            if not browser_session_has_cookies(value, auth.required_cookies):
-                raise ConfigValidationError(f"browser session is expired or incomplete: {key}")
+            # Expiry and required-cookie completeness are recoverable connection states.
+            # The settings UI must be able to load the session and offer reauthentication.
 
     def context(
         self,
