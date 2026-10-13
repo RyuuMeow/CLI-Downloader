@@ -2,10 +2,11 @@
 
 All notable changes to CLI-Downloader will be documented in this file.
 
-## Unreleased (0.1.4)
+## v0.1.4 - 2026-10-13
 
 ### Added
 
+- Added a single scheduler Owner with CLI-to-Shell IPC, durable control receipts, restart recovery and shutdown fencing.
 - Shared site HTTP admission across listing, pagination, preparation and asset downloads through versioned plugin HTTP services; exposed effective policy and coverage in Settings and `network status --json`.
 - Routed external plugin operations through the live Owner with capability negotiation, preserving one shared network budget across CLI processes.
 - Persisted site cooldowns, honored Retry-After across phases and restarts, and counted explicit redirects and safe per-request retries.
@@ -23,6 +24,8 @@ All notable changes to CLI-Downloader will be documented in this file.
 - Released Item and request permits at pause boundaries and prevented canceled request waiters from leaking capacity.
 - Paged Tasks roots as well as Batch children, aggregated root progress in bulk, and reused one scheduler snapshot per refresh. Slow refreshes no longer invalidate themselves; returning from details restores the page, and delayed events from hidden tables cannot overwrite file actions.
 - Migrated the legacy gallery concurrency setting when no scheduler limit was explicitly configured.
+
+---
 
 ## v0.1.3 - 2026-08-14
 
