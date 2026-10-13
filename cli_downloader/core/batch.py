@@ -773,7 +773,9 @@ class BatchSummary:
     total_bytes: int | None = None
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "parent_id", _require_text(self.parent_id, "batch_summary.parent_id"))
+        object.__setattr__(
+            self, "parent_id", _require_text(self.parent_id, "batch_summary.parent_id")
+        )
         object.__setattr__(self, "title", _optional_text(self.title, "batch_summary.title"))
         object.__setattr__(
             self,
@@ -982,7 +984,9 @@ class AssetRecord:
                 "content_sha256",
                 _require_hex_digest(self.content_sha256, "asset_record.content_sha256"),
             )
-        object.__setattr__(self, "metadata", _freeze_json_object(self.metadata, "asset_record.metadata"))
+        object.__setattr__(
+            self, "metadata", _freeze_json_object(self.metadata, "asset_record.metadata")
+        )
 
     def to_dict(self) -> dict[str, JsonValue]:
         return {

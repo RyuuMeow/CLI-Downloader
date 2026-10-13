@@ -96,7 +96,13 @@ def build_interactive_shell(
             owner_mode=OwnerMode.SHELL,
             lifecycle_state=OwnerLifecycleState.RECOVERING,
             session_id=session_id,
-            capabilities=("download", "task_control", "task_query", "history_query", "shell_status"),
+            capabilities=(
+                "download",
+                "task_control",
+                "task_query",
+                "history_query",
+                "shell_status",
+            ),
         )
         lease = OwnerManager(scope).acquire(metadata)
     elif lease.scope != scope:
@@ -121,7 +127,13 @@ def build_interactive_shell(
                 owner_mode=OwnerMode.SHELL,
                 lifecycle_state=OwnerLifecycleState.STOPPING,
                 session_id=session_id,
-                capabilities=("download", "task_control", "task_query", "history_query", "shell_status"),
+                capabilities=(
+                    "download",
+                    "task_control",
+                    "task_query",
+                    "history_query",
+                    "shell_status",
+                ),
             )
             try:
                 lease.publish(stopping)
@@ -165,9 +177,7 @@ def _build_interactive_shell_impl(
     execution_lock = Lock()
     active_cancellations: set[object] = set()
     active_workers: set[Thread] = set()
-    browser_login = BrowserLoginService(
-        profile_root=environment.paths.cache_dir / "browser-auth"
-    )
+    browser_login = BrowserLoginService(profile_root=environment.paths.cache_dir / "browser-auth")
 
     def validate_browser_session(plugin_id, session):
         plugin = runtime.plugin_for_id(plugin_id)
@@ -268,7 +278,13 @@ def _build_interactive_shell_impl(
                     owner_mode=OwnerMode.SHELL,
                     lifecycle_state=OwnerLifecycleState.STOPPING,
                     session_id=owner_session_id or new_owner_session_id(),
-                    capabilities=("download", "task_control", "task_query", "history_query", "shell_status"),
+                    capabilities=(
+                        "download",
+                        "task_control",
+                        "task_query",
+                        "history_query",
+                        "shell_status",
+                    ),
                 )
             )
         if first_request and owner_server is not None:
@@ -298,7 +314,9 @@ def _build_interactive_shell_impl(
         deadline = monotonic() + timeout
         while monotonic() < deadline:
             with execution_lock:
-                workers = tuple(worker for worker in active_workers if worker is not current_thread())
+                workers = tuple(
+                    worker for worker in active_workers if worker is not current_thread()
+                )
             if not workers:
                 break
             for worker in workers:
@@ -322,7 +340,13 @@ def _build_interactive_shell_impl(
                 owner_mode=OwnerMode.SHELL,
                 lifecycle_state=OwnerLifecycleState.READY,
                 session_id=owner_session_id or new_owner_session_id(),
-                capabilities=("download", "task_control", "task_query", "history_query", "shell_status"),
+                capabilities=(
+                    "download",
+                    "task_control",
+                    "task_query",
+                    "history_query",
+                    "shell_status",
+                ),
             )
         )
 
@@ -355,7 +379,13 @@ def _build_interactive_shell_impl(
                 session_id=owner_session_id,
                 mode=OwnerMode.SHELL,
                 application_version=__version__,
-                capabilities=("download", "task_query", "task_control", "history_query", "shell_status"),
+                capabilities=(
+                    "download",
+                    "task_query",
+                    "task_control",
+                    "history_query",
+                    "shell_status",
+                ),
                 scope_fingerprint=owner_lease.scope.scope_fingerprint,
             ),
             handler=lambda request, emit: _handle_owner_request(
@@ -539,7 +569,9 @@ def _handle_owner_download(
             )
         ):
             accepted.set()
-            Thread(target=heartbeat, name=f"owner-heartbeat-{request.request_id[:8]}", daemon=True).start()
+            Thread(
+                target=heartbeat, name=f"owner-heartbeat-{request.request_id[:8]}", daemon=True
+            ).start()
 
     def heartbeat() -> None:
         while not heartbeat_stop.wait(5.0):
@@ -569,7 +601,9 @@ def _handle_owner_download(
                 status=reason,
                 progress=ratio,
                 file_count=current if isinstance(current, int) and current >= 0 else None,
-                message=str(progress_payload.get("message")) if progress_payload.get("message") else None,
+                message=str(progress_payload.get("message"))
+                if progress_payload.get("message")
+                else None,
             )
         )
 
@@ -738,11 +772,7 @@ def _handle_owner_control(
         applied = None
         actual_status = None
         desired_control = (
-            "pause"
-            if action == "pause"
-            else "cancel"
-            if action == "cancel"
-            else "run"
+            "pause" if action == "pause" else "cancel" if action == "cancel" else "run"
         )
         quiescent = None
         phase = None
@@ -750,7 +780,9 @@ def _handle_owner_control(
             acknowledged = bool(getattr(receipt, "requested", acknowledged))
             applied = bool(getattr(receipt, "applied", False))
             actual_status = getattr(getattr(receipt, "actual_status", None), "value", None)
-            desired_control = getattr(getattr(receipt, "desired_control", None), "value", desired_control)
+            desired_control = getattr(
+                getattr(receipt, "desired_control", None), "value", desired_control
+            )
             quiescent = bool(getattr(receipt, "quiescent", False))
             phase = getattr(receipt, "phase", None)
             receipt_revision = getattr(receipt, "revision", None)
@@ -787,7 +819,9 @@ def _handle_owner_control(
                 status=terminal_status,
                 task_id=task_id,
                 exit_code=terminal_exit_code,
-                result={**serialised, "output": output.getvalue()} if isinstance(serialised, dict) else {"value": serialised},
+                result={**serialised, "output": output.getvalue()}
+                if isinstance(serialised, dict)
+                else {"value": serialised},
                 error=(
                     {"phase": phase, "message": "task control is still pending"}
                     if applied is False and phase == "pending"
@@ -808,6 +842,7 @@ def _handle_owner_control(
                 error={"message": str(error)},
             )
         )
+
 
 def _recover_interrupted_downloads(
     task_store: StateTaskStore,

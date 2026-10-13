@@ -19,7 +19,11 @@ from cli_downloader.core.owner_protocol import (
     OwnerWaitPolicy,
 )
 from cli_downloader.core.owner_scope import OwnerScope
-from cli_downloader.core.owner_transport import OwnerPipeClient, OwnerPipeServer, OwnerTransportError
+from cli_downloader.core.owner_transport import (
+    OwnerPipeClient,
+    OwnerPipeServer,
+    OwnerTransportError,
+)
 from tests.owner_transport_worker import orphan_owner_process
 
 
@@ -411,7 +415,9 @@ class OwnerPipeTransportTests(unittest.TestCase):
         self.assertEqual([event.kind.value for event in events], ["accepted"])
         self.assertEqual(events[0].payload["task_id"], "slow-accept-task")
 
-    def test_crashed_owner_does_not_leave_wait_client_blocked_and_replays_task_identity(self) -> None:
+    def test_crashed_owner_does_not_leave_wait_client_blocked_and_replays_task_identity(
+        self,
+    ) -> None:
         context = multiprocessing.get_context("spawn")
         with tempfile.TemporaryDirectory() as directory:
             scope = OwnerScope.from_data_root(directory)
@@ -460,7 +466,9 @@ class OwnerPipeTransportTests(unittest.TestCase):
             process.join(15)
             self.assertFalse(process.is_alive())
             client_thread.join(5)
-            self.assertFalse(client_thread.is_alive(), "WAIT client remained blocked after owner crash")
+            self.assertFalse(
+                client_thread.is_alive(), "WAIT client remained blocked after owner crash"
+            )
             self.assertTrue(events)
             self.assertEqual(events[-1].kind.value, "owner_disconnected")
             self.assertEqual(events[-1].payload["known_task_id"], "orphan-task")
@@ -508,9 +516,7 @@ class OwnerPipeTransportTests(unittest.TestCase):
             try:
                 metadata = json.loads(server._metadata_path.read_text(encoding="utf-8"))
                 metadata["scope_fingerprint"] = "f" * 64
-                server._metadata_path.write_text(
-                    json.dumps(metadata), encoding="utf-8"
-                )
+                server._metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
                 with self.assertRaises(OwnerTransportError):
                     OwnerPipeClient(scope)._load_endpoint()
             finally:

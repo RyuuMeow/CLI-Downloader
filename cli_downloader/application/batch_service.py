@@ -350,29 +350,27 @@ class BatchService:
             title=title or parent_id[:8],
         )
         task_metadata = {
-                "batch_selection": {
-                    "plugin_id": plugin_id,
-                    "site_id": site_id,
-                    "source_operation_id": source_operation_id,
-                    "strategy": strategy.value,
-                    "items": [
-                        {
-                            "candidate_id": item.item_id,
-                            "source_url": item.source_url,
-                            "title": item.title,
-                        }
-                        for item in selected
-                    ],
-                },
-                "scheduler": {
-                    "root_id": parent_id,
-                    "enqueue_sequence": 0,
-                    "site_id": site_id,
-                    "entry_order": {
-                        entry.entry_id: sequence for sequence, entry in enumerate(entries)
-                    },
-                },
-            }
+            "batch_selection": {
+                "plugin_id": plugin_id,
+                "site_id": site_id,
+                "source_operation_id": source_operation_id,
+                "strategy": strategy.value,
+                "items": [
+                    {
+                        "candidate_id": item.item_id,
+                        "source_url": item.source_url,
+                        "title": item.title,
+                    }
+                    for item in selected
+                ],
+            },
+            "scheduler": {
+                "root_id": parent_id,
+                "enqueue_sequence": 0,
+                "site_id": site_id,
+                "entry_order": {entry.entry_id: sequence for sequence, entry in enumerate(entries)},
+            },
+        }
         if existing_task is None:
             task_record = TaskRecord(
                 task_id=parent_id,
@@ -412,7 +410,9 @@ class BatchService:
             title=parent.title,
             source_url=source_url,
             status=TaskStatus.PENDING.value,
-            created_at=(existing_history.created_at if existing_history is not None else datetime.now(UTC)),
+            created_at=(
+                existing_history.created_at if existing_history is not None else datetime.now(UTC)
+            ),
         )
         provisional_snapshot = derive_batch_snapshot(parent, entries, ())
         events_to_append = tuple(
@@ -944,7 +944,9 @@ class SystemBatchDownloader(BatchDownloadExecutor):
                         )
                     )
                     continue
-                descriptor_path = checkpoint.get("descriptor_path") if isinstance(checkpoint, Mapping) else None
+                descriptor_path = (
+                    checkpoint.get("descriptor_path") if isinstance(checkpoint, Mapping) else None
+                )
                 if not isinstance(descriptor_path, str) or not descriptor_path:
                     descriptor_path = record.final_path or str(
                         self._file_writer.paths(
@@ -1115,9 +1117,9 @@ class SystemBatchDownloader(BatchDownloadExecutor):
                     }
                     if poll_supports_argument(poll_method, "shutdown_requested"):
                         poll_kwargs["shutdown_requested"] = _shutdown_requested
-                    if callable(getattr(cancel_event, "is_paused", None)) and poll_supports_argument(
-                        poll_method, "pause_requested"
-                    ):
+                    if callable(
+                        getattr(cancel_event, "is_paused", None)
+                    ) and poll_supports_argument(poll_method, "pause_requested"):
                         poll_kwargs["pause_requested"] = cancel_event.is_paused
                         if poll_supports_argument(poll_method, "pause_waiter"):
                             poll_kwargs["pause_waiter"] = cancel_event.wait_if_paused

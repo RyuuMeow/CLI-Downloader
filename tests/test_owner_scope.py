@@ -62,7 +62,9 @@ class OwnerScopeTests(unittest.TestCase):
             first = OwnerScope.from_data_root(root, user_identity="S-1-5-21-test")
             same = OwnerScope.from_data_root(alias, user_identity="S-1-5-21-test")
             other_user = OwnerScope.from_data_root(root, user_identity="S-1-5-21-other")
-            other_root = OwnerScope.from_data_root(Path(directory) / "Other", user_identity="S-1-5-21-test")
+            other_root = OwnerScope.from_data_root(
+                Path(directory) / "Other", user_identity="S-1-5-21-test"
+            )
 
             self.assertEqual(first.scope_fingerprint, same.scope_fingerprint)
             self.assertEqual(first.lock_path, same.lock_path)
@@ -144,8 +146,12 @@ class OwnerScopeTests(unittest.TestCase):
 
     def test_two_independent_data_roots_can_be_owned_together(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            first = OwnerScope.from_data_root(Path(directory) / "one", user_identity="S-1-5-21-test")
-            second = OwnerScope.from_data_root(Path(directory) / "two", user_identity="S-1-5-21-test")
+            first = OwnerScope.from_data_root(
+                Path(directory) / "one", user_identity="S-1-5-21-test"
+            )
+            second = OwnerScope.from_data_root(
+                Path(directory) / "two", user_identity="S-1-5-21-test"
+            )
 
             with first.lock().acquire(), second.lock().acquire():
                 self.assertTrue(first.lock_path.exists())
@@ -167,7 +173,9 @@ class OwnerScopeTests(unittest.TestCase):
 
 
 class OwnerProcessLockTests(unittest.TestCase):
-    def _start_holder(self, root: str, *, crash: bool) -> tuple[object, object, multiprocessing.Process]:
+    def _start_holder(
+        self, root: str, *, crash: bool
+    ) -> tuple[object, object, multiprocessing.Process]:
         context = multiprocessing.get_context("spawn")
         ready = context.Event()
         release = context.Event()
@@ -191,7 +199,6 @@ class OwnerProcessLockTests(unittest.TestCase):
             with scope.lock().acquire():
                 pass
 
-
     def test_crashed_owner_releases_os_lock_without_manual_cleanup(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             _ready, _release, process = self._start_holder(directory, crash=True)
@@ -210,7 +217,9 @@ class OwnerExecutionIntegrationTests(unittest.TestCase):
             runtime = build_example_runtime()
             with patch.dict(os.environ, {"CLI_DOWNLOADER_DATA_ROOT": directory}):
                 with OwnerManager(scope).acquire(make_metadata(scope)):
-                    with patch("cli_downloader.cli.app._run_generic_download", return_value=0) as dispatch:
+                    with patch(
+                        "cli_downloader.cli.app._run_generic_download", return_value=0
+                    ) as dispatch:
                         exit_code = main(
                             ["download", "https://example.test/gallery/42", "--json"],
                             runtime=runtime,

@@ -72,7 +72,9 @@ def _frame(payload: dict[str, object]) -> bytes:
     )
 
 
-def _write_endpoint_metadata(path: Path, *, family: str, address: object, scope: OwnerScope) -> None:
+def _write_endpoint_metadata(
+    path: Path, *, family: str, address: object, scope: OwnerScope
+) -> None:
     """Publish only scoped, non-secret endpoint coordinates atomically."""
 
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -366,7 +368,9 @@ class OwnerPipeServer:
             persisted = self.persistence.get(request)
             if persisted is not None:
                 if not persisted:
-                    raise OwnerTransportError("request is already persisted without a response; inspect the Task by ID")
+                    raise OwnerTransportError(
+                        "request is already persisted without a response; inspect the Task by ID"
+                    )
                 for event in persisted:
                     send(event.to_bytes())
                 return
@@ -397,7 +401,9 @@ class OwnerPipeServer:
                     if isinstance(status, str):
                         from cli_downloader.core.owner_protocol import OwnerTerminalStatus
 
-                        self.ledger.mark_terminal(event.request_id, status=OwnerTerminalStatus(status))
+                        self.ledger.mark_terminal(
+                            event.request_id, status=OwnerTerminalStatus(status)
+                        )
                 self.persistence.append(request, event)
                 send(event.to_bytes())
 
@@ -415,7 +421,10 @@ class OwnerPipeServer:
                     _frame(
                         {
                             "frame": "transport_error",
-                            "error": {"code": getattr(error, "code", "owner_transport_error"), "message": str(error)},
+                            "error": {
+                                "code": getattr(error, "code", "owner_transport_error"),
+                                "message": str(error),
+                            },
                         }
                     )
                 )
@@ -478,11 +487,15 @@ class OwnerPipeClient:
                     else self.wait_policy.acceptance_timeout
                 )
                 raw = self._recv_bytes(connection, wait_timeout)
-                if raw.startswith(b'{'):
+                if raw.startswith(b"{"):
                     frame = json.loads(raw.decode("utf-8"))
                     if isinstance(frame, dict) and frame.get("frame") == "transport_error":
                         error = frame.get("error", {})
-                        message = error.get("message", "owner transport failed") if isinstance(error, dict) else str(error)
+                        message = (
+                            error.get("message", "owner transport failed")
+                            if isinstance(error, dict)
+                            else str(error)
+                        )
                         raise OwnerTransportError(message)
                 event = OwnerResponseEvent.from_bytes(raw)
                 stream.push(event)
@@ -491,7 +504,10 @@ class OwnerPipeClient:
                     on_event(event)
                 if event.kind.value in {"terminal", "owner_disconnected"}:
                     break
-                if request.response_mode is OwnerResponseMode.DETACH and event.kind.value == "accepted":
+                if (
+                    request.response_mode is OwnerResponseMode.DETACH
+                    and event.kind.value == "accepted"
+                ):
                     break
         except (OSError, EOFError, ValueError, OwnerTransportError) as error:
             if stream.accepted:
@@ -565,9 +581,7 @@ class OwnerPipeClient:
 
             def connect() -> None:
                 try:
-                    result.append(
-                        Client(address, family=family, authkey=_auth_key(self.scope))
-                    )
+                    result.append(Client(address, family=family, authkey=_auth_key(self.scope)))
                 except BaseException as error:  # surfaced below as OwnerTransportError
                     failure.append(error)
 
@@ -581,7 +595,9 @@ class OwnerPipeClient:
             if failure:
                 last_failure = failure[0]
             sleep(0.05)
-        raise OwnerTransportError(f"cannot connect to owner endpoint: {last_failure}") from last_failure
+        raise OwnerTransportError(
+            f"cannot connect to owner endpoint: {last_failure}"
+        ) from last_failure
 
     @staticmethod
     def _wait_for_windows_pipe(address: str, *, deadline: float) -> None:
@@ -602,9 +618,7 @@ class OwnerPipeClient:
         if kernel32.WaitNamedPipeW(address, remaining_ms):
             return
         error = ctypes.get_last_error()
-        raise OwnerTransportError(
-            f"owner named-pipe endpoint is unavailable (WinError {error})"
-        )
+        raise OwnerTransportError(f"owner named-pipe endpoint is unavailable (WinError {error})")
 
     def _load_endpoint(self):
         try:

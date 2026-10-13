@@ -134,14 +134,9 @@ class P520CheckpointTests(IsolatedAsyncioTestCase):
 
             def sink(event) -> None:
                 nonlocal byte_updates, paused
-                if (
-                    event.payload.get("progress_reason") == "byte_progress"
-                ):
+                if event.payload.get("progress_reason") == "byte_progress":
                     byte_updates += 1
-                if (
-                    not paused
-                    and event.payload.get("progress_reason") == "byte_progress"
-                ):
+                if not paused and event.payload.get("progress_reason") == "byte_progress":
                     paused = True
                     assert pipeline_a is not None
                     pipeline_a.pause("parent-a")

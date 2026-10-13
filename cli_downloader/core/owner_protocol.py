@@ -34,7 +34,9 @@ _FINGERPRINT_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 
 JsonScalar: TypeAlias = str | int | float | bool | None
 JsonValue: TypeAlias = JsonScalar | list["JsonValue"] | dict[str, "JsonValue"]
-FrozenJsonValue: TypeAlias = JsonScalar | tuple["FrozenJsonValue", ...] | Mapping[str, "FrozenJsonValue"]
+FrozenJsonValue: TypeAlias = (
+    JsonScalar | tuple["FrozenJsonValue", ...] | Mapping[str, "FrozenJsonValue"]
+)
 
 
 class OwnerMode(StrEnum):
@@ -141,7 +143,11 @@ def _require_token(value: object, path: str, *, maximum: int = 128) -> str:
 
 def _require_identifier(value: object, path: str) -> str:
     if not isinstance(value, str) or not _IDENTIFIER_PATTERN.fullmatch(value):
-        raise _error("invalid_identifier", path, "must use lowercase letters, numbers, dots, underscores, or hyphens")
+        raise _error(
+            "invalid_identifier",
+            path,
+            "must use lowercase letters, numbers, dots, underscores, or hyphens",
+        )
     return value
 
 
@@ -191,7 +197,9 @@ def _protocol_version(value: object, path: str) -> int:
     return value
 
 
-def _require_finite_non_negative_float(value: object, path: str, *, maximum: float | None = None) -> float:
+def _require_finite_non_negative_float(
+    value: object, path: str, *, maximum: float | None = None
+) -> float:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise _error("invalid_number", path, "must be a finite non-negative number")
     result = float(value)
@@ -202,7 +210,9 @@ def _require_finite_non_negative_float(value: object, path: str, *, maximum: flo
     return result
 
 
-def _freeze_json(value: object, path: str, *, depth: int = 0, active: set[int] | None = None) -> FrozenJsonValue:
+def _freeze_json(
+    value: object, path: str, *, depth: int = 0, active: set[int] | None = None
+) -> FrozenJsonValue:
     if depth > _MAX_JSON_DEPTH:
         raise _error("json_depth_exceeded", path, f"must not exceed {_MAX_JSON_DEPTH} levels")
     if value is None or isinstance(value, (str, bool, int)):
@@ -220,7 +230,9 @@ def _freeze_json(value: object, path: str, *, depth: int = 0, active: set[int] |
         active = set()
     if isinstance(value, Mapping):
         if len(value) > _MAX_MAP_ITEMS:
-            raise _error("json_object_too_large", path, f"must contain at most {_MAX_MAP_ITEMS} keys")
+            raise _error(
+                "json_object_too_large", path, f"must contain at most {_MAX_MAP_ITEMS} keys"
+            )
         object_id = id(value)
         if object_id in active:
             raise _error("json_cycle", path, "must not contain reference cycles")
@@ -235,13 +247,18 @@ def _freeze_json(value: object, path: str, *, depth: int = 0, active: set[int] |
         return MappingProxyType(frozen)
     if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
         if len(value) > _MAX_SEQUENCE_ITEMS:
-            raise _error("json_array_too_large", path, f"must contain at most {_MAX_SEQUENCE_ITEMS} items")
+            raise _error(
+                "json_array_too_large", path, f"must contain at most {_MAX_SEQUENCE_ITEMS} items"
+            )
         object_id = id(value)
         if object_id in active:
             raise _error("json_cycle", path, "must not contain reference cycles")
         active.add(object_id)
         try:
-            return tuple(_freeze_json(item, f"{path}[{index}]", depth=depth + 1, active=active) for index, item in enumerate(value))
+            return tuple(
+                _freeze_json(item, f"{path}[{index}]", depth=depth + 1, active=active)
+                for index, item in enumerate(value)
+            )
         finally:
             active.remove(object_id)
     raise _error("non_json_value", path, "must contain only JSON-compatible values")
@@ -265,7 +282,9 @@ def _thaw_json(value: FrozenJsonValue) -> JsonValue:
 def _freeze_identifiers(value: object, path: str) -> tuple[str, ...]:
     if not isinstance(value, Sequence) or isinstance(value, (str, bytes, bytearray)):
         raise _error("invalid_sequence", path, "must be a sequence of identifiers")
-    result = tuple(_require_identifier(item, f"{path}[{index}]") for index, item in enumerate(value))
+    result = tuple(
+        _require_identifier(item, f"{path}[{index}]") for index, item in enumerate(value)
+    )
     if len(result) != len(set(result)):
         raise _error("duplicate_value", path, "must not contain duplicate values")
     return result
@@ -300,24 +319,58 @@ def _parse_datetime(value: object, path: str) -> datetime:
 def _check_keys(value: Mapping[str, object], path: str, allowed: frozenset[str]) -> None:
     unknown = sorted(set(value) - allowed)
     if unknown:
-        raise _error("unknown_field", f"{path}.{unknown[0]}", "is not part of this protocol contract")
+        raise _error(
+            "unknown_field", f"{path}.{unknown[0]}", "is not part of this protocol contract"
+        )
 
 
 _COMMAND_FIELDS: dict[OwnerCommand, frozenset[str]] = {
-    OwnerCommand.DOWNLOAD: frozenset({"url", "params", "settings", "setting_refs", "secret_refs", "strategy", "select", "selection_policy", "confirmations", "profile", "force"}),
+    OwnerCommand.DOWNLOAD: frozenset(
+        {
+            "url",
+            "params",
+            "settings",
+            "setting_refs",
+            "secret_refs",
+            "strategy",
+            "select",
+            "selection_policy",
+            "confirmations",
+            "profile",
+            "force",
+        }
+    ),
     OwnerCommand.TASK_CONTROL: frozenset({"task_id", "action", "expected_revision"}),
     OwnerCommand.TASK_QUERY: frozenset({"task_id", "include_children"}),
     OwnerCommand.HISTORY_QUERY: frozenset({"task_id", "child"}),
     OwnerCommand.SHELL_STATUS: frozenset(),
     OwnerCommand.PING: frozenset(),
 }
-_FORBIDDEN_PAYLOAD_FIELDS = frozenset({"command_line", "shell_command", "python", "callable", "executable", "cookies", "token", "password", "secret"})
+_FORBIDDEN_PAYLOAD_FIELDS = frozenset(
+    {
+        "command_line",
+        "shell_command",
+        "python",
+        "callable",
+        "executable",
+        "cookies",
+        "token",
+        "password",
+        "secret",
+    }
+)
 
 
-def _validate_command_payload(command: OwnerCommand, payload: Mapping[str, FrozenJsonValue]) -> None:
+def _validate_command_payload(
+    command: OwnerCommand, payload: Mapping[str, FrozenJsonValue]
+) -> None:
     forbidden = sorted(set(payload) & _FORBIDDEN_PAYLOAD_FIELDS)
     if forbidden:
-        raise _error("forbidden_field", f"request.payload.{forbidden[0]}", "raw process commands and secret values are not allowed")
+        raise _error(
+            "forbidden_field",
+            f"request.payload.{forbidden[0]}",
+            "raw process commands and secret values are not allowed",
+        )
     _check_keys(payload, "request.payload", _COMMAND_FIELDS[command])
     if command is OwnerCommand.DOWNLOAD:
         if "url" not in payload:
@@ -386,13 +439,33 @@ class OwnerHandshake:
     scope_fingerprint: str | None = None
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "protocol_version", _protocol_version(self.protocol_version, "handshake.protocol_version"))
-        object.__setattr__(self, "session_id", _require_token(self.session_id, "handshake.session_id"))
+        object.__setattr__(
+            self,
+            "protocol_version",
+            _protocol_version(self.protocol_version, "handshake.protocol_version"),
+        )
+        object.__setattr__(
+            self, "session_id", _require_token(self.session_id, "handshake.session_id")
+        )
         object.__setattr__(self, "mode", _enum(self.mode, OwnerMode, "handshake.mode"))
-        object.__setattr__(self, "application_version", _require_text(self.application_version, "handshake.application_version", maximum=64))
-        object.__setattr__(self, "capabilities", _freeze_identifiers(self.capabilities, "handshake.capabilities"))
-        object.__setattr__(self, "required_capabilities", _freeze_identifiers(self.required_capabilities, "handshake.required_capabilities"))
-        object.__setattr__(self, "scope_fingerprint", _optional_fingerprint(self.scope_fingerprint, "handshake.scope_fingerprint"))
+        object.__setattr__(
+            self,
+            "application_version",
+            _require_text(self.application_version, "handshake.application_version", maximum=64),
+        )
+        object.__setattr__(
+            self, "capabilities", _freeze_identifiers(self.capabilities, "handshake.capabilities")
+        )
+        object.__setattr__(
+            self,
+            "required_capabilities",
+            _freeze_identifiers(self.required_capabilities, "handshake.required_capabilities"),
+        )
+        object.__setattr__(
+            self,
+            "scope_fingerprint",
+            _optional_fingerprint(self.scope_fingerprint, "handshake.scope_fingerprint"),
+        )
 
     def to_dict(self) -> dict[str, JsonValue]:
         return {
@@ -447,10 +520,26 @@ class OwnerHandshakeResult:
     negotiated_capabilities: tuple[str, ...]
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "protocol_version", _protocol_version(self.protocol_version, "handshake_result.protocol_version"))
-        object.__setattr__(self, "owner_session_id", _require_token(self.owner_session_id, "handshake_result.owner_session_id"))
-        object.__setattr__(self, "owner_mode", _enum(self.owner_mode, OwnerMode, "handshake_result.owner_mode"))
-        object.__setattr__(self, "negotiated_capabilities", _freeze_identifiers(self.negotiated_capabilities, "handshake_result.negotiated_capabilities"))
+        object.__setattr__(
+            self,
+            "protocol_version",
+            _protocol_version(self.protocol_version, "handshake_result.protocol_version"),
+        )
+        object.__setattr__(
+            self,
+            "owner_session_id",
+            _require_token(self.owner_session_id, "handshake_result.owner_session_id"),
+        )
+        object.__setattr__(
+            self, "owner_mode", _enum(self.owner_mode, OwnerMode, "handshake_result.owner_mode")
+        )
+        object.__setattr__(
+            self,
+            "negotiated_capabilities",
+            _freeze_identifiers(
+                self.negotiated_capabilities, "handshake_result.negotiated_capabilities"
+            ),
+        )
 
     def to_dict(self) -> dict[str, JsonValue]:
         return {
@@ -463,16 +552,33 @@ class OwnerHandshakeResult:
 
 def negotiate_handshake(client: OwnerHandshake, owner: OwnerHandshake) -> OwnerHandshakeResult:
     if client.protocol_version != owner.protocol_version:
-        raise _error("protocol_mismatch", "handshake.protocol_version", "client and owner protocol versions differ")
+        raise _error(
+            "protocol_mismatch",
+            "handshake.protocol_version",
+            "client and owner protocol versions differ",
+        )
     if (client.scope_fingerprint is None) != (owner.scope_fingerprint is None):
-        raise _error("scope_mismatch", "handshake.scope_fingerprint", "client and owner must identify the same data-root scope")
+        raise _error(
+            "scope_mismatch",
+            "handshake.scope_fingerprint",
+            "client and owner must identify the same data-root scope",
+        )
     if client.scope_fingerprint is not None and client.scope_fingerprint != owner.scope_fingerprint:
-        raise _error("scope_mismatch", "handshake.scope_fingerprint", "client and owner data roots differ")
+        raise _error(
+            "scope_mismatch", "handshake.scope_fingerprint", "client and owner data roots differ"
+        )
     client_capabilities = set(client.capabilities)
     owner_capabilities = set(owner.capabilities)
-    missing = sorted((set(client.required_capabilities) - owner_capabilities) | (set(owner.required_capabilities) - client_capabilities))
+    missing = sorted(
+        (set(client.required_capabilities) - owner_capabilities)
+        | (set(owner.required_capabilities) - client_capabilities)
+    )
     if missing:
-        raise _error("unsupported_capability", "handshake.capabilities", f"required capabilities are unavailable: {', '.join(missing)}")
+        raise _error(
+            "unsupported_capability",
+            "handshake.capabilities",
+            f"required capabilities are unavailable: {', '.join(missing)}",
+        )
     return OwnerHandshakeResult(
         protocol_version=owner.protocol_version,
         owner_session_id=owner.session_id,
@@ -493,14 +599,28 @@ class OwnerRequest:
     created_at: datetime = field(default_factory=lambda: datetime.now(UTC))
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "protocol_version", _protocol_version(self.protocol_version, "request.protocol_version"))
-        object.__setattr__(self, "request_id", _require_token(self.request_id, "request.request_id"))
+        object.__setattr__(
+            self,
+            "protocol_version",
+            _protocol_version(self.protocol_version, "request.protocol_version"),
+        )
+        object.__setattr__(
+            self, "request_id", _require_token(self.request_id, "request.request_id")
+        )
         object.__setattr__(self, "source", _enum(self.source, OwnerSource, "request.source"))
         object.__setattr__(self, "command", _enum(self.command, OwnerCommand, "request.command"))
-        object.__setattr__(self, "response_mode", _enum(self.response_mode, OwnerResponseMode, "request.response_mode"))
+        object.__setattr__(
+            self,
+            "response_mode",
+            _enum(self.response_mode, OwnerResponseMode, "request.response_mode"),
+        )
         object.__setattr__(self, "payload", _freeze_json_object(self.payload, "request.payload"))
         _validate_command_payload(self.command, self.payload)
-        object.__setattr__(self, "client_session_id", _optional_text(self.client_session_id, "request.client_session_id", maximum=128))
+        object.__setattr__(
+            self,
+            "client_session_id",
+            _optional_text(self.client_session_id, "request.client_session_id", maximum=128),
+        )
         object.__setattr__(self, "created_at", _utc_datetime(self.created_at, "request.created_at"))
 
     def to_dict(self) -> dict[str, JsonValue]:
@@ -519,8 +639,31 @@ class OwnerRequest:
     def from_dict(cls, value: object) -> "OwnerRequest":
         if not isinstance(value, Mapping):
             raise _error("invalid_envelope", "request", "must be an object")
-        _check_keys(value, "request", frozenset({"protocol_version", "request_id", "source", "command", "response_mode", "payload", "client_session_id", "created_at"}))
-        required = ("protocol_version", "request_id", "source", "command", "response_mode", "payload", "created_at")
+        _check_keys(
+            value,
+            "request",
+            frozenset(
+                {
+                    "protocol_version",
+                    "request_id",
+                    "source",
+                    "command",
+                    "response_mode",
+                    "payload",
+                    "client_session_id",
+                    "created_at",
+                }
+            ),
+        )
+        required = (
+            "protocol_version",
+            "request_id",
+            "source",
+            "command",
+            "response_mode",
+            "payload",
+            "created_at",
+        )
         for key in required:
             if key not in value:
                 raise _error("missing_field", f"request.{key}", "is required")
@@ -538,13 +681,17 @@ class OwnerRequest:
     def to_bytes(self, *, max_frame_bytes: int = DEFAULT_MAX_FRAME_BYTES) -> bytes:
         if not isinstance(max_frame_bytes, int) or max_frame_bytes <= 0:
             raise _error("invalid_integer", "request.max_frame_bytes", "must be greater than zero")
-        encoded = json.dumps(self.to_dict(), ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        encoded = json.dumps(
+            self.to_dict(), ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
         if len(encoded) > max_frame_bytes:
             raise _error("frame_too_large", "request", f"must not exceed {max_frame_bytes} bytes")
         return encoded
 
     @classmethod
-    def from_bytes(cls, value: bytes, *, max_frame_bytes: int = DEFAULT_MAX_FRAME_BYTES) -> "OwnerRequest":
+    def from_bytes(
+        cls, value: bytes, *, max_frame_bytes: int = DEFAULT_MAX_FRAME_BYTES
+    ) -> "OwnerRequest":
         if not isinstance(value, bytes):
             raise _error("invalid_frame", "request", "must be encoded as bytes")
         if len(value) > max_frame_bytes:
@@ -558,7 +705,13 @@ class OwnerRequest:
 
 def _event_payload(kind: OwnerEventKind, payload: Mapping[str, FrozenJsonValue]) -> None:
     if kind is OwnerEventKind.ACCEPTED:
-        _check_keys(payload, "event.payload", frozenset({"owner_session_id", "owner_pid", "accepted_at", "task_id", "task_kind", "queued"}))
+        _check_keys(
+            payload,
+            "event.payload",
+            frozenset(
+                {"owner_session_id", "owner_pid", "accepted_at", "task_id", "task_kind", "queued"}
+            ),
+        )
         for name in ("owner_session_id", "task_id", "task_kind"):
             if name in payload:
                 _require_token(payload[name], f"event.payload.{name}")
@@ -572,13 +725,29 @@ def _event_payload(kind: OwnerEventKind, payload: Mapping[str, FrozenJsonValue])
         if "owner_session_id" not in payload:
             raise _error("missing_field", "event.payload.owner_session_id", "is required")
     elif kind is OwnerEventKind.PROGRESS:
-        _check_keys(payload, "event.payload", frozenset({"task_id", "status", "progress", "downloaded_bytes", "total_bytes", "file_count", "message"}))
+        _check_keys(
+            payload,
+            "event.payload",
+            frozenset(
+                {
+                    "task_id",
+                    "status",
+                    "progress",
+                    "downloaded_bytes",
+                    "total_bytes",
+                    "file_count",
+                    "message",
+                }
+            ),
+        )
         for name in ("task_id", "status"):
             if name not in payload:
                 raise _error("missing_field", f"event.payload.{name}", "is required")
             _require_token(payload[name], f"event.payload.{name}")
         if "progress" in payload:
-            _require_finite_non_negative_float(payload["progress"], "event.payload.progress", maximum=1.0)
+            _require_finite_non_negative_float(
+                payload["progress"], "event.payload.progress", maximum=1.0
+            )
         for name in ("downloaded_bytes", "total_bytes", "file_count"):
             if name in payload:
                 _require_non_negative_int(payload[name], f"event.payload.{name}")
@@ -622,31 +791,64 @@ def _event_payload(kind: OwnerEventKind, payload: Mapping[str, FrozenJsonValue])
     elif kind is OwnerEventKind.HEARTBEAT:
         _check_keys(payload, "event.payload", frozenset({"owner_session_id", "emitted_at"}))
         if "owner_session_id" not in payload or "emitted_at" not in payload:
-            raise _error("missing_field", "event.payload", "owner_session_id and emitted_at are required")
+            raise _error(
+                "missing_field", "event.payload", "owner_session_id and emitted_at are required"
+            )
         _require_token(payload["owner_session_id"], "event.payload.owner_session_id")
         _parse_datetime(payload["emitted_at"], "event.payload.emitted_at")
     elif kind is OwnerEventKind.TERMINAL:
-        _check_keys(payload, "event.payload", frozenset({"status", "task_id", "exit_code", "result", "error"}))
+        _check_keys(
+            payload,
+            "event.payload",
+            frozenset({"status", "task_id", "exit_code", "result", "error"}),
+        )
         if "status" not in payload:
             raise _error("missing_field", "event.payload.status", "is required")
         _enum(payload["status"], OwnerTerminalStatus, "event.payload.status")
         if "task_id" in payload:
             _require_token(payload["task_id"], "event.payload.task_id")
-        if "exit_code" in payload and (isinstance(payload["exit_code"], bool) or not isinstance(payload["exit_code"], int)):
+        if "exit_code" in payload and (
+            isinstance(payload["exit_code"], bool) or not isinstance(payload["exit_code"], int)
+        ):
             raise _error("invalid_integer", "event.payload.exit_code", "must be an integer")
         for name in ("result", "error"):
             if name in payload:
                 _freeze_json_object(payload[name], f"event.payload.{name}")
     elif kind is OwnerEventKind.OWNER_DISCONNECTED:
-        _check_keys(payload, "event.payload", frozenset({"phase", "outcome", "known_task_id", "owner_session_id", "last_sequence", "message", "terminal_persisted"}))
+        _check_keys(
+            payload,
+            "event.payload",
+            frozenset(
+                {
+                    "phase",
+                    "outcome",
+                    "known_task_id",
+                    "owner_session_id",
+                    "last_sequence",
+                    "message",
+                    "terminal_persisted",
+                }
+            ),
+        )
         if "phase" not in payload or "outcome" not in payload:
             raise _error("missing_field", "event.payload", "phase and outcome are required")
         phase = _enum(payload["phase"], OwnerWaitPhase, "event.payload.phase")
         outcome = _enum(payload["outcome"], OwnerDisconnectOutcome, "event.payload.outcome")
         if outcome is OwnerDisconnectOutcome.NOT_ACCEPTED and phase is OwnerWaitPhase.RESPONSE_IDLE:
-            raise _error("invalid_disconnect_outcome", "event.payload.outcome", "not_accepted cannot follow response idle")
-        if outcome is not OwnerDisconnectOutcome.NOT_ACCEPTED and phase is not OwnerWaitPhase.RESPONSE_IDLE:
-            raise _error("invalid_disconnect_outcome", "event.payload.outcome", "accepted outcomes require response idle")
+            raise _error(
+                "invalid_disconnect_outcome",
+                "event.payload.outcome",
+                "not_accepted cannot follow response idle",
+            )
+        if (
+            outcome is not OwnerDisconnectOutcome.NOT_ACCEPTED
+            and phase is not OwnerWaitPhase.RESPONSE_IDLE
+        ):
+            raise _error(
+                "invalid_disconnect_outcome",
+                "event.payload.outcome",
+                "accepted outcomes require response idle",
+            )
         for name in ("known_task_id", "owner_session_id"):
             if name in payload:
                 _require_token(payload[name], f"event.payload.{name}")
@@ -654,10 +856,28 @@ def _event_payload(kind: OwnerEventKind, payload: Mapping[str, FrozenJsonValue])
             _require_text(payload["message"], "event.payload.message")
         if "last_sequence" in payload:
             _require_non_negative_int(payload["last_sequence"], "event.payload.last_sequence")
-        if outcome in {OwnerDisconnectOutcome.ACCEPTED_COMPLETION_UNKNOWN, OwnerDisconnectOutcome.TERMINAL_RESULT_LOST} and "known_task_id" not in payload:
-            raise _error("missing_task_id", "event.payload.known_task_id", "accepted disconnect outcomes require the known Task ID")
-        if outcome is OwnerDisconnectOutcome.TERMINAL_RESULT_LOST and payload.get("terminal_persisted") is not True:
-            raise _error("missing_terminal_evidence", "event.payload.terminal_persisted", "must be true when terminal result was persisted")
+        if (
+            outcome
+            in {
+                OwnerDisconnectOutcome.ACCEPTED_COMPLETION_UNKNOWN,
+                OwnerDisconnectOutcome.TERMINAL_RESULT_LOST,
+            }
+            and "known_task_id" not in payload
+        ):
+            raise _error(
+                "missing_task_id",
+                "event.payload.known_task_id",
+                "accepted disconnect outcomes require the known Task ID",
+            )
+        if (
+            outcome is OwnerDisconnectOutcome.TERMINAL_RESULT_LOST
+            and payload.get("terminal_persisted") is not True
+        ):
+            raise _error(
+                "missing_terminal_evidence",
+                "event.payload.terminal_persisted",
+                "must be true when terminal result was persisted",
+            )
 
 
 @dataclass(frozen=True)
@@ -677,8 +897,23 @@ class OwnerResponseEvent:
         _event_payload(self.kind, self.payload)
 
     @classmethod
-    def accepted(cls, request_id: str, sequence: int, *, owner_session_id: str, accepted_at: datetime, task_id: str | None = None, task_kind: str | None = None, queued: bool = True, owner_pid: int | None = None) -> "OwnerResponseEvent":
-        payload: dict[str, object] = {"owner_session_id": owner_session_id, "accepted_at": _utc_datetime(accepted_at, "event.payload.accepted_at").isoformat(), "queued": queued}
+    def accepted(
+        cls,
+        request_id: str,
+        sequence: int,
+        *,
+        owner_session_id: str,
+        accepted_at: datetime,
+        task_id: str | None = None,
+        task_kind: str | None = None,
+        queued: bool = True,
+        owner_pid: int | None = None,
+    ) -> "OwnerResponseEvent":
+        payload: dict[str, object] = {
+            "owner_session_id": owner_session_id,
+            "accepted_at": _utc_datetime(accepted_at, "event.payload.accepted_at").isoformat(),
+            "queued": queued,
+        }
         if task_id is not None:
             payload["task_id"] = task_id
         if task_kind is not None:
@@ -688,9 +923,27 @@ class OwnerResponseEvent:
         return cls(request_id, sequence, OwnerEventKind.ACCEPTED, payload)
 
     @classmethod
-    def progress(cls, request_id: str, sequence: int, *, task_id: str, status: str, progress: float | None = None, downloaded_bytes: int | None = None, total_bytes: int | None = None, file_count: int | None = None, message: str | None = None) -> "OwnerResponseEvent":
+    def progress(
+        cls,
+        request_id: str,
+        sequence: int,
+        *,
+        task_id: str,
+        status: str,
+        progress: float | None = None,
+        downloaded_bytes: int | None = None,
+        total_bytes: int | None = None,
+        file_count: int | None = None,
+        message: str | None = None,
+    ) -> "OwnerResponseEvent":
         payload: dict[str, object] = {"task_id": task_id, "status": status}
-        for name, value in (("progress", progress), ("downloaded_bytes", downloaded_bytes), ("total_bytes", total_bytes), ("file_count", file_count), ("message", message)):
+        for name, value in (
+            ("progress", progress),
+            ("downloaded_bytes", downloaded_bytes),
+            ("total_bytes", total_bytes),
+            ("file_count", file_count),
+            ("message", message),
+        ):
             if value is not None:
                 payload[name] = value
         return cls(request_id, sequence, OwnerEventKind.PROGRESS, payload)
@@ -712,7 +965,11 @@ class OwnerResponseEvent:
         quiescent: bool | None = None,
         phase: str | None = None,
     ) -> "OwnerResponseEvent":
-        payload: dict[str, object] = {"task_id": task_id, "action": action, "acknowledged": acknowledged}
+        payload: dict[str, object] = {
+            "task_id": task_id,
+            "action": action,
+            "acknowledged": acknowledged,
+        }
         for name, value in (
             ("requested", requested),
             ("applied", applied),
@@ -727,21 +984,68 @@ class OwnerResponseEvent:
         return cls(request_id, sequence, OwnerEventKind.CONTROL, payload)
 
     @classmethod
-    def heartbeat(cls, request_id: str, sequence: int, *, owner_session_id: str, emitted_at: datetime) -> "OwnerResponseEvent":
-        return cls(request_id, sequence, OwnerEventKind.HEARTBEAT, {"owner_session_id": owner_session_id, "emitted_at": _utc_datetime(emitted_at, "event.payload.emitted_at").isoformat()})
+    def heartbeat(
+        cls, request_id: str, sequence: int, *, owner_session_id: str, emitted_at: datetime
+    ) -> "OwnerResponseEvent":
+        return cls(
+            request_id,
+            sequence,
+            OwnerEventKind.HEARTBEAT,
+            {
+                "owner_session_id": owner_session_id,
+                "emitted_at": _utc_datetime(emitted_at, "event.payload.emitted_at").isoformat(),
+            },
+        )
 
     @classmethod
-    def terminal(cls, request_id: str, sequence: int, *, status: OwnerTerminalStatus, task_id: str | None = None, exit_code: int | None = None, result: Mapping[str, object] | None = None, error: Mapping[str, object] | None = None) -> "OwnerResponseEvent":
-        payload: dict[str, object] = {"status": status.value if isinstance(status, OwnerTerminalStatus) else status}
-        for name, value in (("task_id", task_id), ("exit_code", exit_code), ("result", result), ("error", error)):
+    def terminal(
+        cls,
+        request_id: str,
+        sequence: int,
+        *,
+        status: OwnerTerminalStatus,
+        task_id: str | None = None,
+        exit_code: int | None = None,
+        result: Mapping[str, object] | None = None,
+        error: Mapping[str, object] | None = None,
+    ) -> "OwnerResponseEvent":
+        payload: dict[str, object] = {
+            "status": status.value if isinstance(status, OwnerTerminalStatus) else status
+        }
+        for name, value in (
+            ("task_id", task_id),
+            ("exit_code", exit_code),
+            ("result", result),
+            ("error", error),
+        ):
             if value is not None:
                 payload[name] = value
         return cls(request_id, sequence, OwnerEventKind.TERMINAL, payload)
 
     @classmethod
-    def owner_disconnected(cls, request_id: str, sequence: int, *, phase: OwnerWaitPhase, outcome: OwnerDisconnectOutcome, known_task_id: str | None = None, owner_session_id: str | None = None, last_sequence: int = 0, message: str = "owner disconnected", terminal_persisted: bool = False) -> "OwnerResponseEvent":
-        payload: dict[str, object] = {"phase": phase.value if isinstance(phase, OwnerWaitPhase) else phase, "outcome": outcome.value if isinstance(outcome, OwnerDisconnectOutcome) else outcome, "last_sequence": last_sequence, "message": message}
-        for name, value in (("known_task_id", known_task_id), ("owner_session_id", owner_session_id)):
+    def owner_disconnected(
+        cls,
+        request_id: str,
+        sequence: int,
+        *,
+        phase: OwnerWaitPhase,
+        outcome: OwnerDisconnectOutcome,
+        known_task_id: str | None = None,
+        owner_session_id: str | None = None,
+        last_sequence: int = 0,
+        message: str = "owner disconnected",
+        terminal_persisted: bool = False,
+    ) -> "OwnerResponseEvent":
+        payload: dict[str, object] = {
+            "phase": phase.value if isinstance(phase, OwnerWaitPhase) else phase,
+            "outcome": outcome.value if isinstance(outcome, OwnerDisconnectOutcome) else outcome,
+            "last_sequence": last_sequence,
+            "message": message,
+        }
+        for name, value in (
+            ("known_task_id", known_task_id),
+            ("owner_session_id", owner_session_id),
+        ):
             if value is not None:
                 payload[name] = value
         if terminal_persisted:
@@ -749,27 +1053,46 @@ class OwnerResponseEvent:
         return cls(request_id, sequence, OwnerEventKind.OWNER_DISCONNECTED, payload)
 
     def to_dict(self) -> dict[str, JsonValue]:
-        return {"protocol_version": OWNER_PROTOCOL_VERSION, "request_id": self.request_id, "sequence": self.sequence, "kind": self.kind.value, "payload": _thaw_json(self.payload)}
+        return {
+            "protocol_version": OWNER_PROTOCOL_VERSION,
+            "request_id": self.request_id,
+            "sequence": self.sequence,
+            "kind": self.kind.value,
+            "payload": _thaw_json(self.payload),
+        }
 
     @classmethod
     def from_dict(cls, value: object) -> "OwnerResponseEvent":
         if not isinstance(value, Mapping):
             raise _error("invalid_envelope", "event", "must be an object")
-        _check_keys(value, "event", frozenset({"protocol_version", "request_id", "sequence", "kind", "payload"}))
+        _check_keys(
+            value,
+            "event",
+            frozenset({"protocol_version", "request_id", "sequence", "kind", "payload"}),
+        )
         for key in ("protocol_version", "request_id", "sequence", "kind", "payload"):
             if key not in value:
                 raise _error("missing_field", f"event.{key}", "is required")
         _protocol_version(value["protocol_version"], "event.protocol_version")
-        return cls(value["request_id"], value["sequence"], _enum(value["kind"], OwnerEventKind, "event.kind"), value["payload"])
+        return cls(
+            value["request_id"],
+            value["sequence"],
+            _enum(value["kind"], OwnerEventKind, "event.kind"),
+            value["payload"],
+        )
 
     def to_bytes(self, *, max_frame_bytes: int = DEFAULT_MAX_FRAME_BYTES) -> bytes:
-        encoded = json.dumps(self.to_dict(), ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        encoded = json.dumps(
+            self.to_dict(), ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
         if len(encoded) > max_frame_bytes:
             raise _error("frame_too_large", "event", f"must not exceed {max_frame_bytes} bytes")
         return encoded
 
     @classmethod
-    def from_bytes(cls, value: bytes, *, max_frame_bytes: int = DEFAULT_MAX_FRAME_BYTES) -> "OwnerResponseEvent":
+    def from_bytes(
+        cls, value: bytes, *, max_frame_bytes: int = DEFAULT_MAX_FRAME_BYTES
+    ) -> "OwnerResponseEvent":
         if not isinstance(value, bytes) or len(value) > max_frame_bytes:
             raise _error("frame_too_large", "event", f"must not exceed {max_frame_bytes} bytes")
         try:
@@ -790,17 +1113,23 @@ class OwnerResponseStream:
 
     def push(self, event: OwnerResponseEvent) -> None:
         if event.request_id != self.request_id:
-            raise _error("request_id_mismatch", "event.request_id", "must match the response stream")
+            raise _error(
+                "request_id_mismatch", "event.request_id", "must match the response stream"
+            )
         if self.terminal:
             raise _error("event_after_terminal", "event", "no event may follow a terminal result")
         if event.sequence != self.last_sequence + 1:
             raise _error("invalid_sequence", "event.sequence", "must increase by exactly one")
         if event.kind is OwnerEventKind.ACCEPTED:
             if self.accepted:
-                raise _error("duplicate_acceptance", "event.kind", "a request may be accepted only once")
+                raise _error(
+                    "duplicate_acceptance", "event.kind", "a request may be accepted only once"
+                )
             self.accepted = True
         elif event.kind is not OwnerEventKind.OWNER_DISCONNECTED and not self.accepted:
-            raise _error("invalid_lifecycle", "event.kind", "accepted must be the first response event")
+            raise _error(
+                "invalid_lifecycle", "event.kind", "accepted must be the first response event"
+            )
         self.last_sequence = event.sequence
         if event.kind in {OwnerEventKind.TERMINAL, OwnerEventKind.OWNER_DISCONNECTED}:
             self.terminal = True
@@ -841,12 +1170,22 @@ class OwnerRequestLedger:
     def mark_accepted(self, request_id: str, *, task_id: str | None = None) -> OwnerRequestRecord:
         request, record = self._get(request_id)
         if record.state is RequestState.TERMINAL:
-            raise _error("request_already_terminal", "request.request_id", "terminal requests cannot be accepted again")
+            raise _error(
+                "request_already_terminal",
+                "request.request_id",
+                "terminal requests cannot be accepted again",
+            )
         if record.state is RequestState.ACCEPTED:
             if record.task_id != task_id:
-                raise _error("request_acceptance_conflict", "request.task_id", "accepted request already has a different Task ID")
+                raise _error(
+                    "request_acceptance_conflict",
+                    "request.task_id",
+                    "accepted request already has a different Task ID",
+                )
             return record
-        updated = OwnerRequestRecord(request_id, record.fingerprint, RequestState.ACCEPTED, task_id=task_id)
+        updated = OwnerRequestRecord(
+            request_id, record.fingerprint, RequestState.ACCEPTED, task_id=task_id
+        )
         self._records[request_id] = (request, updated)
         return updated
 
@@ -855,8 +1194,18 @@ class OwnerRequestLedger:
         if record.state is RequestState.TERMINAL:
             if record.terminal_status is status:
                 return record
-            raise _error("request_terminal_conflict", "request.terminal_status", "terminal request already has a different status")
-        updated = OwnerRequestRecord(request_id, record.fingerprint, RequestState.TERMINAL, task_id=record.task_id, terminal_status=_enum(status, OwnerTerminalStatus, "request.terminal_status"))
+            raise _error(
+                "request_terminal_conflict",
+                "request.terminal_status",
+                "terminal request already has a different status",
+            )
+        updated = OwnerRequestRecord(
+            request_id,
+            record.fingerprint,
+            RequestState.TERMINAL,
+            task_id=record.task_id,
+            terminal_status=_enum(status, OwnerTerminalStatus, "request.terminal_status"),
+        )
         self._records[request_id] = (request, updated)
         return updated
 
@@ -893,16 +1242,33 @@ class OwnerWaitPolicy:
     max_frame_bytes: int = DEFAULT_MAX_FRAME_BYTES
 
     def __post_init__(self) -> None:
-        for name in ("connect_timeout", "handshake_timeout", "acceptance_timeout", "response_idle_timeout"):
+        for name in (
+            "connect_timeout",
+            "handshake_timeout",
+            "acceptance_timeout",
+            "response_idle_timeout",
+        ):
             value = getattr(self, name)
-            if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(float(value)) or value <= 0:
-                raise _error("invalid_timeout", f"wait.{name}", "must be a finite number greater than zero")
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(float(value))
+                or value <= 0
+            ):
+                raise _error(
+                    "invalid_timeout", f"wait.{name}", "must be a finite number greater than zero"
+                )
         if not isinstance(self.max_frame_bytes, int) or self.max_frame_bytes < 1024:
             raise _error("invalid_integer", "wait.max_frame_bytes", "must be at least 1024 bytes")
 
     def timeout_for(self, phase: OwnerWaitPhase) -> float:
         phase = _enum(phase, OwnerWaitPhase, "wait.phase")
-        return {OwnerWaitPhase.CONNECT: self.connect_timeout, OwnerWaitPhase.HANDSHAKE: self.handshake_timeout, OwnerWaitPhase.ACCEPTANCE: self.acceptance_timeout, OwnerWaitPhase.RESPONSE_IDLE: self.response_idle_timeout}[phase]
+        return {
+            OwnerWaitPhase.CONNECT: self.connect_timeout,
+            OwnerWaitPhase.HANDSHAKE: self.handshake_timeout,
+            OwnerWaitPhase.ACCEPTANCE: self.acceptance_timeout,
+            OwnerWaitPhase.RESPONSE_IDLE: self.response_idle_timeout,
+        }[phase]
 
 
 class OwnerLivenessTracker:
@@ -921,7 +1287,12 @@ class OwnerLivenessTracker:
     def observe(self, event: OwnerResponseEvent, *, now: float) -> None:
         if not math.isfinite(now):
             raise _error("invalid_timestamp", "liveness.now", "must be finite")
-        if event.kind in {OwnerEventKind.ACCEPTED, OwnerEventKind.PROGRESS, OwnerEventKind.CONTROL, OwnerEventKind.HEARTBEAT}:
+        if event.kind in {
+            OwnerEventKind.ACCEPTED,
+            OwnerEventKind.PROGRESS,
+            OwnerEventKind.CONTROL,
+            OwnerEventKind.HEARTBEAT,
+        }:
             self._last_activity = now
 
     def expires_at(self) -> float:
@@ -983,9 +1354,14 @@ class InMemoryOwnerTransport:
         session.pending.append(event)
         if event.kind is OwnerEventKind.ACCEPTED:
             task_id = event.payload.get("task_id")
-            self.ledger.mark_accepted(event.request_id, task_id=task_id if isinstance(task_id, str) else None)
+            self.ledger.mark_accepted(
+                event.request_id, task_id=task_id if isinstance(task_id, str) else None
+            )
         elif event.kind is OwnerEventKind.TERMINAL:
-            self.ledger.mark_terminal(event.request_id, status=_enum(event.payload["status"], OwnerTerminalStatus, "event.payload.status"))
+            self.ledger.mark_terminal(
+                event.request_id,
+                status=_enum(event.payload["status"], OwnerTerminalStatus, "event.payload.status"),
+            )
         elif event.kind is OwnerEventKind.OWNER_DISCONNECTED:
             session.connected = False
 
@@ -997,7 +1373,10 @@ class InMemoryOwnerTransport:
             return session.pending.popleft()
         if not session.connected:
             return None
-        if not session.stream.accepted and now >= session.submitted_at + self.policy.acceptance_timeout:
+        if (
+            not session.stream.accepted
+            and now >= session.submitted_at + self.policy.acceptance_timeout
+        ):
             event = OwnerResponseEvent.owner_disconnected(
                 request_id,
                 session.stream.last_sequence + 1,
@@ -1024,7 +1403,17 @@ class InMemoryOwnerTransport:
             return session.pending.popleft()
         return None
 
-    def disconnect(self, request_id: str, *, phase: OwnerWaitPhase, outcome: OwnerDisconnectOutcome, now: float = 0.0, known_task_id: str | None = None, owner_session_id: str | None = None, terminal_persisted: bool = False) -> OwnerResponseEvent:
+    def disconnect(
+        self,
+        request_id: str,
+        *,
+        phase: OwnerWaitPhase,
+        outcome: OwnerDisconnectOutcome,
+        now: float = 0.0,
+        known_task_id: str | None = None,
+        owner_session_id: str | None = None,
+        terminal_persisted: bool = False,
+    ) -> OwnerResponseEvent:
         session = self._session(request_id)
         event = OwnerResponseEvent.owner_disconnected(
             request_id,
@@ -1042,5 +1431,7 @@ class InMemoryOwnerTransport:
     def _session(self, request_id: str) -> _InMemoryOwnerSession:
         session = self._sessions.get(request_id)
         if session is None:
-            raise _error("unknown_request", "request.request_id", "has not been submitted to this transport")
+            raise _error(
+                "unknown_request", "request.request_id", "has not been submitted to this transport"
+            )
         return session

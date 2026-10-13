@@ -155,15 +155,16 @@ def _require_non_empty_string(
     return value
 
 
-def _optional_requirement(
-    data: Mapping[str, Any], key: str, source: str
-) -> str | None:
+def _optional_requirement(data: Mapping[str, Any], key: str, source: str) -> str | None:
     value = data.get(key)
     if value is None:
         return None
     if not isinstance(value, str) or not value.strip():
         raise PluginValidationError(f"{source}.{key} must be a version requirement string")
-    if not re.fullmatch(r"\s*(?:~=|==|!=|>=|<=|>|<)?\s*\d+(?:\.\d+)*(?:\s*,\s*(?:~=|==|!=|>=|<=|>|<)?\s*\d+(?:\.\d+)*)*\s*", value):
+    if not re.fullmatch(
+        r"\s*(?:~=|==|!=|>=|<=|>|<)?\s*\d+(?:\.\d+)*(?:\s*,\s*(?:~=|==|!=|>=|<=|>|<)?\s*\d+(?:\.\d+)*)*\s*",
+        value,
+    ):
         raise PluginValidationError(f"{source}.{key} must contain version clauses such as >=3.11")
     return value.strip()
 

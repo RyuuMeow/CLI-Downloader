@@ -178,6 +178,10 @@ third-party Cookies are never read. Core helpers validate the stored session and
 domain, path, Secure, and expiry matching before a Plugin sends a request. A
 Plugin may implement `validate_auth_session()` for site-specific proof of login;
 the managed browser remains open until both common and Plugin validation pass.
+Loading configuration rejects malformed sessions and Cookies outside the Manifest's
+first-party domains. An expired session or one missing its login-proof Cookie is a
+recoverable connection state instead of a fatal configuration error, so the Shell can
+display it as expired and let the user authenticate again.
 
 Network pacing is a system policy shared by every active Task for the same
 Plugin/site identity. Manifest `network` declares request concurrency, minimum

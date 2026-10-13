@@ -196,7 +196,9 @@ class ShellControllerTests(unittest.TestCase):
                 ShellStatusKind.RECOVERING: OwnerLifecycleState.RECOVERING,
                 ShellStatusKind.FOREGROUND_BUSY: OwnerLifecycleState.BUSY,
             }[kind]
-            mode = OwnerMode.FOREGROUND if kind is ShellStatusKind.FOREGROUND_BUSY else OwnerMode.SHELL
+            mode = (
+                OwnerMode.FOREGROUND if kind is ShellStatusKind.FOREGROUND_BUSY else OwnerMode.SHELL
+            )
             metadata = _metadata(scope, mode=mode, lifecycle=lifecycle)
         return ShellStatusSnapshot(
             scope.scope_fingerprint,

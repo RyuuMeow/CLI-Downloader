@@ -149,10 +149,7 @@ class TaskHierarchyService:
             and record.task_id not in internal_entry_ids
             and record.task_id not in parent_ids
         )
-        batches = tuple(
-            self._batch_root_summary(parent_id)
-            for parent_id in parent_ids
-        )
+        batches = tuple(self._batch_root_summary(parent_id) for parent_id in parent_ids)
         return (*standalone, *batches)
 
     def list_children(self, parent_id: str) -> tuple[TaskNode, ...]:
@@ -494,9 +491,7 @@ class TaskHierarchyService:
                 completed_files=summary.completed_files,
                 total_files=summary.total_files,
                 preparing_items=(
-                    summary.counts.unresolved
-                    + summary.counts.resolving
-                    + summary.counts.queued
+                    summary.counts.unresolved + summary.counts.resolving + summary.counts.queued
                 ),
                 completed_bytes=summary.completed_bytes,
                 total_bytes=summary.total_bytes,
@@ -757,9 +752,7 @@ class TaskHierarchyService:
                     continue
                 client_id = checkpoint.get("client_id")
                 live_key = (
-                    f"{record.task_id}:torrent:{client_id}"
-                    if isinstance(client_id, str)
-                    else None
+                    f"{record.task_id}:torrent:{client_id}" if isinstance(client_id, str) else None
                 )
                 if live_key is not None and live_key in self._byte_progress_by_asset:
                     c, t = self._byte_progress_by_asset[live_key]
@@ -891,10 +884,10 @@ def _control_is_applied(record: TaskRecord, action: str) -> bool:
             and record.desired_control is TaskDesiredControl.PAUSE
         )
     if action == "resume":
-        return (
-            record.desired_control is TaskDesiredControl.RUN
-            and record.status in {TaskStatus.PLANNED, TaskStatus.RUNNING}
-        )
+        return record.desired_control is TaskDesiredControl.RUN and record.status in {
+            TaskStatus.PLANNED,
+            TaskStatus.RUNNING,
+        }
     return (
         record.desired_control is TaskDesiredControl.CANCEL
         and record.status in _TERMINAL_TASK_STATUSES
@@ -902,10 +895,7 @@ def _control_is_applied(record: TaskRecord, action: str) -> bool:
 
 
 def _task_state_for_record(record: TaskRecord) -> TaskState:
-    if (
-        record.status is TaskStatus.RUNNING
-        and record.desired_control is TaskDesiredControl.PAUSE
-    ):
+    if record.status is TaskStatus.RUNNING and record.desired_control is TaskDesiredControl.PAUSE:
         return TaskState.PAUSING
     return _STANDALONE_STATES[record.status]
 

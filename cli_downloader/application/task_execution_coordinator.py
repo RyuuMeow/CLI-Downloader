@@ -340,7 +340,10 @@ class TaskExecutionCoordinator:
 
         async with self._lock_for(handle.task_id):
             record = self._current_handle_record(handle, expected_revision)
-            paused = record.desired_control is TaskDesiredControl.PAUSE or record.status is TaskStatus.PAUSED
+            paused = (
+                record.desired_control is TaskDesiredControl.PAUSE
+                or record.status is TaskStatus.PAUSED
+            )
             updated = record.transition(
                 status=TaskStatus.PAUSED if paused else TaskStatus.PLANNED,
                 desired_control=TaskDesiredControl.PAUSE if paused else TaskDesiredControl.RUN,

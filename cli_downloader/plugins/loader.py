@@ -149,9 +149,7 @@ def scan_fixed_plugin_packages(
 ) -> PluginScanReport:
     """Scan project overrides and one active installed version per plugin."""
     app_root = (
-        Path(application_root)
-        if application_root is not None
-        else discover_application_root()
+        Path(application_root) if application_root is not None else discover_application_root()
     )
     project_report = _scan_existing_root(app_root / "Plugins")
     installed_report = _scan_installed_versions(

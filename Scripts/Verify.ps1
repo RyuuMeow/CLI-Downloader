@@ -21,10 +21,12 @@ function Invoke-Checked {
     $Timer = [Diagnostics.Stopwatch]::StartNew()
     $Output = @()
     try {
+        $local:ErrorActionPreference = "Continue"
         $Output = & $Command 2>&1
         if ($LASTEXITCODE -ne 0) {
             throw "$Name failed with exit code $LASTEXITCODE."
         }
+
         $Timer.Stop()
         $Results.Add([pscustomobject]@{
             Name = $Name
@@ -63,7 +65,8 @@ function Remove-GeneratedDirectory {
         throw "Refusing to clean unexpected path: $Resolved"
     }
 
-    Remove-Item -LiteralPath $Resolved -Recurse -Force
+    Remove-Item -LiteralPath $Resolved -Recurse -Force -ErrorAction SilentlyContinue
+
 }
 
 function Test-DevToolsReady {

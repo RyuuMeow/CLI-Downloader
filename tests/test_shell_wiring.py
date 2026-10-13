@@ -65,9 +65,7 @@ class ShellWiringTest(TestCase):
 
         with TemporaryDirectory() as directory:
             plugins_dir = Path(directory) / "plugins"
-            store = StateTaskStore(
-                StateDatabase(Path(directory) / "state" / "state.sqlite3")
-            )
+            store = StateTaskStore(StateDatabase(Path(directory) / "state" / "state.sqlite3"))
             with patch.dict(os.environ, {"CLI_DOWNLOADER_DATA_ROOT": directory}):
                 runtime = build_example_runtime()
                 fake_shell = Mock()
@@ -179,15 +177,15 @@ class ShellWiringTest(TestCase):
 
             self.assertEqual(exit_code, 0)
 
-    def test_repeated_shutdown_callback_keeps_paused_task_and_owner_cleanup_idempotent(self) -> None:
+    def test_repeated_shutdown_callback_keeps_paused_task_and_owner_cleanup_idempotent(
+        self,
+    ) -> None:
         runner = Mock(return_value=0)
         background_runner = Mock(return_value=0)
 
         with TemporaryDirectory() as directory:
             plugins_dir = Path(directory) / "plugins"
-            store = StateTaskStore(
-                StateDatabase(Path(directory) / "state" / "state.sqlite3")
-            )
+            store = StateTaskStore(StateDatabase(Path(directory) / "state" / "state.sqlite3"))
             store.upsert(
                 TaskRecord(
                     task_id="paused-before-close",
@@ -266,8 +264,14 @@ class ShellWiringTest(TestCase):
                     error_path = Path(directory) / "process-owner-error.txt"
                     trace_path = Path(directory) / "process-owner-trace.txt"
                     detail_path = error_path if error_path.exists() else trace_path
-                    detail = detail_path.read_text(encoding="utf-8") if detail_path.exists() else "unknown child failure"
-                    self.fail(f"Shell owner did not publish READY (exit={process.exitcode}): {detail}")
+                    detail = (
+                        detail_path.read_text(encoding="utf-8")
+                        if detail_path.exists()
+                        else "unknown child failure"
+                    )
+                    self.fail(
+                        f"Shell owner did not publish READY (exit={process.exitcode}): {detail}"
+                    )
                 return process, stop, executed
 
             first, first_stop, first_executed = start_owner()

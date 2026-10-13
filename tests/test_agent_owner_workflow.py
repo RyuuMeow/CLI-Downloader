@@ -91,7 +91,9 @@ class AgentOwnerWorkflowTests(unittest.TestCase):
             server = OwnerPipeServer(scope, handshake=owner_handshake, handler=handler)
             server.start()
             try:
-                self.assertEqual(scope.discovery().read_for_scope().lifecycle_state, OwnerLifecycleState.READY)
+                self.assertEqual(
+                    scope.discovery().read_for_scope().lifecycle_state, OwnerLifecycleState.READY
+                )
 
                 item_session = "agent-item-session"
                 item_request = OwnerRequest(
@@ -236,7 +238,11 @@ class AgentOwnerWorkflowTests(unittest.TestCase):
                             DownloadHistoryRecord(
                                 record_id=f"history-{task_id}",
                                 task_id=task_id,
-                                kind=(HistoryKind.BATCH if task_kind is TaskKind.BATCH else HistoryKind.ITEM),
+                                kind=(
+                                    HistoryKind.BATCH
+                                    if task_kind is TaskKind.BATCH
+                                    else HistoryKind.ITEM
+                                ),
                                 title=task_id,
                                 source_url=str(request.payload["url"]),
                                 status="completed",
@@ -410,7 +416,9 @@ class AgentOwnerWorkflowTests(unittest.TestCase):
             try:
                 replay = OwnerPipeClient(scope).request(item_request, handshake=item_handshake)
                 self.assertEqual(replay[0].payload["task_id"], "workflow-item")
-                self.assertEqual(download_calls, ["workflow-item-request", "workflow-batch-request"])
+                self.assertEqual(
+                    download_calls, ["workflow-item-request", "workflow-batch-request"]
+                )
             finally:
                 restarted.stop()
 

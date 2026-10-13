@@ -1,8 +1,8 @@
-# CLI-Downloader Plugin 開發說明
+# CLI-Downloader Plugin Development Guide
 
-`Plugins/` 是專案開發版插件目錄。每個插件一個資料夾，啟動時會自動掃描並註冊；同 ID 的專案插件會覆蓋已安裝版本。
+`Plugins/` is the development directory for plugins. Each plugin has its own folder. On startup, the system automatically scans and registers plugins here. Workspace plugins with the same ID will override installed versions.
 
-## 目錄結構
+## Directory Structure
 
 ```text
 Plugins/<plugin_id>/
@@ -16,28 +16,24 @@ Plugins/<plugin_id>/
    `- site.json
 ```
 
-外部插件的網站實作、HTTP client、parser、fixtures 與測試都必須放在插件目錄內。Core
-只保留通用契約、載入器、生命週期與 orchestration；Core 測試不得直接 import 某個網站的
-parser、adapter 或 fixture。插件若使用 sibling package，入口載入時會以插件版本目錄為
-import root，讓同一套程式也能從專案 `Plugins/` 或 LocalAppData 的安裝版本執行。
+A plugin's website implementation, HTTP clients, parsers, fixtures, and tests must be kept inside the plugin directory. The Core framework only handles the universal contracts, loaders, lifecycle, and orchestration. Core tests must not directly import a specific website's parser, adapter, or fixture. If a plugin uses a sibling package, the entrypoint loading will use the plugin's version directory as the import root, allowing the exact same code to run from either the project's `Plugins/` directory or an installed version in LocalAppData.
 
-插件測試可在專案根目錄獨立執行，例如 `<plugin-id>`：
+Plugin tests can be run independently from the project root, for example for `<plugin-id>`:
 
 ```powershell
 $env:PYTHONPATH = "Plugins/<plugin-id>"
 python -m unittest discover -s Plugins/<plugin-id>/tests -t .
 ```
 
-測試必須預設 mock 網路；需要 live-site 的檢查不得成為 Core 或插件的 deterministic release
-gate。
+Tests must mock the network by default; checks requiring a live-site must not be deterministic release gates for Core or plugins.
 
-正式安裝版本位於：
+Officially installed versions are located at:
 
 ```text
 %LOCALAPPDATA%/CLI-Downloader/plugins/<plugin_id>/<version>/
 ```
 
-版本目錄旁可放置 `active` 純文字檔，內容為啟用版本名稱；沒有 `active` 時使用最高版本。
+Next to the version directory, there can be a plain text file named `active`, whose content is the active version name. When `active` is missing, the highest version is used.
 
 ## plugin.json
 
@@ -52,16 +48,13 @@ gate。
 }
 ```
 
-`plugin_id` 使用小寫英數字、`-` 或 `_`。`description` 用於在 Shell 外掛列表中顯示簡介。入口檔必須在插件根目錄，Manifest 必須在 `manifests/`。
+`plugin_id` should use lowercase alphanumeric characters, `-`, or `_`. `description` is used to display a brief introduction in the Shell plugin list. The entrypoint file must be in the plugin root directory, and the Manifest must be in `manifests/`.
 
-可選的 `requires_python` 與 `requires_core_api` 使用版本條件（例如 `>=3.11` 或
-`>=0.1.0`）。`requirements.txt` 只描述執行期依賴；Plugin Manager 安裝或更新時會把它們
-放入該版本自己的 `deps/`，不會在插件 discovery/import 時執行 pip，也不會修改 Core 環境。
-`requirements-dev.txt` 僅供插件作者本機測試與 lint，不會被產品安裝流程帶入。
+Optional `requires_python` and `requires_core_api` use version conditions (e.g., `>=3.11` or `>=0.1.0`). `requirements.txt` only describes runtime dependencies; when the Plugin Manager installs or updates a plugin, these dependencies are placed in the specific version's own `deps/` folder. It will not run pip during plugin discovery/import, nor will it modify the Core environment. `requirements-dev.txt` is strictly for local testing and linting by plugin authors and will not be included in the product installation process.
 
 ## Manifest
 
-Manifest 宣告網域、URL 規則、操作參數、設定、秘密欄位與輸出標籤。Runtime 會先驗證 JSON，再載入 Python。
+The Manifest declares domains, URL rules, operation parameters, settings, secret fields, and output tags. The Runtime validates the JSON before loading the Python code.
 
 ```json
 {
@@ -94,14 +87,11 @@ Manifest 宣告網域、URL 規則、操作參數、設定、秘密欄位與輸�
 }
 ```
 
-插件依賴應使用可重現的版本範圍或鎖定版本，避免未預期的上游更新；需要雜湊完整性時可在
-requirements 檔使用 pip 支援的 `--hash` 行。安裝失敗會保留原本的 active 版本，並在 Runtime
-diagnostics 顯示原因。
+Plugin dependencies should use reproducible version ranges or lock versions to prevent unexpected upstream updates. If hash integrity is required, pip's `--hash` lines can be used in the requirements file. If installation fails, the original active version will be retained, and the reason will be displayed in Runtime diagnostics.
 
-設定會註冊為 `plugins.<plugin_id>.<key>`。密鑰只透過 secret reference 傳遞，不應放進結果、紀錄或錯誤訊息。
+Settings are registered as `plugins.<plugin_id>.<key>`. Secrets are only passed via secret references and should not be placed in results, logs, or error messages.
 
-需要網站登入時，優先在 Manifest 註冊系統管理的瀏覽器登入，而不是要求
-使用者手動複製 Cookie：
+When a website login is required, prefer registering a system-managed browser login in the Manifest instead of asking the user to copy cookies manually:
 
 ```json
 "browser_auth": {
@@ -111,16 +101,13 @@ diagnostics 顯示原因。
 }
 ```
 
-Core 會建立 `auth.session` secret、開啟隔離登入視窗，並只保存允許網域的
-Cookie Jar。`required_cookies` 只判斷登入完成，不限制實際保存的 Cookie。
-Plugin 可在 `configure()` 的 `secrets["auth.session"]` 取得固定 JSON Session，
-並使用 `cookie_header_for_url()` 依請求 URL 安全產生 Cookie Header。
+Core will create an `auth.session` secret, open an isolated login window, and only persist the Cookie Jar for allowed domains. `required_cookies` only judges if login is complete and does not limit the actual cookies saved. A plugin can obtain the static JSON Session in `configure()` via `secrets["auth.session"]` and safely generate the Cookie Header based on the request URL using `cookie_header_for_url()`.
 
-`output.fields` 只能列出插件放在 `ResolvedItem.metadata` 的純量欄位。系統會自動提供 `site_id`、`gallery_id`、`title`、`task_id`，並註冊可選的 `plugins.<plugin_id>.download.folder_template` 覆寫。插件不可回傳實際路徑；核心會驗證模板、清理檔名並把有效模板與欄位快照保存到任務。
+`output.fields` can only list scalar fields placed by the plugin in `ResolvedItem.metadata`. The system will automatically provide `site_id`, `gallery_id`, `title`, and `task_id`, and register an optional `plugins.<plugin_id>.download.folder_template` override. Plugins must not return actual paths; the core will validate the template, sanitize filenames, and save a snapshot of the valid template and fields to the task.
 
-## Plugin 類別
+## Plugin Class
 
-插件必須提供以下接口：
+The plugin must provide the following interfaces:
 
 ```python
 class Plugin:
@@ -137,15 +124,15 @@ class Plugin:
     async def choose_strategy(self, item): ...
 ```
 
-- `classify_url` 回傳 core `RouteMatch`，內容必須與 Manifest 規則一致。
-- `execute` 接收 core `OperationRequest`，回傳 core `OperationResult`。
-- `resolve` 將已確認下載的 URL 轉為 `ResolvedItem`。
-- `list_assets` 回傳完整 `AssetList`。
-- `choose_strategy` 回傳 `DownloadStrategyPlan`。
-- ListPage、Gallery、Widget、Action 與 Enum 一律使用 `cli_downloader.core` 的通用物件。
-- 插件不可建立輸出路徑、任務或下載佇列；這些由系統管理。
+- `classify_url` returns a core `RouteMatch`, and its content must match the rules in the Manifest.
+- `execute` receives a core `OperationRequest` and returns a core `OperationResult`.
+- `resolve` converts a confirmed download URL to a `ResolvedItem`.
+- `list_assets` returns a complete `AssetList`.
+- `choose_strategy` returns a `DownloadStrategyPlan`.
+- ListPage, Gallery, Widget, Action, and Enum must uniformly use the universal objects from `cli_downloader.core`.
+- Plugins must not create output paths, tasks, or download queues; these are managed by the system.
 
-插件若有設定或秘密欄位，可選擇加入同步設定入口。`secrets` 只包含此插件命名空間內的實際值，不會進入 OperationResult 或紀錄：
+If a plugin has settings or secret fields, it can choose to add a synchronous configuration entry. `secrets` only contains the actual values within this plugin's namespace and will not enter the OperationResult or logs:
 
 ```python
 def configure(self, settings, secrets):
@@ -153,11 +140,11 @@ def configure(self, settings, secrets):
     self._session = secrets.get("session")
 ```
 
-Runtime 的 Batch 重試會重新呼叫 `resolve` 與 `choose_strategy`，並用穩定的 Gallery/Asset 識別資料比對缺少項目。建議在 `ResolvedItem.metadata` 放入 `gallery_id`，在 `Asset.metadata` 放入穩定的 `asset_id`、`image_id`、`page_id` 或 `index`。
+The Runtime's Batch retry will re-call `resolve` and `choose_strategy`, and compare missing items using stable Gallery/Asset identification data. It is recommended to put `gallery_id` in `ResolvedItem.metadata`, and stable `asset_id`, `image_id`, `page_id`, or `index` in `Asset.metadata`.
 
-## 網路節流
+## Network Throttling
 
-有實際網路請求的插件應在 `manifests/site.json` 宣告安全預設：
+Plugins with actual network requests should declare safe defaults in `manifests/site.json`:
 
 ```json
 "network": {
@@ -169,15 +156,15 @@ Runtime 的 Batch 重試會重新呼叫 `resolve` 與 `choose_strategy`，並用
 }
 ```
 
-系統會將數值設定註冊成 `plugins.<plugin_id>.network.*` 覆寫項目，並讓同一網站的解析與取檔共用 request gate。插件不需自行重試 429；保留原始 `HTTPError` 的 status 與 headers，系統才能遵守 `Retry-After` 並保存冷卻狀態。
+The system will register numeric settings as `plugins.<plugin_id>.network.*` overrides, and share the request gate between resolution and downloading for the same website. Plugins do not need to manually retry 429 errors; retain the original `HTTPError` status and headers so the system can respect `Retry-After` and maintain cooldown states.
 
-## 自訂取檔
+## Custom Fetching
 
-一般 HTTP/HTTPS Asset 不需要額外程式碼，系統會直接下載。需要 Cookie、簽名、刷新 URL 或特殊協定時，可選擇實作：
+General HTTP/HTTPS Assets do not require additional code; the system will download them directly. When Cookies, signatures, URL refreshes, or special protocols are needed, a plugin may optionally implement:
 
 ```python
 async def fetch(self, asset):
     return b"file content"
 ```
 
-`fetch` 必須回傳 `bytes`。驗證、重試、檔案命名與寫入仍由系統負責。
+`fetch` must return `bytes`. Validation, retries, file naming, and writing are still handled by the system.

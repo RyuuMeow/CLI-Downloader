@@ -89,10 +89,20 @@ from cli_downloader.core.operations import (
     ListPageData,
     ResultKind,
 )
+from cli_downloader.plugins.catalog import PluginCatalogService
 from cli_downloader.plugins.loader import (
     scan_local_plugin_packages,
 )
+from cli_downloader.plugins.manager import (
+    _write_active_marker,
+    install_plugin,
+    list_plugin_versions,
+    remove_plugin,
+    rollback_plugin,
+    update_plugin,
+)
 from cli_downloader.plugins.runtime import ApplicationRuntime, build_application_runtime
+from cli_downloader.application.release_update_service import ReleaseUpdateService
 from cli_downloader.sites.registry import SiteRegistry
 from cli_downloader.storage.completion_store import CompletionStore
 from cli_downloader.storage.paths import StorageLayout
@@ -102,6 +112,7 @@ from cli_downloader.storage.state_batch_store import StateBatchStore
 from cli_downloader.storage.state_history_store import StateHistoryStore
 from cli_downloader.storage.state_task_store import StateTaskStore
 from cli_downloader.storage.task_store import TaskDesiredControl, TaskRecord, TaskStatus
+
 
 # Transitional aliases keep the previous private helper imports working while
 # the implementation lives in the focused inspection module.
@@ -187,9 +198,7 @@ def _forward_download_to_shell(args: argparse.Namespace) -> int | None:
 
     response_mode = OwnerResponseMode.DETACH if args.detach else OwnerResponseMode.WAIT
     session_id = f"cli-{uuid4().hex}"
-    selection_policy = (
-        ListSelectionPolicy.EXPLICIT.value if args.select else args.selection_policy
-    )
+    selection_policy = ListSelectionPolicy.EXPLICIT.value if args.select else args.selection_policy
     payload: dict[str, object] = {
         "url": args.url,
         "force": bool(args.force),
@@ -241,10 +250,14 @@ def _forward_download_to_shell(args: argparse.Namespace) -> int | None:
         return 0
     terminal = next((event for event in events if event.kind is OwnerEventKind.TERMINAL), None)
     if terminal is None:
-        error = next((event for event in events if event.kind is OwnerEventKind.OWNER_DISCONNECTED), None)
+        error = next(
+            (event for event in events if event.kind is OwnerEventKind.OWNER_DISCONNECTED), None
+        )
         _emit_owner_error(
             OwnerTransportError(
-                str(dict(error.payload)) if error is not None else "owner disconnected before completion"
+                str(dict(error.payload))
+                if error is not None
+                else "owner disconnected before completion"
             ),
             json_output=args.json,
         )
@@ -315,7 +328,12 @@ def _forward_task_control_to_shell(
         return 1
     result = terminal.payload.get("result")
     if json_output:
-        print(json.dumps(dict(result) if isinstance(result, dict) else dict(terminal.payload), ensure_ascii=False))
+        print(
+            json.dumps(
+                dict(result) if isinstance(result, dict) else dict(terminal.payload),
+                ensure_ascii=False,
+            )
+        )
     elif isinstance(result, dict) and isinstance(result.get("output"), str) and result["output"]:
         sys.stdout.write(result["output"])
         if not result["output"].endswith("\n"):
@@ -532,6 +550,149 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Required confirmation before external plugin.py files are imported.",
     )
+    plugins_remote_parser = plugins_subparsers.add_parser(
+        "remote",
+        help="List available plugins from remote marketplace.",
+    )
+    plugins_remote_parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Force a live network fetch from the remote catalog.",
+    )
+    plugins_remote_parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Output raw JSON data.",
+    )
+    plugins_refresh_parser = plugins_subparsers.add_parser(
+        "refresh",
+        help="Force refresh the remote marketplace plugin catalog cache.",
+    )
+    plugins_refresh_parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Output raw JSON data.",
+    )
+
+    plugins_install_parser = plugins_subparsers.add_parser(
+        "install",
+        help="Install a plugin from a Git URL or catalog ID.",
+    )
+    plugins_install_parser.add_argument(
+        "target",
+        help="Git URL or catalog plugin ID.",
+    )
+    plugins_install_parser.add_argument(
+        "--root",
+        action="append",
+        default=[],
+        help="Target plugins directory.",
+    )
+    plugins_install_parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Output raw JSON data.",
+    )
+    plugins_update_parser = plugins_subparsers.add_parser(
+        "update",
+        help="Update an installed plugin to its latest version.",
+    )
+    plugins_update_parser.add_argument(
+        "plugin_id",
+        help="Plugin ID to update.",
+    )
+    plugins_update_parser.add_argument(
+        "--root",
+        action="append",
+        default=[],
+        help="Target plugins directory.",
+    )
+    plugins_update_parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Output raw JSON data.",
+    )
+    plugins_remove_parser = plugins_subparsers.add_parser(
+        "remove",
+        help="Remove an installed plugin.",
+    )
+    plugins_remove_parser.add_argument(
+        "plugin_id",
+        help="Plugin ID to remove.",
+    )
+    plugins_remove_parser.add_argument(
+        "--root",
+        action="append",
+        default=[],
+        help="Target plugins directory.",
+    )
+    plugins_remove_parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Output raw JSON data.",
+    )
+    plugins_rollback_parser = plugins_subparsers.add_parser(
+        "rollback",
+        help="Rollback a plugin to its previous installed version.",
+    )
+    plugins_rollback_parser.add_argument(
+        "plugin_id",
+        help="Plugin ID to rollback.",
+    )
+    plugins_rollback_parser.add_argument(
+        "--root",
+        action="append",
+        default=[],
+        help="Target plugins directory.",
+    )
+    plugins_rollback_parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Output raw JSON data.",
+    )
+    plugins_switch_parser = plugins_subparsers.add_parser(
+        "switch",
+        help="Switch active version of an installed plugin.",
+    )
+    plugins_switch_parser.add_argument(
+        "plugin_id",
+        help="Plugin ID to switch.",
+    )
+    plugins_switch_parser.add_argument(
+        "version",
+        help="Version string to set as active.",
+    )
+    plugins_switch_parser.add_argument(
+        "--root",
+        action="append",
+        default=[],
+        help="Target plugins directory.",
+    )
+    plugins_switch_parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Output raw JSON data.",
+    )
+    plugins_versions_parser = plugins_subparsers.add_parser(
+        "versions",
+        help="List installed versions of a plugin.",
+    )
+    plugins_versions_parser.add_argument(
+        "plugin_id",
+        help="Plugin ID to inspect.",
+    )
+    plugins_versions_parser.add_argument(
+        "--root",
+        action="append",
+        default=[],
+        help="Target plugins directory.",
+    )
+    plugins_versions_parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Output raw JSON data.",
+    )
+
     download_parser = subparsers.add_parser(
         "download",
         help="Route a URL through the site manifest contract.",
@@ -823,6 +984,15 @@ def build_parser() -> argparse.ArgumentParser:
         "show",
         help="Print the effective config loaded from the app config directory.",
     )
+    check_update_parser = subparsers.add_parser(
+        "check-update",
+        help="Check for published application release updates.",
+    )
+    check_update_parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Output raw JSON data.",
+    )
     return parser
 
 
@@ -898,14 +1068,16 @@ def main(
                 runtime=shell_runtime,
                 _owner_claimed=True,
             ),
-            background_runner=lambda shell_argv, cancellation, progress, download_limiter, on_accept=None: main(
-                shell_argv,
-                runtime=shell_runtime,
-                cancellation=cancellation,
-                progress=progress,
-                download_limiter=download_limiter,
-                _owner_claimed=True,
-                on_accept=on_accept,
+            background_runner=lambda shell_argv, cancellation, progress, download_limiter, on_accept=None: (
+                main(
+                    shell_argv,
+                    runtime=shell_runtime,
+                    cancellation=cancellation,
+                    progress=progress,
+                    download_limiter=download_limiter,
+                    _owner_claimed=True,
+                    on_accept=on_accept,
+                )
             ),
         )
 
@@ -916,7 +1088,10 @@ def main(
             except SystemExit as exc:
                 return exc.code if isinstance(exc.code, int) else 0
             return 0
-        roots = _plugin_roots(getattr(args, "root", None) or getattr(args, "plugin_root", None) or [])
+        user_specified_roots = (
+            getattr(args, "root", None) or getattr(args, "plugin_root", None) or []
+        )
+        roots = _plugin_roots(user_specified_roots)
         if args.plugins_command == "list":
             report = scan_local_plugin_packages(
                 roots,
@@ -951,6 +1126,207 @@ def main(
                 )
             )
             return 0
+        plugins_dir = (
+            Path(user_specified_roots[0]) if user_specified_roots else installed_plugins_root()
+        )
+        if args.plugins_command in {"remote", "refresh"}:
+            environment = diagnose_environment()
+            service = PluginCatalogService(environment.paths.cache_dir)
+            force = True if args.plugins_command == "refresh" else getattr(args, "force", False)
+            catalog = service.load(force=force)
+            if getattr(args, "json", False):
+                payload = {
+                    "status": catalog.status,
+                    "refreshed_at": catalog.refreshed_at,
+                    "diagnostics": list(catalog.diagnostics),
+                    "entries": [
+                        {
+                            "plugin_id": entry.plugin_id,
+                            "repository_url": entry.repository_url,
+                            "source": entry.source,
+                            "author": entry.author,
+                            "channel": entry.channel,
+                            "tags": list(entry.tags),
+                        }
+                        for entry in catalog.entries
+                    ],
+                }
+                print(json.dumps(payload, indent=2))
+            else:
+                label = (
+                    "Refreshed plugin catalog"
+                    if args.plugins_command == "refresh"
+                    else "Plugin catalog"
+                )
+                print(f"{label}: {catalog.status} ({len(catalog.entries)} entries)")
+                for entry in catalog.entries:
+                    author = f" by {entry.author}" if entry.author else ""
+                    print(f" - {entry.plugin_id}: {entry.repository_url} [{entry.source}]{author}")
+            return 0
+
+        if args.plugins_command == "install":
+            target = args.target
+            catalog_id = None
+            if not (
+                target.startswith("http://")
+                or target.startswith("https://")
+                or target.startswith("file://")
+            ):
+                environment = diagnose_environment()
+                service = PluginCatalogService(environment.paths.cache_dir)
+                catalog = service.load()
+                matched = next(
+                    (entry for entry in catalog.entries if entry.plugin_id == target), None
+                )
+                if matched is None:
+                    err = f"Plugin ID {target!r} not found in remote catalog."
+                    if getattr(args, "json", False):
+                        print(json.dumps({"error": err}, indent=2))
+                    else:
+                        print(err)
+                    return 1
+                catalog_id = matched.plugin_id
+                target = matched.repository_url
+            try:
+                version = install_plugin(plugins_dir, target, catalog_id=catalog_id)
+                if getattr(args, "json", False):
+                    print(
+                        json.dumps(
+                            {"status": "installed", "target": target, "version": version}, indent=2
+                        )
+                    )
+                else:
+                    print(f"Successfully installed plugin from {target} (version: {version})")
+                return 0
+            except Exception as exc:
+                if getattr(args, "json", False):
+                    print(json.dumps({"error": str(exc)}, indent=2))
+                else:
+                    print(f"Failed to install plugin: {exc}")
+                return 1
+
+        if args.plugins_command == "update":
+            try:
+                new_version = update_plugin(plugins_dir, args.plugin_id)
+                if new_version:
+                    if getattr(args, "json", False):
+                        print(
+                            json.dumps(
+                                {
+                                    "status": "updated",
+                                    "plugin_id": args.plugin_id,
+                                    "version": new_version,
+                                },
+                                indent=2,
+                            )
+                        )
+                    else:
+                        print(
+                            f"Successfully updated plugin {args.plugin_id} to version {new_version}"
+                        )
+                else:
+                    if getattr(args, "json", False):
+                        print(
+                            json.dumps(
+                                {"status": "up_to_date", "plugin_id": args.plugin_id}, indent=2
+                            )
+                        )
+                    else:
+                        print(f"Plugin {args.plugin_id} is already up to date.")
+                return 0
+            except Exception as exc:
+                if getattr(args, "json", False):
+                    print(json.dumps({"error": str(exc)}, indent=2))
+                else:
+                    print(f"Failed to update plugin {args.plugin_id}: {exc}")
+                return 1
+
+        if args.plugins_command == "remove":
+            try:
+                remove_plugin(plugins_dir, args.plugin_id)
+                if getattr(args, "json", False):
+                    print(json.dumps({"status": "removed", "plugin_id": args.plugin_id}, indent=2))
+                else:
+                    print(f"Successfully removed plugin {args.plugin_id}")
+                return 0
+            except Exception as exc:
+                if getattr(args, "json", False):
+                    print(json.dumps({"error": str(exc)}, indent=2))
+                else:
+                    print(f"Failed to remove plugin {args.plugin_id}: {exc}")
+                return 1
+
+        if args.plugins_command == "rollback":
+            try:
+                prev_version = rollback_plugin(plugins_dir, args.plugin_id)
+                if prev_version:
+                    if getattr(args, "json", False):
+                        print(
+                            json.dumps(
+                                {
+                                    "status": "rolled_back",
+                                    "plugin_id": args.plugin_id,
+                                    "active_version": prev_version,
+                                },
+                                indent=2,
+                            )
+                        )
+                    else:
+                        print(f"Rolled back plugin {args.plugin_id} to version {prev_version}")
+                else:
+                    if getattr(args, "json", False):
+                        print(
+                            json.dumps(
+                                {"status": "no_previous_version", "plugin_id": args.plugin_id},
+                                indent=2,
+                            )
+                        )
+                    else:
+                        print(f"No previous version available for plugin {args.plugin_id}")
+                return 0
+            except Exception as exc:
+                if getattr(args, "json", False):
+                    print(json.dumps({"error": str(exc)}, indent=2))
+                else:
+                    print(f"Failed to rollback plugin {args.plugin_id}: {exc}")
+                return 1
+
+        if args.plugins_command == "switch":
+            target_base = plugins_dir / args.plugin_id
+            if not target_base.is_dir() or not (target_base / args.version).is_dir():
+                err = f"Version {args.version!r} for plugin {args.plugin_id!r} is not installed."
+                if getattr(args, "json", False):
+                    print(json.dumps({"error": err}, indent=2))
+                else:
+                    print(err)
+                return 1
+            _write_active_marker(target_base, args.version)
+            if getattr(args, "json", False):
+                print(
+                    json.dumps(
+                        {
+                            "status": "switched",
+                            "plugin_id": args.plugin_id,
+                            "active_version": args.version,
+                        },
+                        indent=2,
+                    )
+                )
+            else:
+                print(f"Switched plugin {args.plugin_id} active version to {args.version}")
+            return 0
+
+        if args.plugins_command == "versions":
+            versions = list_plugin_versions(plugins_dir, args.plugin_id)
+            if getattr(args, "json", False):
+                print(json.dumps({"plugin_id": args.plugin_id, "versions": versions}, indent=2))
+            else:
+                print(f"Versions for plugin {args.plugin_id}:")
+                for v in versions:
+                    active = " [active]" if v.get("active") else ""
+                    print(f" - {v.get('version')}{active}")
+            return 0
+
         parser.print_help()
         return 0
 
@@ -1097,9 +1473,7 @@ def main(
                     if forwarded is not None:
                         return forwarded
                 with _owned_execution(owner_claimed=_owner_claimed):
-                    task_record = StateTaskStore(StateDatabase(layout.state_db)).get(
-                        args.parent_id
-                    )
+                    task_record = StateTaskStore(StateDatabase(layout.state_db)).get(args.parent_id)
                     enumeration = (
                         task_record.metadata.get("batch_enumeration")
                         if task_record is not None
@@ -1233,7 +1607,14 @@ def main(
             except CLIDownloaderError as error:
                 print(json.dumps({"error": str(error)}, indent=2))
                 return 1
-            print(json.dumps(result.to_dict() if hasattr(result, "to_dict") else {"task_id": task_id, "action": "pause"}, indent=2))
+            print(
+                json.dumps(
+                    result.to_dict()
+                    if hasattr(result, "to_dict")
+                    else {"task_id": task_id, "action": "pause"},
+                    indent=2,
+                )
+            )
             return 0
         if not task_id:
             print(json.dumps({"error": "positional TASK_ID is required"}))
@@ -1376,10 +1757,29 @@ def main(
         if args.config_command == "defaults":
             print(json.dumps(settings_registry.schema.defaults(), indent=2))
             return 0
-        if args.config_command == "show":
-            print(json.dumps(ConfigLoader(registry=settings_registry).load().to_dict(), indent=2))
-            return 0
-        parser.print_help()
+    if args.command == "check-update":
+        service = ReleaseUpdateService(
+            repository_url="https://github.com/RyuuMeow/CLI-Downloader.git",
+            current_version=__version__,
+        )
+        res = service.check()
+        payload = {
+            "status": res.status.value,
+            "current_version": res.current_version,
+            "latest_version": res.latest_version,
+            "release_url": res.release_url,
+            "error_code": res.error_code,
+        }
+        if getattr(args, "json", False):
+            print(json.dumps(payload, indent=2))
+        else:
+            if res.status.value == "update_available":
+                print(f"Update available: {res.latest_version} (Current: {res.current_version})")
+                print(f"Release URL: {res.release_url}")
+            elif res.status.value == "up_to_date":
+                print(f"CLI-Downloader is up to date (version {res.current_version}).")
+            else:
+                print(f"Release check status: {res.status.value}")
         return 0
 
     parser.print_help()
@@ -1453,7 +1853,8 @@ def _delete_task_records(
     blocked = tuple(
         node.task_id
         for node in candidates
-        if node.state in {
+        if node.state
+        in {
             TaskState.PREPARING,
             TaskState.QUEUED,
             TaskState.RUNNING,

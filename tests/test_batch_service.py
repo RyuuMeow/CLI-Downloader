@@ -254,7 +254,9 @@ class BatchServiceTests(unittest.TestCase):
             self.assertEqual(len(result.entries), len(_items()))
             self.assertEqual(finalized.metadata["batch_enumeration"]["state"], "completed")
             self.assertEqual(finalized.created_at, provisional.created_at)
-            self.assertEqual(history.get_record(parent_id).created_at, provisional_history.created_at)
+            self.assertEqual(
+                history.get_record(parent_id).created_at, provisional_history.created_at
+            )
 
     def test_failed_enumeration_closes_task_and_history_without_deleting_root(self) -> None:
         with TemporaryDirectory() as directory:

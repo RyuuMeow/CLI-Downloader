@@ -805,9 +805,7 @@ class TextualShellAppTest(IsolatedAsyncioTestCase):
             table = app.query_one("#task-table", DataTable)
 
             wide_viewport = table.scrollable_content_region.width
-            wide_rendered = sum(
-                column.get_render_width(table) for column in table.columns.values()
-            )
+            wide_rendered = sum(column.get_render_width(table) for column in table.columns.values())
             self.assertEqual(wide_rendered, wide_viewport)
             self.assertGreaterEqual(
                 table.columns[app._task_column_keys["type"]].width,
@@ -1621,9 +1619,7 @@ class TextualShellAppTest(IsolatedAsyncioTestCase):
             list_roots=lambda: (direct, torrent),
             list_files=lambda task_id: files[task_id],
         )
-        app = TextualShellApp(
-            InteractiveShell(task_service_loader=lambda: service)
-        )
+        app = TextualShellApp(InteractiveShell(task_service_loader=lambda: service))
 
         async with app.run_test() as pilot:
             app.query_one(TabbedContent).active = "tasks"

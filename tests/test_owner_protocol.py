@@ -102,7 +102,9 @@ class OwnerRequestTests(unittest.TestCase):
 
     def test_request_frame_size_is_bounded(self) -> None:
         with self.assertRaises(ContractValidationError) as context:
-            download_request(payload={"url": "https://example.test", "params": {"x": "a" * 200}}).to_bytes(max_frame_bytes=64)
+            download_request(
+                payload={"url": "https://example.test", "params": {"x": "a" * 200}}
+            ).to_bytes(max_frame_bytes=64)
 
         self.assertEqual(context.exception.code, "frame_too_large")
 
@@ -118,8 +120,12 @@ class OwnerRequestTests(unittest.TestCase):
 
 class HandshakeTests(unittest.TestCase):
     def test_capability_negotiation_returns_intersection(self) -> None:
-        client = OwnerHandshake(1, "client-1", OwnerMode.FOREGROUND, "0.1.5", ("download", "status"), ("download",))
-        owner = OwnerHandshake(1, "owner-1", OwnerMode.SHELL, "0.1.5", ("download", "status", "history"), ())
+        client = OwnerHandshake(
+            1, "client-1", OwnerMode.FOREGROUND, "0.1.5", ("download", "status"), ("download",)
+        )
+        owner = OwnerHandshake(
+            1, "owner-1", OwnerMode.SHELL, "0.1.5", ("download", "status", "history"), ()
+        )
 
         result = negotiate_handshake(client, owner)
 
@@ -176,7 +182,9 @@ class HandshakeTests(unittest.TestCase):
 
     def test_lifecycle_states_are_explicit(self) -> None:
         self.assertEqual(OwnerLifecycleState.READY.value, "ready")
-        self.assertNotIn(OwnerLifecycleState.READY, {OwnerLifecycleState.STARTING, OwnerLifecycleState.BUSY})
+        self.assertNotIn(
+            OwnerLifecycleState.READY, {OwnerLifecycleState.STARTING, OwnerLifecycleState.BUSY}
+        )
 
 
 class ResponseStreamTests(unittest.TestCase):
@@ -218,9 +226,15 @@ class ResponseStreamTests(unittest.TestCase):
 
     def test_stream_requires_acceptance_and_one_terminal_event(self) -> None:
         stream = OwnerResponseStream("request-1")
-        accepted = OwnerResponseEvent.accepted("request-1", 1, owner_session_id="owner-1", accepted_at=NOW, task_id="task-1")
-        progress = OwnerResponseEvent.progress("request-1", 2, task_id="task-1", status="running", progress=0.5)
-        terminal = OwnerResponseEvent.terminal("request-1", 3, status=OwnerTerminalStatus.COMPLETED, task_id="task-1")
+        accepted = OwnerResponseEvent.accepted(
+            "request-1", 1, owner_session_id="owner-1", accepted_at=NOW, task_id="task-1"
+        )
+        progress = OwnerResponseEvent.progress(
+            "request-1", 2, task_id="task-1", status="running", progress=0.5
+        )
+        terminal = OwnerResponseEvent.terminal(
+            "request-1", 3, status=OwnerTerminalStatus.COMPLETED, task_id="task-1"
+        )
 
         for event in (accepted, progress, terminal):
             stream.push(event)
@@ -228,29 +242,58 @@ class ResponseStreamTests(unittest.TestCase):
         self.assertTrue(stream.accepted)
         self.assertTrue(stream.terminal)
         with self.assertRaises(ContractValidationError) as context:
-            stream.push(OwnerResponseEvent.heartbeat("request-1", 4, owner_session_id="owner-1", emitted_at=NOW))
+            stream.push(
+                OwnerResponseEvent.heartbeat(
+                    "request-1", 4, owner_session_id="owner-1", emitted_at=NOW
+                )
+            )
         self.assertEqual(context.exception.code, "event_after_terminal")
 
     def test_stream_rejects_gaps_and_pre_acceptance_progress(self) -> None:
         stream = OwnerResponseStream("request-1")
         with self.assertRaises(ContractValidationError) as context:
-            stream.push(OwnerResponseEvent.progress("request-1", 1, task_id="task-1", status="queued"))
+            stream.push(
+                OwnerResponseEvent.progress("request-1", 1, task_id="task-1", status="queued")
+            )
         self.assertEqual(context.exception.code, "invalid_lifecycle")
 
-        stream.push(OwnerResponseEvent.accepted("request-1", 1, owner_session_id="owner-1", accepted_at=NOW))
+        stream.push(
+            OwnerResponseEvent.accepted("request-1", 1, owner_session_id="owner-1", accepted_at=NOW)
+        )
         with self.assertRaises(ContractValidationError) as context:
-            stream.push(OwnerResponseEvent.heartbeat("request-1", 3, owner_session_id="owner-1", emitted_at=NOW))
+            stream.push(
+                OwnerResponseEvent.heartbeat(
+                    "request-1", 3, owner_session_id="owner-1", emitted_at=NOW
+                )
+            )
         self.assertEqual(context.exception.code, "invalid_sequence")
 
     def test_disconnect_has_deterministic_outcomes(self) -> None:
-        not_accepted = OwnerResponseEvent.owner_disconnected("request-1", 1, phase=OwnerWaitPhase.ACCEPTANCE, outcome=OwnerDisconnectOutcome.NOT_ACCEPTED)
+        not_accepted = OwnerResponseEvent.owner_disconnected(
+            "request-1",
+            1,
+            phase=OwnerWaitPhase.ACCEPTANCE,
+            outcome=OwnerDisconnectOutcome.NOT_ACCEPTED,
+        )
         self.assertEqual(not_accepted.payload["outcome"], "not_accepted")
 
-        lost = OwnerResponseEvent.owner_disconnected("request-1", 1, phase=OwnerWaitPhase.RESPONSE_IDLE, outcome=OwnerDisconnectOutcome.TERMINAL_RESULT_LOST, known_task_id="task-1", terminal_persisted=True)
+        lost = OwnerResponseEvent.owner_disconnected(
+            "request-1",
+            1,
+            phase=OwnerWaitPhase.RESPONSE_IDLE,
+            outcome=OwnerDisconnectOutcome.TERMINAL_RESULT_LOST,
+            known_task_id="task-1",
+            terminal_persisted=True,
+        )
         self.assertEqual(lost.kind, OwnerEventKind.OWNER_DISCONNECTED)
 
         with self.assertRaises(ContractValidationError) as context:
-            OwnerResponseEvent.owner_disconnected("request-1", 1, phase=OwnerWaitPhase.RESPONSE_IDLE, outcome=OwnerDisconnectOutcome.NOT_ACCEPTED)
+            OwnerResponseEvent.owner_disconnected(
+                "request-1",
+                1,
+                phase=OwnerWaitPhase.RESPONSE_IDLE,
+                outcome=OwnerDisconnectOutcome.NOT_ACCEPTED,
+            )
         self.assertEqual(context.exception.code, "invalid_disconnect_outcome")
 
 
@@ -264,14 +307,23 @@ class LedgerAndLivenessTests(unittest.TestCase):
         self.assertEqual(first.disposition, RequestDisposition.NEW)
         self.assertEqual(duplicate.disposition, RequestDisposition.DUPLICATE)
         self.assertEqual(conflict.disposition, RequestDisposition.CONFLICT)
-        self.assertEqual(ledger.mark_accepted("request-1", task_id="task-1").state, RequestState.ACCEPTED)
-        self.assertEqual(ledger.mark_terminal("request-1", status=OwnerTerminalStatus.COMPLETED).state, RequestState.TERMINAL)
+        self.assertEqual(
+            ledger.mark_accepted("request-1", task_id="task-1").state, RequestState.ACCEPTED
+        )
+        self.assertEqual(
+            ledger.mark_terminal("request-1", status=OwnerTerminalStatus.COMPLETED).state,
+            RequestState.TERMINAL,
+        )
 
     def test_heartbeat_extends_idle_window_but_not_acceptance_contract(self) -> None:
         policy = OwnerWaitPolicy(response_idle_timeout=10)
         tracker = OwnerLivenessTracker(policy, now=0)
-        accepted = OwnerResponseEvent.accepted("request-1", 1, owner_session_id="owner-1", accepted_at=NOW)
-        heartbeat = OwnerResponseEvent.heartbeat("request-1", 2, owner_session_id="owner-1", emitted_at=NOW)
+        accepted = OwnerResponseEvent.accepted(
+            "request-1", 1, owner_session_id="owner-1", accepted_at=NOW
+        )
+        heartbeat = OwnerResponseEvent.heartbeat(
+            "request-1", 2, owner_session_id="owner-1", emitted_at=NOW
+        )
 
         tracker.observe(accepted, now=1)
         tracker.observe(heartbeat, now=9)
@@ -280,7 +332,9 @@ class LedgerAndLivenessTests(unittest.TestCase):
         self.assertEqual(policy.timeout_for(OwnerWaitPhase.ACCEPTANCE), 30)
 
     def test_in_memory_transport_bounds_silent_owner_wait(self) -> None:
-        transport = InMemoryOwnerTransport(policy=OwnerWaitPolicy(acceptance_timeout=3, response_idle_timeout=5))
+        transport = InMemoryOwnerTransport(
+            policy=OwnerWaitPolicy(acceptance_timeout=3, response_idle_timeout=5)
+        )
         transport.submit(download_request(), now=0)
 
         self.assertIsNone(transport.poll("request-1", now=2.9))
@@ -294,9 +348,19 @@ class LedgerAndLivenessTests(unittest.TestCase):
     def test_in_memory_transport_keeps_healthy_heartbeat_stream_alive(self) -> None:
         transport = InMemoryOwnerTransport(policy=OwnerWaitPolicy(response_idle_timeout=5))
         transport.submit(download_request(), now=0)
-        transport.deliver(OwnerResponseEvent.accepted("request-1", 1, owner_session_id="owner-1", accepted_at=NOW, task_id="task-1"), now=0)
+        transport.deliver(
+            OwnerResponseEvent.accepted(
+                "request-1", 1, owner_session_id="owner-1", accepted_at=NOW, task_id="task-1"
+            ),
+            now=0,
+        )
         self.assertIsNotNone(transport.poll("request-1", now=0))
-        transport.deliver(OwnerResponseEvent.heartbeat("request-1", 2, owner_session_id="owner-1", emitted_at=NOW), now=4)
+        transport.deliver(
+            OwnerResponseEvent.heartbeat(
+                "request-1", 2, owner_session_id="owner-1", emitted_at=NOW
+            ),
+            now=4,
+        )
         self.assertIsNotNone(transport.poll("request-1", now=4))
 
         self.assertIsNone(transport.poll("request-1", now=8.9))
@@ -308,7 +372,12 @@ class LedgerAndLivenessTests(unittest.TestCase):
     def test_in_memory_transport_reports_terminal_result_lost(self) -> None:
         transport = InMemoryOwnerTransport()
         transport.submit(download_request(), now=0)
-        transport.deliver(OwnerResponseEvent.accepted("request-1", 1, owner_session_id="owner-1", accepted_at=NOW, task_id="task-1"), now=0)
+        transport.deliver(
+            OwnerResponseEvent.accepted(
+                "request-1", 1, owner_session_id="owner-1", accepted_at=NOW, task_id="task-1"
+            ),
+            now=0,
+        )
         transport.poll("request-1", now=0)
 
         disconnected = transport.disconnect(
@@ -318,7 +387,9 @@ class LedgerAndLivenessTests(unittest.TestCase):
             known_task_id="task-1",
             terminal_persisted=True,
         )
-        self.assertEqual(disconnected.payload["outcome"], OwnerDisconnectOutcome.TERMINAL_RESULT_LOST.value)
+        self.assertEqual(
+            disconnected.payload["outcome"], OwnerDisconnectOutcome.TERMINAL_RESULT_LOST.value
+        )
 
 
 if __name__ == "__main__":

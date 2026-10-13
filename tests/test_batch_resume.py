@@ -333,7 +333,12 @@ class ResumePlanTests(TestCase):
             plan = BatchResumeService(store=store, resolver=object()).plan_resume("parent-1")
 
             self.assertEqual(store.get_child(child.child_id).status, DownloadChildStatus.COMPLETED)
-            self.assertTrue(all(record.status is AssetStatus.COMPLETED for record in store.list_assets(child.child_id)))
+            self.assertTrue(
+                all(
+                    record.status is AssetStatus.COMPLETED
+                    for record in store.list_assets(child.child_id)
+                )
+            )
             self.assertEqual(plan.plans, ())
 
 

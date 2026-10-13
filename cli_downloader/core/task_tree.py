@@ -172,7 +172,9 @@ class BatchChildPage:
 
     def __post_init__(self) -> None:
         if self.total_count < 0 or self.offset < 0 or self.limit <= 0:
-            raise ValueError("BatchChildPage bounds must be non-negative and limit must be positive")
+            raise ValueError(
+                "BatchChildPage bounds must be non-negative and limit must be positive"
+            )
         if self.offset > self.total_count and self.items:
             raise ValueError("BatchChildPage offset cannot exceed total count with items")
         if len(self.items) > self.limit:

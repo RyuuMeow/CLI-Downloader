@@ -570,6 +570,48 @@ class CLITest(TestCase):
         self.assertEqual(exit_code, 0)
         self.assertIn("sample\tSample", stream.getvalue())
 
+    def test_plugins_install_defaults_to_installed_plugins_root(self) -> None:
+        with TemporaryDirectory() as directory:
+            appdata_plugins = Path(directory) / "CLI-Downloader" / "plugins"
+            with patch(
+                "cli_downloader.cli.app.installed_plugins_root", return_value=appdata_plugins
+            ):
+                with patch(
+                    "cli_downloader.cli.app.install_plugin", return_value="1.0.0"
+                ) as mock_install:
+                    stream = StringIO()
+                    with redirect_stdout(stream):
+                        exit_code = _main(
+                            ["plugins", "install", "https://github.com/example/test.git", "--json"]
+                        )
+                    self.assertEqual(exit_code, 0)
+                    mock_install.assert_called_once_with(
+                        appdata_plugins, "https://github.com/example/test.git", catalog_id=None
+                    )
+
+    def test_plugins_install_honors_explicit_root(self) -> None:
+        with TemporaryDirectory() as directory:
+            custom_root = Path(directory) / "my_plugins"
+            with patch(
+                "cli_downloader.cli.app.install_plugin", return_value="1.0.0"
+            ) as mock_install:
+                stream = StringIO()
+                with redirect_stdout(stream):
+                    exit_code = _main(
+                        [
+                            "plugins",
+                            "install",
+                            "https://github.com/example/test.git",
+                            "--root",
+                            str(custom_root),
+                            "--json",
+                        ]
+                    )
+                self.assertEqual(exit_code, 0)
+                mock_install.assert_called_once_with(
+                    custom_root, "https://github.com/example/test.git", catalog_id=None
+                )
+
     def test_tasks_lists_persisted_tasks(self) -> None:
         with TemporaryDirectory() as directory:
             with patch.dict("os.environ", {"CLI_DOWNLOADER_DATA_ROOT": directory}):
@@ -885,12 +927,92 @@ class CLITest(TestCase):
         self.assertEqual(exit_code, 1)
         self.assertIn("error", json.loads(stream.getvalue()))
 
-    def test_malformed_command_returns_nonzero(self) -> None:
+    def test_tasks_pause_reports_missing_task(self) -> None:
         stream = StringIO()
         with redirect_stdout(stream):
-            exit_code = _main(["nonexistent-command"])
+            exit_code = _main(["tasks", "pause", "nonexistent-id"])
 
-        self.assertNotEqual(exit_code, 0)
+        self.assertEqual(exit_code, 1)
+        self.assertIn("error", json.loads(stream.getvalue()))
+
+    def test_plugins_remote_command(self) -> None:
+        stream = StringIO()
+        with redirect_stdout(stream):
+            self.assertEqual(_main(["plugins", "remote", "--json"]), 0)
+        payload = json.loads(stream.getvalue())
+        self.assertIn("status", payload)
+        self.assertIn("entries", payload)
+
+    def test_plugins_refresh_command(self) -> None:
+        stream = StringIO()
+        with redirect_stdout(stream):
+            self.assertEqual(_main(["plugins", "refresh", "--json"]), 0)
+        payload = json.loads(stream.getvalue())
+        self.assertIn("status", payload)
+        self.assertIn("entries", payload)
+
+    def test_plugins_versions_and_switch_command(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            pdir = root / "testplugin"
+            (pdir / "0.1.0").mkdir(parents=True)
+            (pdir / "0.2.0").mkdir(parents=True)
+            (pdir / "active").write_text("0.1.0", encoding="utf-8")
+            (pdir / "0.1.0" / "plugin.json").write_text(
+                json.dumps(
+                    {
+                        "plugin_id": "testplugin",
+                        "display_name": "Test Plugin",
+                        "version": "0.1.0",
+                        "entrypoint": "plugin.py:Plugin",
+                        "manifest": "site.json",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (pdir / "0.2.0" / "plugin.json").write_text(
+                json.dumps(
+                    {
+                        "plugin_id": "testplugin",
+                        "display_name": "Test Plugin",
+                        "version": "0.2.0",
+                        "entrypoint": "plugin.py:Plugin",
+                        "manifest": "site.json",
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            # test versions
+            stream = StringIO()
+            with redirect_stdout(stream):
+                self.assertEqual(
+                    _main(["plugins", "versions", "testplugin", "--root", str(root), "--json"]), 0
+                )
+            payload = json.loads(stream.getvalue())
+            self.assertEqual(payload["plugin_id"], "testplugin")
+            self.assertEqual(len(payload["versions"]), 2)
+
+            # test switch
+            stream2 = StringIO()
+            with redirect_stdout(stream2):
+                self.assertEqual(
+                    _main(
+                        ["plugins", "switch", "testplugin", "0.2.0", "--root", str(root), "--json"]
+                    ),
+                    0,
+                )
+            payload2 = json.loads(stream2.getvalue())
+            self.assertEqual(payload2["status"], "switched")
+            self.assertEqual((pdir / "active").read_text(encoding="utf-8").strip(), "0.2.0")
+
+    def test_check_update_command(self) -> None:
+        stream = StringIO()
+        with redirect_stdout(stream):
+            self.assertEqual(_main(["check-update", "--json"]), 0)
+        payload = json.loads(stream.getvalue())
+        self.assertIn("status", payload)
+        self.assertIn("current_version", payload)
 
 
 def _extract_task_id(payload: str) -> str:

@@ -131,14 +131,12 @@ class StateBatchStore:
 
             paused = current.status is TaskStatus.PAUSED
             updated = current.transition(
-                status=TaskStatus.PAUSED if paused else (
-                    TaskStatus.PLANNED
-                    if current.status is TaskStatus.RUNNING
-                    else current.status
+                status=TaskStatus.PAUSED
+                if paused
+                else (
+                    TaskStatus.PLANNED if current.status is TaskStatus.RUNNING else current.status
                 ),
-                desired_control=(
-                    TaskDesiredControl.PAUSE if paused else TaskDesiredControl.RUN
-                ),
+                desired_control=(TaskDesiredControl.PAUSE if paused else TaskDesiredControl.RUN),
                 active_run_id=None,
                 metadata={**current.metadata, "execution_fence": execution_fence},
             )
@@ -148,9 +146,12 @@ class StateBatchStore:
             # DOWNLOADING but before it releases the process.  Requeue those
             # operational rows for the next explicit resume.  Checkpoint
             # metadata (partial files and torrent handles) remains untouched.
-            for _entry_id, _entry_status, _payload, child_id in unit_of_work.execution.list_entry_payloads(
-                parent_id
-            ):
+            for (
+                _entry_id,
+                _entry_status,
+                _payload,
+                child_id,
+            ) in unit_of_work.execution.list_entry_payloads(parent_id):
                 if not isinstance(child_id, str) or not child_id:
                     continue
                 child_payload = unit_of_work.execution.get_child_payload(child_id)
@@ -216,7 +217,10 @@ class StateBatchStore:
                 requested = set(asset_ids)
                 for asset_payload in unit_of_work.execution.list_asset_payloads(child_id):
                     asset = _asset_record_from_payload(asset_payload)
-                    if asset.asset.asset_id not in requested or asset.status is not AssetStatus.COMPLETED:
+                    if (
+                        asset.asset.asset_id not in requested
+                        or asset.status is not AssetStatus.COMPLETED
+                    ):
                         continue
                     updated_asset = replace(
                         asset,
@@ -427,8 +431,7 @@ class StateBatchStore:
             attempt_counts = _attempt_summary_rows(connection, child_ids)
 
         summaries = tuple(
-            _child_summary_from_row(row, asset_counts, attempt_counts)
-            for row in rows
+            _child_summary_from_row(row, asset_counts, attempt_counts) for row in rows
         )
         return BatchChildPage(
             items=summaries,
@@ -1051,7 +1054,9 @@ def _batch_counts_from_rows(rows: object) -> BatchCounts:
     return BatchCounts(**counts)
 
 
-def _asset_summary_rows(connection: object, child_ids: tuple[str, ...]) -> dict[str, tuple[int, int, int, int, int]]:
+def _asset_summary_rows(
+    connection: object, child_ids: tuple[str, ...]
+) -> dict[str, tuple[int, int, int, int, int]]:
     if not child_ids:
         return {}
     placeholders = ",".join("?" for _ in child_ids)

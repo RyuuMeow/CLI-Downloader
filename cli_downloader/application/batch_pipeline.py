@@ -1096,9 +1096,7 @@ class BatchPipeline:
             await control.wait_if_paused()
             if control.is_set():
                 raise asyncio.CancelledError
-            outcomes = await self._downloader.execute(
-                downloading_child, assets, control, reporter
-            )
+            outcomes = await self._downloader.execute(downloading_child, assets, control, reporter)
             if control.is_shutdown_requested():
                 return
             outcomes = _validate_outcomes(assets, outcomes)

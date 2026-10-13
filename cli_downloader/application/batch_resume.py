@@ -133,6 +133,7 @@ class BatchResumeService:
     ) -> BatchResumeResult:
         resume = self.plan_resume(parent_id)
         return await self._resume(resume, pipeline)
+
     async def resume_task(
         self,
         task_id: str,

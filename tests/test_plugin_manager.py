@@ -7,6 +7,7 @@ from unittest import TestCase
 from unittest.mock import patch
 
 from cli_downloader.plugins.manager import (
+    _extract_zip_archive,
     _installed_versions,
     _install_plugin_dependencies,
     _read_active_marker,
@@ -419,3 +420,70 @@ class RemovePluginTest(TestCase):
             plugins.mkdir()
             with self.assertRaises(RuntimeError):
                 remove_plugin(plugins, "unknown")
+
+
+class PreparePluginSourceTest(TestCase):
+    def test_zip_extraction_unwraps_single_folder(self) -> None:
+        import zipfile
+
+        with TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            zip_file = tmp_path / "test.zip"
+            target_dir = tmp_path / "target"
+
+            with zipfile.ZipFile(zip_file, "w") as zf:
+                zf.writestr("subfolder/plugin.json", '{"plugin_id": "test"}')
+                zf.writestr("subfolder/manifests/site.json", "{}")
+
+            _extract_zip_archive(zip_file, target_dir)
+            self.assertTrue((target_dir / "plugin.json").exists())
+            self.assertTrue((target_dir / "manifests" / "site.json").exists())
+
+    def test_skips_pip_install_when_deps_exist(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            plugin_dir = Path(tmpdir)
+            (plugin_dir / "requirements.txt").write_text(
+                "invalid_package_name_xyz_9999>=99.0", encoding="utf-8"
+            )
+            deps_dir = plugin_dir / "deps"
+            deps_dir.mkdir()
+            (deps_dir / "dummy.py").write_text("# vendor dep", encoding="utf-8")
+
+            # Should return immediately without raising pip error
+            _install_plugin_dependencies(plugin_dir)
+
+    @patch("cli_downloader.plugins.manager.urllib.request.urlopen")
+    def test_github_release_zip_auto_detection(self, mock_urlopen) -> None:
+        from cli_downloader.plugins.manager import _find_github_latest_release_zip_url
+
+        class FakeResponse:
+            def __init__(self, data: bytes):
+                self._data = data
+
+            def read(self):
+                return self._data
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                pass
+
+        api_payload = json.dumps(
+            {
+                "tag_name": "v1.0.0",
+                "assets": [
+                    {"name": "notes.txt", "browser_download_url": "https://example.test/notes.txt"},
+                    {
+                        "name": "douyin-plugin-v1.0.0.zip",
+                        "browser_download_url": "https://example.test/douyin.zip",
+                    },
+                ],
+            }
+        ).encode("utf-8")
+
+        mock_urlopen.side_effect = lambda req, timeout=15: FakeResponse(api_payload)
+
+        url = "https://github.com/RyuuMeow/Douyin-Plugin"
+        found_url = _find_github_latest_release_zip_url(url)
+        self.assertEqual(found_url, "https://example.test/douyin.zip")

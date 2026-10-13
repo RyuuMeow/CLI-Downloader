@@ -320,9 +320,7 @@ class DownloadServiceTest(TestCase):
                         PipelineContext(
                             "boundary-task",
                             data={
-                                "item": ResolvedItem(
-                                    "example", "example://boundary", "Boundary"
-                                ),
+                                "item": ResolvedItem("example", "example://boundary", "Boundary"),
                                 "plan": plan,
                             },
                         )
@@ -364,9 +362,7 @@ class DownloadServiceTest(TestCase):
                         PipelineContext(
                             "fenced-task",
                             data={
-                                "item": ResolvedItem(
-                                    "example", "example://fenced", "Fenced"
-                                ),
+                                "item": ResolvedItem("example", "example://fenced", "Fenced"),
                                 "plan": plan,
                             },
                         )

@@ -249,9 +249,7 @@ class InteractiveShell:
         self._runtime = runtime
         self._plugins_dir = plugins_dir or Path("plugins")
         catalog_cache = cache_dir or Path("~/.cli-downloader/cache").expanduser()
-        self._plugin_catalog_service = plugin_catalog_service or PluginCatalogService(
-            catalog_cache
-        )
+        self._plugin_catalog_service = plugin_catalog_service or PluginCatalogService(catalog_cache)
         self._shutdown_warning_callback = shutdown_warning
         self._startup_ready_callback = startup_ready_callback
         self._startup_ready_notified = False
@@ -1079,9 +1077,9 @@ class TextualShellApp(App[int]):
     def on_tabbed_content_tab_activated(self, event: TabbedContent.TabActivated) -> None:
         try:
             pane = getattr(event, "pane", None)
-            active_tab = getattr(pane, "id", None) or self.query_one(
-                "#shell-tabs", TabbedContent
-            ).active
+            active_tab = (
+                getattr(pane, "id", None) or self.query_one("#shell-tabs", TabbedContent).active
+            )
         except Exception:
             return
         if active_tab == "tasks":
@@ -1124,7 +1122,10 @@ class TextualShellApp(App[int]):
             self.query_one("#task-table", DataTable).focus()
             if self._active_task_id is None:
                 self._select_task(next(iter(self._task_nodes)))
-        if callable(getattr(self._task_service, "list_root_summaries", None)) or not self._task_nodes:
+        if (
+            callable(getattr(self._task_service, "list_root_summaries", None))
+            or not self._task_nodes
+        ):
             self._refresh_tasks()
 
     @work(thread=True)
@@ -1160,7 +1161,10 @@ class TextualShellApp(App[int]):
             for catalog_entry in self._plugin_catalog.entries:
                 url = catalog_entry.repository_url
                 metadata = fetch_remote_plugin_metadata(url)
-                if not metadata.get("fetch_error") and metadata.get("id") != catalog_entry.plugin_id:
+                if (
+                    not metadata.get("fetch_error")
+                    and metadata.get("id") != catalog_entry.plugin_id
+                ):
                     metadata["catalog_error"] = (
                         f"plugin.json ID {metadata.get('id')!r} does not match "
                         f"catalog ID {catalog_entry.plugin_id!r}"
@@ -1617,6 +1621,16 @@ class TextualShellApp(App[int]):
         table.clear()
 
         registry = load_registry(self._shell._plugins_dir)
+        dev_plugins_dir = Path("Plugins")
+        if (
+            dev_plugins_dir.is_dir()
+            and dev_plugins_dir.resolve() != self._shell._plugins_dir.resolve()
+        ):
+            dev_reg = load_registry(dev_plugins_dir)
+            for p_id, p_info in dev_reg.items():
+                if p_id not in registry:
+                    registry[p_id] = p_info
+
         plugins: dict[str, dict[str, object]] = {}
         installed_urls: set[str] = set()
         local_meta: dict[str, object] = {}
@@ -1657,15 +1671,15 @@ class TextualShellApp(App[int]):
                     else "Installed external plugin."
                 )
 
+                catalog_entry = self._catalog_entries.get(plugin_id)
                 git_url = registry.get(plugin_id, {}).get("git_url", "")
+                if not git_url and catalog_entry:
+                    git_url = catalog_entry.repository_url
                 if git_url:
                     installed_urls.add(git_url)
 
-                catalog_entry = self._catalog_entries.get(plugin_id)
                 remote_meta = self._fetched_remote_plugins.get(git_url) if git_url else None
-                available_version = (
-                    remote_meta.get("version", "-") if remote_meta else "-"
-                )
+                available_version = remote_meta.get("version", "-") if remote_meta else "-"
                 source = str(
                     registry.get(plugin_id, {}).get(
                         "source",
@@ -1712,7 +1726,9 @@ class TextualShellApp(App[int]):
                 "name": meta.display_name if meta else plugin_id,  # type: ignore[union-attr]
                 "version": meta.version if meta else version,  # type: ignore[union-attr]
                 "available_version": remote_meta.get("version", "-") if remote_meta else "-",
-                "source": str(info.get("source", catalog_entry.source if catalog_entry else "local")),
+                "source": str(
+                    info.get("source", catalog_entry.source if catalog_entry else "local")
+                ),
                 "author": (catalog_entry.author if catalog_entry and catalog_entry.author else "-"),
                 "description": (
                     meta.description  # type: ignore[union-attr]
@@ -1733,7 +1749,7 @@ class TextualShellApp(App[int]):
         # ── Phase 2: not-installed Official and Community catalog plugins ──
         for catalog_entry in self._plugin_catalog.entries:
             git_url = catalog_entry.repository_url
-            if git_url in installed_urls:
+            if git_url in installed_urls or catalog_entry.plugin_id in plugins:
                 continue
 
             entry = self._fetched_remote_plugins.get(git_url)
@@ -1923,9 +1939,7 @@ class TextualShellApp(App[int]):
             self._fetch_remote_plugins()
         except Exception as e:
             self.query_one("#plugin-info", Static).update(
-                "[red]"
-                + self._shell.translator("plugin.info.install_failed", error=e)
-                + "[/red]"
+                "[red]" + self._shell.translator("plugin.info.install_failed", error=e) + "[/red]"
             )
 
     def _show_catalog_status(self) -> None:
@@ -1983,9 +1997,7 @@ class TextualShellApp(App[int]):
         except Exception as e:
             msg = str(e)
             self.query_one("#plugin-info", Static).update(
-                "[red]"
-                + self._shell.translator("plugin.info.update_failed", error=msg)
-                + "[/red]"
+                "[red]" + self._shell.translator("plugin.info.update_failed", error=msg) + "[/red]"
             )
 
     def _remove_plugin(self) -> None:
@@ -2015,9 +2027,7 @@ class TextualShellApp(App[int]):
             self._selected_plugin_installed = False
         except Exception as e:
             self.query_one("#plugin-info", Static).update(
-                "[red]"
-                + self._shell.translator("plugin.info.remove_failed", error=e)
-                + "[/red]"
+                "[red]" + self._shell.translator("plugin.info.remove_failed", error=e) + "[/red]"
             )
 
     def _open_plugin_github(self) -> None:
@@ -2061,7 +2071,16 @@ class TextualShellApp(App[int]):
         translator = self._shell.translator
         path_labels = {
             part: translator(f"settings.category.{part}")
-            for part in ("general", "interface", "download", "tasks", "torrent", "network", "plugins", "about")
+            for part in (
+                "general",
+                "interface",
+                "download",
+                "tasks",
+                "torrent",
+                "network",
+                "plugins",
+                "about",
+            )
         }
         self.query_one("#settings-path", Static).update(
             " / ".join(
@@ -2203,13 +2222,13 @@ class TextualShellApp(App[int]):
         for index, (row_id, name, value, access) in enumerate(rows, start=1):
             table.add_row(str(index), name, value, access, key=row_id)
         detail = (
-                translator(
-                    "settings.detail.about",
-                    project=PROJECT_NAME,
-                    version=__version__,
-                    update=update_text,
-                    repository=REPOSITORY_URL or translator("plugin.detail.unavailable"),
-                )
+            translator(
+                "settings.detail.about",
+                project=PROJECT_NAME,
+                version=__version__,
+                update=update_text,
+                repository=REPOSITORY_URL or translator("plugin.detail.unavailable"),
+            )
             if path == ("about",)
             else (
                 translator("settings.detail.select")
@@ -2680,9 +2699,7 @@ class TextualShellApp(App[int]):
             return
         self._enable_selection_buttons(False)
         self.query_one("#operation-view-status", Static).update(
-            self._shell.translator(
-                "operation.loading_pages_start", total=total_pages
-            )
+            self._shell.translator("operation.loading_pages_start", total=total_pages)
         )
         thread = Thread(
             target=self._run_select_all_pages,
@@ -2737,9 +2754,7 @@ class TextualShellApp(App[int]):
         if error:
             count = len(self._selected_items)
             self.query_one("#operation-view-status", Static).update(
-                self._shell.translator(
-                    "operation.selection_error", count=count, error=error
-                )
+                self._shell.translator("operation.selection_error", count=count, error=error)
             )
         else:
             self._update_selection_status()
@@ -2936,9 +2951,7 @@ class TextualShellApp(App[int]):
             else:
                 summaries = service.list_root_summaries()
                 nodes = tuple(
-                    item.to_task_node()
-                    if hasattr(item, "to_task_node")
-                    else item
+                    item.to_task_node() if hasattr(item, "to_task_node") else item
                     for item in reversed(summaries)
                 )
                 total = None
@@ -3068,19 +3081,13 @@ class TextualShellApp(App[int]):
         nodes = tuple(self._task_nodes.values())
         fixed_values: dict[str, tuple[object, ...]] = {
             "number": tuple(_number_cell(index) for index in range(1, len(nodes) + 1)),
-            "type": tuple(
-                _task_kind_label(node.kind, self._shell.translator) for node in nodes
-            ),
+            "type": tuple(_task_kind_label(node.kind, self._shell.translator) for node in nodes),
             "site": tuple(_display_name(node.site_id or "unknown") for node in nodes),
-            "progress": tuple(
-                _task_progress(node, self._shell.translator) for node in nodes
-            ),
+            "progress": tuple(_task_progress(node, self._shell.translator) for node in nodes),
             "status": tuple(
                 _display_status(node.state.value, self._shell.translator) for node in nodes
             ),
-            "created": tuple(
-                _short_datetime(node.details.get("created_at")) for node in nodes
-            ),
+            "created": tuple(_short_datetime(node.details.get("created_at")) for node in nodes),
         }
         fixed_widths: dict[str, int] = {}
         for name, key in self._task_column_keys.items():
@@ -3206,17 +3213,13 @@ class TextualShellApp(App[int]):
         self._task_nodes = {node.task_id: node for node in nodes}
         self._task_files.clear()
         self._task_page_offset = page_offset if level == "items" else 0
-        self._task_page_total = (
-            max(page_total or 0, len(nodes)) if level == "items" else 0
-        )
+        self._task_page_total = max(page_total or 0, len(nodes)) if level == "items" else 0
         table = self.query_one("#task-table", DataTable)
 
         existing_keys = tuple(str(key.value) for key in table.rows)
         desired_keys = tuple(node.task_id for node in nodes)
         cursor_key = (
-            existing_keys[table.cursor_row]
-            if 0 <= table.cursor_row < len(existing_keys)
-            else None
+            existing_keys[table.cursor_row] if 0 <= table.cursor_row < len(existing_keys) else None
         )
         if existing_keys != desired_keys:
             table.clear()
@@ -3273,9 +3276,7 @@ class TextualShellApp(App[int]):
         if level == "roots":
             self._active_batch_id = None
             self._active_batch_name = None
-            self.query_one("#task-path", Static).update(
-                self._shell.translator("task.path")
-            )
+            self.query_one("#task-path", Static).update(self._shell.translator("task.path"))
             empty_text = self._shell.translator("task.no_tasks")
         else:
             self.query_one("#task-path", Static).update(
@@ -3349,9 +3350,7 @@ class TextualShellApp(App[int]):
     def _set_task_actions(self, node: TaskNode | None = None) -> None:
         self._task_file_path = None
         self._task_source_url = (
-            node.source_url
-            if node is not None and self._task_level != "files"
-            else None
+            node.source_url if node is not None and self._task_level != "files" else None
         )
         self._task_folder = _folder_for_task(node)
         folder_resolver = getattr(self._task_service, "get_available_folder", None)
@@ -3686,9 +3685,7 @@ class TextualShellApp(App[int]):
         if file.failure is not None:
             lines.extend(_task_failure_lines(file.failure, self._shell.translator))
         self.query_one("#task-detail", Static).update("\n".join(lines))
-        self._task_folder = (
-            str(Path(file.location).parent) if file.location is not None else None
-        )
+        self._task_folder = str(Path(file.location).parent) if file.location is not None else None
         self._task_file_path = file.location
         self._task_source_url = None
         self._task_action_signature = None
@@ -4010,13 +4007,18 @@ def _is_embedded_operation_command(argv: Sequence[str]) -> bool:
 
 
 def _shell_task_id(argv: Sequence[str]) -> str | None:
-    if len(argv) >= 3 and argv[0] == "tasks" and argv[1] in {
-        "show",
-        "retry",
-        "resume",
-        "hard-retry",
-        "cancel",
-    }:
+    if (
+        len(argv) >= 3
+        and argv[0] == "tasks"
+        and argv[1]
+        in {
+            "show",
+            "retry",
+            "resume",
+            "hard-retry",
+            "cancel",
+        }
+    ):
         return argv[2]
     if len(argv) >= 3 and argv[0] == "batches" and argv[1] in {"show", "retry", "resume"}:
         return argv[2]

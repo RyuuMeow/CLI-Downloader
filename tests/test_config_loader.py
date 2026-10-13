@@ -1,9 +1,14 @@
+import json
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest import TestCase
 
 from cli_downloader.config.loader import ConfigLoader
+from cli_downloader.config.schema import SettingsRegistry
+from cli_downloader.core.browser_auth import serialize_browser_session
 from cli_downloader.core.environment import AppPaths
+from cli_downloader.core.errors import ConfigValidationError
+from cli_downloader.sites.manifest import BrowserAuthSchema, SiteManifest
 
 
 class ConfigLoaderTest(TestCase):
@@ -49,6 +54,50 @@ class ConfigLoaderTest(TestCase):
         self.assertEqual(loaded.secrets["example.cookie"], "secret")
         self.assertEqual(loaded.to_dict()["secrets"]["example.cookie"], "<redacted>")
 
+    def test_loads_expired_browser_auth_session_for_reauthentication(self) -> None:
+        with TemporaryDirectory() as directory:
+            paths = _paths(Path(directory))
+            session = serialize_browser_session(
+                {
+                    "cookies": [
+                        {
+                            "name": "PHPSESSID",
+                            "value": "expired-session",
+                            "domain": ".pixiv.net",
+                            "path": "/",
+                            "expires": 1,
+                        }
+                    ]
+                },
+                allowed_domains=("pixiv.net",),
+            )
+            _write_browser_session(paths, session)
+
+            loaded = ConfigLoader(paths=paths, registry=_browser_auth_registry()).load()
+
+        self.assertEqual(loaded.secrets["plugins.pixiv.auth.session"], session)
+
+    def test_rejects_unsafe_browser_auth_sessions(self) -> None:
+        disallowed_domain = json.dumps(
+            {
+                "cookies": [
+                    {
+                        "name": "PHPSESSID",
+                        "value": "session",
+                        "domain": ".example.test",
+                        "path": "/",
+                    }
+                ]
+            }
+        )
+        for session in ("not-json", disallowed_domain):
+            with self.subTest(session=session), TemporaryDirectory() as directory:
+                paths = _paths(Path(directory))
+                _write_browser_session(paths, session)
+
+                with self.assertRaises(ConfigValidationError):
+                    ConfigLoader(paths=paths, registry=_browser_auth_registry()).load()
+
 
 def _paths(root: Path) -> AppPaths:
     return AppPaths(
@@ -59,4 +108,31 @@ def _paths(root: Path) -> AppPaths:
         state_dir=root / "state",
         downloads_dir=root / "downloads",
         logs_dir=root / "logs",
+    )
+
+
+def _browser_auth_registry() -> SettingsRegistry:
+    registry = SettingsRegistry()
+    registry.register_plugin(
+        "pixiv",
+        SiteManifest(
+            site_id="pixiv",
+            display_name="Pixiv",
+            domains=("pixiv.net",),
+            url_rules=(),
+            browser_auth=BrowserAuthSchema(
+                login_url="https://accounts.pixiv.net/login",
+                cookie_domains=("pixiv.net",),
+                required_cookies=("PHPSESSID",),
+            ),
+        ),
+    )
+    return registry
+
+
+def _write_browser_session(paths: AppPaths, session: str) -> None:
+    paths.config_dir.mkdir(parents=True)
+    (paths.config_dir / "secrets.toml").write_text(
+        f"[plugins.pixiv.auth]\nsession = {json.dumps(session)}\n",
+        encoding="utf-8",
     )

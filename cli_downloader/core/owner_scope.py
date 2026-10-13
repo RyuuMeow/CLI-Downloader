@@ -136,7 +136,9 @@ def _parse_datetime(value: object, path: str) -> datetime:
 def _identifiers(value: object, path: str) -> tuple[str, ...]:
     if not isinstance(value, Sequence) or isinstance(value, (str, bytes, bytearray)):
         raise _error("invalid_sequence", path, "must be a sequence of identifiers")
-    result = tuple(_require_identifier(item, f"{path}[{index}]") for index, item in enumerate(value))
+    result = tuple(
+        _require_identifier(item, f"{path}[{index}]") for index, item in enumerate(value)
+    )
     if len(result) != len(set(result)):
         raise _error("duplicate_value", path, "must not contain duplicate identifiers")
     return result
@@ -207,7 +209,9 @@ def _windows_current_user_sid() -> str | None:
         kernel.LocalFree.argtypes = [wintypes.HLOCAL]
         kernel.LocalFree.restype = wintypes.HLOCAL
 
-        if not advapi.OpenProcessToken(kernel.GetCurrentProcess(), token_query, ctypes.byref(token)):
+        if not advapi.OpenProcessToken(
+            kernel.GetCurrentProcess(), token_query, ctypes.byref(token)
+        ):
             return None
         required = wintypes.DWORD()
         advapi.GetTokenInformation(token, token_user, None, 0, ctypes.byref(required))
@@ -426,7 +430,9 @@ class OwnerDiscoveryMetadata:
             "application_version",
             _require_text(self.application_version, "discovery.application_version", maximum=64),
         )
-        object.__setattr__(self, "owner_mode", _enum(self.owner_mode, OwnerMode, "discovery.owner_mode"))
+        object.__setattr__(
+            self, "owner_mode", _enum(self.owner_mode, OwnerMode, "discovery.owner_mode")
+        )
         object.__setattr__(
             self,
             "lifecycle_state",
@@ -438,15 +444,23 @@ class OwnerDiscoveryMetadata:
             "process_start_identity",
             _require_token(self.process_start_identity, "discovery.process_start_identity"),
         )
-        object.__setattr__(self, "session_id", _require_token(self.session_id, "discovery.session_id"))
+        object.__setattr__(
+            self, "session_id", _require_token(self.session_id, "discovery.session_id")
+        )
         object.__setattr__(
             self,
             "endpoint_identity",
             _require_token(self.endpoint_identity, "discovery.endpoint_identity", maximum=256),
         )
-        object.__setattr__(self, "capabilities", _identifiers(self.capabilities, "discovery.capabilities"))
-        object.__setattr__(self, "created_at", _utc_datetime(self.created_at, "discovery.created_at"))
-        object.__setattr__(self, "updated_at", _utc_datetime(self.updated_at, "discovery.updated_at"))
+        object.__setattr__(
+            self, "capabilities", _identifiers(self.capabilities, "discovery.capabilities")
+        )
+        object.__setattr__(
+            self, "created_at", _utc_datetime(self.created_at, "discovery.created_at")
+        )
+        object.__setattr__(
+            self, "updated_at", _utc_datetime(self.updated_at, "discovery.updated_at")
+        )
 
     def to_dict(self) -> dict[str, JsonValue]:
         return {
@@ -488,7 +502,9 @@ class OwnerDiscoveryMetadata:
         )
         unknown = sorted(set(value) - allowed)
         if unknown:
-            raise _error("unknown_field", f"discovery.{unknown[0]}", "is not part of owner metadata")
+            raise _error(
+                "unknown_field", f"discovery.{unknown[0]}", "is not part of owner metadata"
+            )
         required = (
             "scope_fingerprint",
             "protocol_version",
@@ -510,7 +526,9 @@ class OwnerDiscoveryMetadata:
             protocol_version=value["protocol_version"],
             application_version=value["application_version"],
             owner_mode=_enum(value["owner_mode"], OwnerMode, "discovery.owner_mode"),
-            lifecycle_state=_enum(value["lifecycle_state"], OwnerLifecycleState, "discovery.lifecycle_state"),
+            lifecycle_state=_enum(
+                value["lifecycle_state"], OwnerLifecycleState, "discovery.lifecycle_state"
+            ),
             pid=value["pid"],
             process_start_identity=value["process_start_identity"],
             session_id=value["session_id"],
@@ -565,7 +583,13 @@ class OwnerDiscoveryStore:
                 delete=False,
             ) as stream:
                 temporary = Path(stream.name)
-                json.dump(metadata.to_dict(), stream, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+                json.dump(
+                    metadata.to_dict(),
+                    stream,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
                 stream.flush()
                 os.fsync(stream.fileno())
             if os.name != "nt":

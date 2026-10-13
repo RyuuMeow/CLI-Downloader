@@ -235,9 +235,13 @@ class TaskHierarchyServiceTest(TestCase):
             batches = GuardBatchStore(database)
             entries = tuple(_entry(f"entry-{index}") for index in range(1000))
             tasks.upsert(TaskRecord("batch-1", TaskStatus.RUNNING, kind=TaskKind.BATCH))
-            batches.create_batch(BatchParent("batch-1", tuple(entry.entry_id for entry in entries)), entries)
+            batches.create_batch(
+                BatchParent("batch-1", tuple(entry.entry_id for entry in entries)), entries
+            )
 
-            summary = TaskHierarchyService(task_store=tasks, batch_store=batches).list_root_summaries()
+            summary = TaskHierarchyService(
+                task_store=tasks, batch_store=batches
+            ).list_root_summaries()
 
             self.assertEqual(len(summary), 1)
             self.assertEqual(summary[0].progress.total_files, 0)
@@ -252,7 +256,9 @@ class TaskHierarchyServiceTest(TestCase):
             StateTaskStore(StateDatabase(root / "state.sqlite3")).upsert(
                 TaskRecord("batch-1", TaskStatus.PENDING, kind=TaskKind.BATCH)
             )
-            batches.create_batch(BatchParent("batch-1", tuple(entry.entry_id for entry in entries)), entries)
+            batches.create_batch(
+                BatchParent("batch-1", tuple(entry.entry_id for entry in entries)), entries
+            )
 
             page = batches.list_child_summaries("batch-1", offset=400, limit=100)
 

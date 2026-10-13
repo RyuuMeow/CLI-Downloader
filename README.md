@@ -8,11 +8,11 @@
   <img src="assets/icon/CLI-Downloader.png" width="128" alt="CLI-Downloader icon">
 </p>
 
-<h1 align="center">CLI-Downloader</h1>
+<h1 align="center">CLI-Downloader — Interactive Plugin-Based Collection Manager</h1>
 
 <p align="center">
-  A plugin-driven download manager with persistent tasks, batch control,<br>
-  torrent integration, and an interactive terminal UI.
+  An interactive, plugin-driven download framework for browsing, collecting, and organizing media from authenticated websites.<br>
+  Optimized for image collections and gallery-based workflows.
 </p>
 
 <p align="center">
@@ -27,87 +27,23 @@
   <img src="assets/readme/hero.png" width="960" alt="CLI-Downloader task dashboard">
 </p>
 
+**Status:** Early release. Core workflows are usable, but the Plugin API may change before v1.0.
 
-CLI-Downloader provides one consistent task, history, configuration, and user-interface layer while website support remains in independently maintained external plugins. It is designed for interactive terminal use, repeatable batch downloads, and automation through machine-readable output.
+## Why CLI-Downloader?
 
-## Features
+Browse an artist’s works, select multiple galleries, sign in when required, and automatically organize the results.
 
-- **One app, many websites.** Add support for the sites you need through installable plugins instead of switching between unrelated downloaders.
-- **Continue where you left off.** Tasks and Batch progress are saved, so closing the application does not erase your download state.
-- **Stay in control of large downloads.** Pause, resume, cancel, retry, or completely rebuild an Item or Batch task when needed.
-- **Choose how files arrive.** Use direct downloads, a configured torrent client, or let a plugin select the best available method automatically.
-- **Keep tasks and history separate.** Remove finished tasks without losing their durable download records.
-- **Discover plugins in the app.** Browse Official and Community catalogs, review plugin details, and see when updates are available.
-- **Use a UI or a command line.** Work in the keyboard-driven terminal interface or use JSON output in scripts and automation.
-- **Ready for different setups.** Choose an Installer or Portable build and use the interface in English, Traditional Chinese, or Simplified Chinese.
+Instead of dealing with ad-hoc scripts or managing separate tools for different sites, CLI-Downloader provides a single cohesive interface.
 
-## Quick Start
+### The Workflow
 
-### Windows Installer
-
-Download the latest `CLI-Downloader-<version>-windows-x64-setup.exe` from [GitHub Releases](https://github.com/RyuuMeow/CLI-Downloader/releases/latest). The per-user Installer can add CLI-Downloader to your user `PATH` and does not require administrator privileges.
-
-### Windows Portable
-
-Download and extract the latest `CLI-Downloader-<version>-windows-x64-portable.zip`. Run `CLI-Downloader.exe` to open the interactive shell, or use `clid.cmd` to forward command-line arguments without modifying `PATH`.
-
-### Run from Source
-
-Python 3.11 or newer is required.
-
-```powershell
-git clone https://github.com/RyuuMeow/CLI-Downloader.git
-cd CLI-Downloader
-python -m pip install -e .
-clid
+```text
+Install Plugin → Login → Search → Select → Download → Resume Later
 ```
 
-## Basic Usage
+## How It Differs
 
-Open the interactive shell:
-
-```powershell
-clid
-```
-
-Route a URL through an installed plugin, inspect the plan first, and query persisted state:
-
-```powershell
-clid download <url> --dry-run
-clid download <url>
-clid download <list-url>
-clid download <list-url> --select <item-id>
-clid tasks
-clid history
-clid plugins list
-clid doctor
-```
-
-Use `clid <command> --help` for command-specific options. Commands that support `--json` can be consumed by scripts and other tools.
-
-A command-line list or Batch URL without `--select` downloads every item returned by that
-operation. Repeat `--select <item-id>` to restrict the Batch to a subset. The interactive Shell
-continues to show the plugin-provided selection page.
-
-For Agent-assisted work, keep downloads in the visible Shell owner:
-
-```powershell
-clid shell status --json
-clid shell ensure --visible --wait-ready --json
-clid download <url> --dry-run --json
-clid download <url> --detach --json
-clid tasks show <task-id>
-clid tasks pause <task-id>
-clid tasks resume <task-id>
-```
-
-`--detach` reports durable acceptance and the Task ID; it does not claim final success. If the
-owner disconnects, inspect that existing Task and History before retrying, rather than creating a
-replacement Task. See the [Agent Skill guide](skills/cli-downloader/README.md) for the full
-authorization and ownership workflow.
-
-When the visible Shell closes with unfinished work, it warns, stops accepting new commands,
-and leaves recoverable checkpoints for the next Shell startup.
+While **yt-dlp** focuses on video extraction and **gallery-dl** excels at headless gallery scraping on supported sites, **CLI-Downloader** focuses on persistent and interactive collection workflows. We treat the downloader as an interactive hub where plugins act as mini-applications.
 
 ## Visual Tour
 
@@ -135,7 +71,7 @@ Plugins can expose list and search operations with keyboard selection and pagina
   <img src="assets/readme/operation.png" width="960" alt="Plugin batch selection operation">
 </p>
 
-## Plugin System
+## Plugin Architecture
 
 CLI-Downloader Core does not bundle website-specific downloaders. Installed plugins classify URLs, resolve website data, and declare supported operations; Core owns task creation, scheduling, retries, storage, downloads, and history.
 
@@ -149,119 +85,116 @@ flowchart LR
     Task --> History["Durable History"]
 ```
 
-The remote catalog is maintained in the [CLI-Downloader Plugin Marketplace](https://github.com/RyuuMeow/CLI-Downloader-Plugin-Marketplace). Activated plugins are trusted local Python code and are not sandboxed, so install plugins only from sources you trust.
+## Key Features
 
-See [Plugins/README.md](Plugins/README.md) for package layout, activation behavior, and plugin development guidance.
+- **Interactive Plugin Pages:** Plugins can provide search pages, paginated lists, forms, actions, and multi-selection workflows directly in the terminal interface.
+- **Browser Login Sessions:** Sign in through an isolated browser session without manually extracting or copying cookies.
+- **Folder Templates:** Automatically organize downloaded files into customized structures. For example:
+  ```text
+  {author_name}/{artwork_id}-{title}
+  ```
+  Output:
+  ```text
+  Artist Name/12345-Illustration Title/
+  ```
+- **Persistent Tasks:** Download progress, queues, and task states are saved. Close the app at any time and resume exactly where you left off.
+- **Multiple Download Strategies:** Select between direct file downloads or hand off jobs to an integrated Torrent client.
+- **Automation Ready:** Prefer scripts over the TUI? Every command supports `--json` output for headless automation.
 
-To start a plugin from a ready-made structure, use the [CLI-Downloader Plugin Template](https://github.com/RyuuMeow/CLI-Downloader-Plugin-Template). Finished plugins can be submitted to the [CLI-Downloader Plugin Marketplace](https://github.com/RyuuMeow/CLI-Downloader-Plugin-Marketplace) for catalog consideration.
+## Supported Websites
+
+CLI-Downloader Core itself does not contain website scrapers. **Website support is installed separately through the Plugin Marketplace.**
+
+Currently available repository official plugins:
+- **[Pixiv](https://github.com/RyuuMeow/Pixiv-Plugin.git)** (Images, Illustrations)
+- **[EHentai](https://github.com/RyuuMeow/EHentai-Plugin.git)** (Gallery, Torrent)
+- **[X / Twitter](https://github.com/RyuuMeow/X-Plugin.git)** (Images, Videos)
+- **[Douyin](https://github.com/RyuuMeow/Douyin-Plugin.git)** (Images, Videos)
+
+Browse and install plugins directly inside the application using the Plugin Marketplace tab, or via the command line: `clid plugins install pixiv`.
+
+## Quick Start
+
+### Windows Installer
+
+Download the latest `windows-x64-setup.exe` from [GitHub Releases](https://github.com/RyuuMeow/CLI-Downloader/releases/latest). It adds CLI-Downloader to your `PATH` and doesn't require administrator privileges.
+
+### Portable Build
+
+Download `windows-x64-portable.zip`. Run `CLI-Downloader.exe` to open the interactive shell, or use `clid.cmd` for command-line arguments.
+
+### Basic Usage
+
+Open the interactive shell:
+```powershell
+clid
+```
+
+Or use the command line directly:
+```powershell
+clid plugins list
+clid download <url> --dry-run
+clid download <url>
+```
+
+A command-line list or Batch URL without `--select` downloads every item returned by that
+operation. Repeat `--select <item-id>` to restrict the Batch to a subset. The interactive Shell
+continues to show the plugin-provided selection page.
+
+For Agent-assisted work, keep downloads in the visible Shell owner:
+
+```powershell
+clid shell status --json
+clid shell ensure --visible --wait-ready --json
+clid download <url> --dry-run --json
+clid download <url> --detach --json
+clid tasks show <task-id>
+clid tasks pause <task-id>
+clid tasks resume <task-id>
+```
+
+`--detach` reports durable acceptance and the Task ID; it does not claim final success. If the
+owner disconnects, inspect that existing Task and History before retrying, rather than creating a
+replacement Task. See the [Agent Skill guide](skills/cli-downloader/README.md) for the full
+authorization and ownership workflow.
+
+When the visible Shell closes with unfinished work, it warns, stops accepting new commands,
+and leaves recoverable checkpoints for the next Shell startup.
 
 ## Agent Skill
 
-This repository includes a ready-to-use [CLI-Downloader Agent Skill](skills/cli-downloader/) for compatible AI agent environments. It gives an agent project-specific guidance to:
+This project includes a ready-to-use Agent Skill (`skills/cli-downloader`). Use it to supercharge your AI assistants (like Claude Code or Codex).
 
-- inspect current tasks and durable history without reading the database directly;
-- validate URL routing with a dry run before starting a download;
-- add and verify download tasks with explicit user authorization;
-- diagnose unsupported URLs and plugin routing problems; and
-- research, scaffold, test, and document external website plugins; and
-- submit authorized work to the visible Shell owner and control the resulting Task through JSON commands.
+**Ask an Agent to:** research a website, scaffold a plugin, implement routing, add tests, and generate documentation.
 
-The Agent Skill does not grant additional permissions, bypass confirmation requirements, or make third-party plugins trustworthy. Agents must still follow the user's authorization and the security boundaries of their host environment.
+See the [Agent Skill documentation](skills/cli-downloader/README.md) for installation instructions.
 
-### Install the Skill
+## FAQ
 
-Clone this repository, then copy the **entire** `skills/cli-downloader` directory so its references and plugin template remain available.
+**Is this a replacement for yt-dlp?**
+No. If your primary goal is video extraction from YouTube and video platforms, yt-dlp is superior. CLI-Downloader is designed for gallery aggregation, image collections, and authenticated browsing workflows.
 
-**Codex** — install for your user account:
+**Are plugins sandboxed?**
+No. Activated plugins are trusted local Python code. You should only install plugins from trusted sources.
 
-```powershell
-New-Item -ItemType Directory -Force "$HOME\.agents\skills" | Out-Null
-Copy-Item -Recurse -Force ".\skills\cli-downloader" "$HOME\.agents\skills\"
-```
+**Can it use browser login sessions?**
+Yes. You can invoke a browser-based login flow that securely persists your session state, eliminating the need to copy-paste cookies.
 
-Invoke it explicitly with `$cli-downloader`, or let Codex select it when the request matches. For a project-only installation, copy it to `<project>/.agents/skills/cli-downloader` instead.
+## Disclaimer & Security
 
-**Claude Code** — install for your user account:
+CLI-Downloader is an open-source download framework provided "AS IS". We do not endorse or guarantee the lawfulness of third-party plugins.
 
-```powershell
-New-Item -ItemType Directory -Force "$HOME\.claude\skills" | Out-Null
-Copy-Item -Recurse -Force ".\skills\cli-downloader" "$HOME\.claude\skills\"
-```
-
-Invoke it explicitly with `/cli-downloader`, or let Claude select it when relevant. For a project-only installation, copy it to `<project>/.claude/skills/cli-downloader` instead.
-
-See the [Agent Skill installation guide](skills/cli-downloader/README.md) for scope, verification, updates, and generic Agent Skills-compatible environments.
-
-**Let an Agent install it for you** — you can ask a compatible Agent to install the Skill from this checkout, for example: `Install the CLI-Downloader Agent Skill from this repository and verify that it is available.` Review the proposed file operations and approve them according to your environment's permission rules.
-
-## Download Strategies
-
-Plugins may support one or more strategies:
-
-- `auto` lets the plugin choose the best available method.
-- `direct` downloads resolved files through Core.
-- `torrent` submits a torrent to the configured torrent client.
-
-```powershell
-clid download <url> --strategy auto
-clid download <url> --strategy direct
-clid download <url> --strategy torrent
-```
-
-Actual strategy support depends on the selected plugin and URL.
-
-## Tasks, History, and User Data
-
-Tasks represent current controllable work. History is a separate durable record, so deleting a task does not delete its history unless an explicit history action is requested. Settings, plugins, logs, downloads, tasks, and history remain in per-user data locations across upgrades and uninstallations.
-
-## Disclaimer
-
-CLI-Downloader is an open-source **download framework**. Core does not bundle support or parsing logic for any specific website. Website-specific behavior is provided by independently maintained plugins installed by the user.
-
-### Project Scope
-
-- Core provides general capabilities such as plugin contracts, task scheduling, rate limiting, persistence, and download pipelines.
-- CLI-Downloader does not endorse any plugin or guarantee that a plugin is safe, lawful, accurate, or compatible with a website's terms.
-- Network activity may be initiated by installed plugins or performed by Core on their resolved download requests, plugin catalog access, and configured external integrations.
-
-### Limitation of Liability
-
-- This project is provided **“AS IS”** under the [MIT License](LICENSE), without express or implied warranties.
-- You assume all risks arising from CLI-Downloader and any installed plugin, including account restrictions, service bans, legal claims, data loss, or unexpected network and filesystem activity.
-- You are responsible for complying with applicable laws, copyright rules, website terms of service, and for obtaining any required authorization or usage rights.
-- Do not use this project for unauthorized access, copyright infringement, unlawful distribution, or abusive bulk requests. The MIT License permits commercial use of this software but does not grant rights to third-party websites or downloaded content.
-
-### Plugins
-
-Plugins may contain additional website-specific behavior and terms. Read each plugin's README before installation or use. Community plugins are maintained independently; their behavior and risks do not represent the position of the CLI-Downloader Core project.
-
-By installing, compiling, or using CLI-Downloader or a plugin, you acknowledge this disclaimer and any additional terms documented by that plugin.
+- For security practices and vulnerability reporting, see [SECURITY.md](SECURITY.md).
+- For complete terms, limitations of liability, and plugin warnings, read [DISCLAIMER.md](DISCLAIMER.md).
 
 ## Documentation
 
+- [CLI Command Reference](docs/CLI-Commands.md)
 - [Project scope and behavior](docs/CLI-Downloader.md)
-- [Documentation index](docs/Index.md)
 - [System architecture](docs/structure/SystemDesign.md)
 - [Repository structure](docs/structure/SystemStructure.md)
 - [Changelog](CHANGELOG.md)
 
-## Development
-
-Install the development and packaging dependencies, then run the complete verification gate:
-
-```powershell
-python -m pip install -e ".[dev,package]"
-.\Scripts\Verify.ps1
-```
-
-Build the Windows Portable package with:
-
-```powershell
-.\Scripts\BuildPortable.ps1
-```
-
-Bug reports, feature proposals, documentation improvements, and plugin-contract discussions are welcome through [GitHub Issues](https://github.com/RyuuMeow/CLI-Downloader/issues).
 
 ## License
-
-CLI-Downloader is released under the [MIT License](LICENSE).
+Released under the [MIT License](LICENSE).

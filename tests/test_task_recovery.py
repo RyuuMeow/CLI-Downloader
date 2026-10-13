@@ -335,9 +335,7 @@ class BatchRecoveryTest(TestCase):
             entry = batch_store.get_entry("entry-p")
             batch_store.update_entry(replace(entry, status=BatchEntryStatus.RESOLVING))
             batch_store.attach_child("entry-p", paused_child)
-            batch_store.update_child(
-                replace(paused_child, status=DownloadChildStatus.DOWNLOADING)
-            )
+            batch_store.update_child(replace(paused_child, status=DownloadChildStatus.DOWNLOADING))
             stored_asset = batch_store.list_assets("paused-child")[0]
             batch_store.update_asset(
                 "paused-child", replace(stored_asset, status=AssetStatus.DOWNLOADING)
@@ -547,9 +545,7 @@ class BatchRecoveryTest(TestCase):
                 package=_package(asset),
             )
             batch_store.attach_child(entry.entry_id, child)
-            batch_store.update_child(
-                replace(child, status=DownloadChildStatus.DOWNLOADING)
-            )
+            batch_store.update_child(replace(child, status=DownloadChildStatus.DOWNLOADING))
             original_asset = batch_store.list_assets(child.child_id)[0]
             batch_store.update_asset(
                 child.child_id,

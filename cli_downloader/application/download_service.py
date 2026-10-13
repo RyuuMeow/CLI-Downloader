@@ -278,10 +278,7 @@ class DownloadService:
             ).run(context)
         except OwnerShutdownRequested:
             current = self._task_store.get(record.task_id) or record
-            paused = (
-                current.status is TaskStatus.PAUSED
-                or current.desired_control.value == "pause"
-            )
+            paused = current.status is TaskStatus.PAUSED or current.desired_control.value == "pause"
             checkpoint = current.transition(
                 status=TaskStatus.PAUSED if paused else TaskStatus.PLANNED,
                 desired_control=TaskDesiredControl.PAUSE if paused else TaskDesiredControl.RUN,
@@ -399,9 +396,7 @@ class DownloadService:
             title=item.title,
             kind=existing.kind if existing is not None else TaskKind.ITEM,
             desired_control=(
-                existing.desired_control
-                if existing is not None
-                else TaskDesiredControl.RUN
+                existing.desired_control if existing is not None else TaskDesiredControl.RUN
             ),
             revision=existing.revision if existing is not None else 0,
             run_generation=existing.run_generation if existing is not None else 0,
@@ -694,8 +689,7 @@ class WriteAssetsStage:
                     if existing_path.is_file():
                         actual_bytes = existing_path.stat().st_size
                         if (expected_bytes is None or actual_bytes == expected_bytes) and (
-                            await asyncio.to_thread(_sha256_file, existing_path)
-                            == expected_digest
+                            await asyncio.to_thread(_sha256_file, existing_path) == expected_digest
                         ):
                             written_assets.append(
                                 WrittenAsset(
@@ -927,9 +921,7 @@ class WriteAssetsStage:
                     bytes_written=0,
                 )
                 if reconciliation.outcome is not None:
-                    self._persist_torrent_outcome(
-                        context.task_id, asset, reconciliation.outcome
-                    )
+                    self._persist_torrent_outcome(context.task_id, asset, reconciliation.outcome)
             else:
                 content = await self._fetcher.fetch(asset)
                 written = self._file_writer.write(
@@ -1092,9 +1084,7 @@ class WriteAssetsStage:
         checkpoint = checkpoints.get(_torrent_checkpoint_key(asset))
         return checkpoint if isinstance(checkpoint, Mapping) else None
 
-    def _persist_torrent_outcome(
-        self, task_id: str, asset: Asset, outcome: TorrentOutcome
-    ) -> None:
+    def _persist_torrent_outcome(self, task_id: str, asset: Asset, outcome: TorrentOutcome) -> None:
         self._assert_execution_fence(task_id)
         current = self._task_store.get(task_id)
         if current is None:
@@ -1197,9 +1187,7 @@ class WriteAssetsStage:
             "sha256": _sha256_file(partial),
         }
         self._task_store.upsert(
-            current.transition(
-                metadata={**current.metadata, "partial_files": partial_files}
-            )
+            current.transition(metadata={**current.metadata, "partial_files": partial_files})
         )
 
     def _torrent_cancel_requested(self, task_id: str) -> bool:
