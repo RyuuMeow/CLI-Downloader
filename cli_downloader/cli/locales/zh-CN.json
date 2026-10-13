@@ -245,7 +245,7 @@
   "settings.description.folder_template": "下载画廊使用的相对文件夹模板。",
   "settings.description.max_concurrent_galleries": "同时下载的最大画廊数量。",
   "settings.description.scheduler_policy": "选择公平的 Round Robin 轮换，或按加入顺序的 FIFO 调度。",
-  "settings.description.scheduler_max_concurrent_downloads": "所有网站同时运行中的项目数上限。",
+  "settings.description.scheduler_max_concurrent_downloads": "所有独立下载与批次子项目共用的同时下载数上限，重试也计入。",
   "settings.description.scheduler_max_concurrent_downloads_per_site": "单个网站同时运行中的项目数备用上限。",
   "settings.description.client": "Torrent 客户端：none 或 qbittorrent。",
   "settings.description.poll_interval_seconds": "Torrent 进度轮询间隔秒数。",

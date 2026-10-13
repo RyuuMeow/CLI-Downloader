@@ -727,6 +727,44 @@ class CLITest(TestCase):
         self.assertIn('"status": "completed"', history_stream.getvalue())
         self.assertIn('"completed_files": 2', history_stream.getvalue())
 
+    def test_tasks_resume_reuses_registered_worker(self) -> None:
+        from cli_downloader.application.task_hierarchy_service import TaskHierarchyService
+        from cli_downloader.application.download_limiter import GalleryDownloadLimiter
+        from cli_downloader.storage.task_store import TaskRecord
+
+        with TemporaryDirectory() as directory:
+            database = StateDatabase(Path(directory) / "state" / "state.sqlite3")
+            tasks = StateTaskStore(database)
+            tasks.upsert(
+                TaskRecord(
+                    "live",
+                    TaskStatus.PAUSED,
+                    source_url="https://example.test/gallery/welcome",
+                    desired_control=TaskDesiredControl.PAUSE,
+                )
+            )
+            limiter = GalleryDownloadLimiter(1)
+            service = TaskHierarchyService(
+                task_store=tasks, batch_store=StateBatchStore(database), scheduler=limiter
+            )
+            service.register_standalone_runtime("live")
+            with (
+                patch.dict("os.environ", {"CLI_DOWNLOADER_DATA_ROOT": directory}),
+                redirect_stdout(StringIO()),
+            ):
+                with patch(
+                    "cli_downloader.cli.app._run_generic_download",
+                    side_effect=AssertionError("duplicate worker"),
+                ):
+                    code = _main(
+                        ["tasks", "resume", "live", "--json"],
+                        _owner_claimed=True,
+                        task_service=service,
+                        download_limiter=limiter,
+                    )
+            self.assertEqual(code, 0)
+            self.assertEqual(tasks.get("live").desired_control, TaskDesiredControl.RUN)
+
     def test_tasks_resume_rejects_completed_task(self) -> None:
         with TemporaryDirectory() as directory:
             with patch.dict("os.environ", {"CLI_DOWNLOADER_DATA_ROOT": directory}):

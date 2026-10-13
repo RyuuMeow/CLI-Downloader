@@ -245,7 +245,7 @@
   "settings.description.folder_template": "Relative folder template for downloaded galleries.",
   "settings.description.max_concurrent_galleries": "Maximum number of galleries downloaded at the same time.",
   "settings.description.scheduler_policy": "Choose fair Round Robin rotation or enqueue-order FIFO admission.",
-  "settings.description.scheduler_max_concurrent_downloads": "Global maximum number of active Item downloads.",
+  "settings.description.scheduler_max_concurrent_downloads": "Global maximum active Items, shared by standalone downloads and Batch children, including retries.",
   "settings.description.scheduler_max_concurrent_downloads_per_site": "Fallback maximum number of active Item downloads for one site.",
   "settings.description.client": "Torrent client: none or qbittorrent.",
   "settings.description.poll_interval_seconds": "Seconds between torrent progress polls.",

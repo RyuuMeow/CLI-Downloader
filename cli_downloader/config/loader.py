@@ -45,7 +45,14 @@ class ConfigLoader:
         sources: list[Path] = []
 
         if config_path.exists():
-            values.update(_flatten_toml(_read_toml(config_path)))
+            configured = _flatten_toml(_read_toml(config_path))
+            # Older releases exposed this as an independent setting. Import
+            # it only when the canonical setting was not explicitly saved.
+            legacy_limit = "download.max_concurrent_galleries"
+            item_limit = "scheduler.max_concurrent_downloads"
+            if legacy_limit in configured and item_limit not in configured:
+                configured[item_limit] = configured[legacy_limit]
+            values.update(configured)
             sources.append(config_path)
 
         secrets: dict[str, Any] = {}

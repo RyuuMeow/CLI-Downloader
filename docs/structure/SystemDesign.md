@@ -251,9 +251,26 @@ plugin resolve and enumerate
 
 Site plugins produce complete core download packages. Application services own
 validation, task creation, queues, task events, output writing, and history.
-Standalone Items and Batch children acquire the same process-wide Gallery
-download limiter before entering the system fetch/write stage. The default
-limit is two and is controlled by `download.max_concurrent_galleries`.
+Standalone Items and Batch children, including retries and resumed work, acquire
+one shared process-wide Item scheduler before entering the system fetch/write stage.
+`scheduler.max_concurrent_downloads` controls the global limit (default two), while
+`scheduler.max_concurrent_downloads_per_site` provides the per-site fallback. A Batch
+can use the available global capacity; it has no additional fixed two-worker cap.
+The former `download.max_concurrent_galleries` setting is hidden and is migrated on
+load only when no explicit scheduler limit exists. Network request concurrency,
+pacing, and retry backoff remain separate from Item admission.
+
+Each live Batch retains its own pipeline/coordinator registration until it finishes.
+Owner and Shell controls address that registration, and resume reuses a live worker.
+Pause intent projects as Pausing until the worker reaches a safe boundary. Paused
+streams release their active Item and request permits and reacquire them on resume;
+torrent pause acknowledgement follows the client pause call.
+
+Tasks roots and Batch children load in pages of 100 off the Textual event loop.
+Root pages decode compact metadata, aggregate Batch progress in bulk, and share one
+scheduler snapshot per refresh. Read projections use deferred, query-only SQLite
+transactions; state transitions retain immediate write transactions. Periodic refreshes
+coalesce while a page is loading, while navigation changes discard stale results.
 
 ## Pipelined Scheduling
 

@@ -96,7 +96,7 @@ class StateBatchStore:
             raise BatchConflictError(f"batch identity conflict: {parent.parent_id}") from error
 
     def list_parent_ids(self) -> tuple[str, ...]:
-        with StateUnitOfWork(self._database) as unit_of_work:
+        with StateUnitOfWork(self._database, read_only=True) as unit_of_work:
             return unit_of_work.execution.list_batch_ids()
 
     def recover_interrupted_root(
@@ -265,7 +265,7 @@ class StateBatchStore:
         if not task_ids:
             return frozenset()
         placeholders = ",".join("?" for _ in task_ids)
-        with StateUnitOfWork(self._database) as unit_of_work:
+        with StateUnitOfWork(self._database, read_only=True) as unit_of_work:
             rows = unit_of_work.connection.execute(
                 f"SELECT entry_id FROM execution_entries WHERE entry_id IN ({placeholders})",
                 task_ids,
@@ -273,39 +273,41 @@ class StateBatchStore:
         return frozenset(str(row[0]) for row in rows)
 
     def get_summary(self, parent_id: str) -> BatchSummary:
-        """Read a Batch root aggregate without decoding its child graph."""
+        return self.get_summaries((parent_id,))[parent_id]
 
-        with StateUnitOfWork(self._database) as unit_of_work:
+    def get_summaries(self, parent_ids: tuple[str, ...]) -> dict[str, BatchSummary]:
+        """Read root aggregates in bulk without decoding the execution graphs."""
+        if not parent_ids:
+            return {}
+        placeholders = ",".join("?" for _ in parent_ids)
+        with StateUnitOfWork(self._database, read_only=True) as unit_of_work:
             connection = unit_of_work.connection
-            root = connection.execute(
-                "SELECT title FROM execution_batches WHERE task_id = ?",
-                (parent_id,),
-            ).fetchone()
-            if root is None:
-                raise BatchNotFoundError(f"batch parent not found: {parent_id}")
+            roots = connection.execute(
+                f"SELECT task_id, title FROM execution_batches WHERE task_id IN ({placeholders})",
+                parent_ids,
+            ).fetchall()
             count_rows = connection.execute(
-                """
-                SELECT entry.status, child.status, COUNT(*)
+                f"""
+                SELECT entry.task_id, entry.status, child.status, COUNT(*)
                 FROM execution_entries AS entry
                 LEFT JOIN execution_children AS child ON child.entry_id = entry.entry_id
-                WHERE entry.task_id = ?
-                GROUP BY entry.status, child.status
+                WHERE entry.task_id IN ({placeholders})
+                GROUP BY entry.task_id, entry.status, child.status
                 """,
-                (parent_id,),
+                parent_ids,
             ).fetchall()
-            first = connection.execute(
-                """
-                SELECT entry_id, payload_json
-                FROM execution_entries
-                WHERE task_id = ?
-                ORDER BY position
-                LIMIT 1
+            first_rows = connection.execute(
+                f"""
+                SELECT e.task_id, e.payload_json
+                FROM execution_entries e
+                WHERE e.task_id IN ({placeholders})
+                  AND e.position = (SELECT MIN(position) FROM execution_entries WHERE task_id = e.task_id)
                 """,
-                (parent_id,),
-            ).fetchone()
-            byte_row = connection.execute(
-                """
-                SELECT
+                parent_ids,
+            ).fetchall()
+            byte_rows = connection.execute(
+                f"""
+                SELECT child.task_id,
                     COUNT(*),
                     SUM(CASE WHEN asset.status = ? THEN 1 ELSE 0 END),
                     COALESCE(SUM(CASE
@@ -326,34 +328,50 @@ class StateBatchStore:
                         THEN 0 ELSE 1 END)
                 FROM execution_assets AS asset
                 JOIN execution_children AS child ON child.child_id = asset.child_id
-                WHERE child.task_id = ?
+                WHERE child.task_id IN ({placeholders})
+                GROUP BY child.task_id
                 """,
-                (AssetStatus.COMPLETED.value, parent_id),
-            ).fetchone()
+                (AssetStatus.COMPLETED.value, *parent_ids),
+            ).fetchall()
 
-        counts = _batch_counts_from_rows(count_rows)
-        entry = _entry_from_payload(first[1]) if first is not None else None
-        asset_count = int(byte_row[0] or 0)
-        completed_asset_count = int(byte_row[1] or 0)
-        missing_total = int(byte_row[4] or 0)
-        return BatchSummary(
-            parent_id=parent_id,
-            title=root[0],
-            first_entry_id=entry.entry_id if entry is not None else None,
-            site_id=entry.site_id if entry is not None else None,
-            source_url=entry.source_url if entry is not None else None,
-            counts=counts,
-            execution_status=derive_batch_execution_status(counts),
-            completed_files=completed_asset_count,
-            total_files=asset_count,
-            completed_bytes=int(byte_row[2] or 0),
-            total_bytes=(int(byte_row[3] or 0) if asset_count > 0 and missing_total == 0 else None),
-        )
+        counts_by_root: dict[str, list[tuple[object, ...]]] = {}
+        for row in count_rows:
+            counts_by_root.setdefault(row[0], []).append(row[1:])
+        first_by_root = {row[0]: _entry_from_payload(row[1]) for row in first_rows}
+        bytes_by_root = {row[0]: row[1:] for row in byte_rows}
+        summaries = {}
+        for parent_id, title in roots:
+            counts = _batch_counts_from_rows(counts_by_root.get(parent_id, ()))
+            entry = first_by_root.get(parent_id)
+            byte_row = bytes_by_root.get(parent_id, (0, 0, 0, 0, 0))
+            asset_count = int(byte_row[0] or 0)
+            completed_asset_count = int(byte_row[1] or 0)
+            missing_total = int(byte_row[4] or 0)
+            summaries[parent_id] = BatchSummary(
+                parent_id=parent_id,
+                title=title,
+                first_entry_id=entry.entry_id if entry is not None else None,
+                site_id=entry.site_id if entry is not None else None,
+                source_url=entry.source_url if entry is not None else None,
+                counts=counts,
+                execution_status=derive_batch_execution_status(counts),
+                completed_files=completed_asset_count,
+                total_files=asset_count,
+                completed_bytes=int(byte_row[2] or 0),
+                total_bytes=(
+                    int(byte_row[3] or 0) if asset_count > 0 and missing_total == 0 else None
+                ),
+            )
+
+        missing = set(parent_ids) - summaries.keys()
+        if missing:
+            raise BatchNotFoundError(f"batch parent not found: {next(iter(missing))}")
+        return summaries
 
     def find_available_folder(self, task_id: str) -> str | None:
         """Return one persisted output folder without materialising a Batch graph."""
 
-        with StateUnitOfWork(self._database) as unit_of_work:
+        with StateUnitOfWork(self._database, read_only=True) as unit_of_work:
             row = unit_of_work.connection.execute(
                 """
                 SELECT
@@ -403,7 +421,7 @@ class StateBatchStore:
         if isinstance(limit, bool) or not isinstance(limit, int) or limit <= 0:
             raise ValueError("limit must be a positive integer")
         limit = min(limit, 500)
-        with StateUnitOfWork(self._database) as unit_of_work:
+        with StateUnitOfWork(self._database, read_only=True) as unit_of_work:
             connection = unit_of_work.connection
             exists = connection.execute(
                 "SELECT 1 FROM execution_batches WHERE task_id = ?", (parent_id,)
@@ -560,7 +578,7 @@ class StateBatchStore:
             unit_of_work.tasks.delete(parent_id)
 
     def get_snapshot(self, parent_id: str) -> BatchSnapshot:
-        with StateUnitOfWork(self._database) as unit_of_work:
+        with StateUnitOfWork(self._database, read_only=True) as unit_of_work:
             title = unit_of_work.execution.get_batch_title(parent_id)
             if title is None and parent_id not in unit_of_work.execution.list_batch_ids():
                 raise BatchNotFoundError(f"batch parent not found: {parent_id}")
@@ -577,12 +595,12 @@ class StateBatchStore:
         return derive_batch_snapshot(parent, entries, children)
 
     def get_entry(self, entry_id: str) -> BatchEntry | None:
-        with StateUnitOfWork(self._database) as unit_of_work:
+        with StateUnitOfWork(self._database, read_only=True) as unit_of_work:
             row = unit_of_work.execution.get_entry_payload(entry_id)
         return _entry_from_payload(row[2]) if row else None
 
     def list_entries(self, parent_id: str) -> tuple[BatchEntry, ...]:
-        with StateUnitOfWork(self._database) as unit_of_work:
+        with StateUnitOfWork(self._database, read_only=True) as unit_of_work:
             rows = unit_of_work.execution.list_entry_payloads(parent_id)
         return tuple(_entry_from_payload(row[2]) for row in rows)
 
@@ -665,17 +683,17 @@ class StateBatchStore:
             raise BatchConflictError(f"child handoff conflict: {child.child_id}") from error
 
     def get_package(self, package_id: str, version: int) -> DownloadPackage | None:
-        with StateUnitOfWork(self._database) as unit_of_work:
+        with StateUnitOfWork(self._database, read_only=True) as unit_of_work:
             payload = unit_of_work.execution.get_package_payload(package_id, version)
         return _package_from_payload(payload) if payload else None
 
     def get_child(self, child_id: str) -> DownloadChild | None:
-        with StateUnitOfWork(self._database) as unit_of_work:
+        with StateUnitOfWork(self._database, read_only=True) as unit_of_work:
             payload = unit_of_work.execution.get_child_payload(child_id)
         return _child_from_payload(payload) if payload else None
 
     def list_children(self, parent_id: str) -> tuple[DownloadChild, ...]:
-        with StateUnitOfWork(self._database) as unit_of_work:
+        with StateUnitOfWork(self._database, read_only=True) as unit_of_work:
             payloads = unit_of_work.execution.list_child_payloads(parent_id)
         return tuple(_child_from_payload(payload) for payload in payloads)
 
@@ -695,7 +713,7 @@ class StateBatchStore:
             unit_of_work.execution.update_child(child.child_id, child.status.value, child.to_dict())
 
     def list_assets(self, child_id: str) -> tuple[AssetRecord, ...]:
-        with StateUnitOfWork(self._database) as unit_of_work:
+        with StateUnitOfWork(self._database, read_only=True) as unit_of_work:
             payloads = unit_of_work.execution.list_asset_payloads(child_id)
         return tuple(_asset_record_from_payload(payload) for payload in payloads)
 
@@ -814,7 +832,7 @@ class StateBatchStore:
             raise BatchConflictError(f"attempt identity conflict: {attempt.attempt_id}") from error
 
     def list_attempts(self, target_id: str) -> tuple[AttemptData, ...]:
-        with StateUnitOfWork(self._database) as unit_of_work:
+        with StateUnitOfWork(self._database, read_only=True) as unit_of_work:
             payloads = unit_of_work.execution.list_attempt_payloads(target_id)
         return tuple(_attempt_from_payload(payload) for payload in payloads)
 
@@ -844,7 +862,7 @@ class StateBatchStore:
         if not candidate_ids:
             return {}
         placeholders = ",".join("?" for _ in candidate_ids)
-        with StateUnitOfWork(self._database) as unit_of_work:
+        with StateUnitOfWork(self._database, read_only=True) as unit_of_work:
             rows = unit_of_work.connection.execute(
                 f"""
                 SELECT entry.candidate_id, entry.status, child.status

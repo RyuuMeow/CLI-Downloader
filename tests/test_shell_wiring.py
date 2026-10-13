@@ -26,6 +26,38 @@ from tests.owner_transport_worker import shell_owner_process
 
 
 class ShellWiringTest(TestCase):
+    def test_owner_resume_reuses_live_standalone_worker(self) -> None:
+        from cli_downloader.application.task_hierarchy_service import TaskHierarchyService
+        from cli_downloader.cli._shell_wiring import _handle_owner_control
+        from cli_downloader.storage.state_batch_store import StateBatchStore
+        from tests.test_owner_protocol import download_request
+
+        with TemporaryDirectory() as directory:
+            database = StateDatabase(Path(directory) / "state.sqlite3")
+            tasks = StateTaskStore(database)
+            tasks.upsert(
+                TaskRecord("item", TaskStatus.PAUSED, desired_control=TaskDesiredControl.PAUSE)
+            )
+            service = TaskHierarchyService(task_store=tasks, batch_store=StateBatchStore(database))
+            service.register_standalone_runtime("item")
+            runner = Mock(side_effect=AssertionError("started duplicate worker"))
+            events = []
+            _handle_owner_control(
+                download_request(
+                    command=OwnerCommand.TASK_CONTROL,
+                    payload={"task_id": "item", "action": "resume"},
+                ),
+                events.append,
+                run_background=runner,
+                owner_session_id="owner",
+                task_service=service,
+            )
+            runner.assert_not_called()
+            self.assertEqual(tasks.get("item").status, TaskStatus.PLANNED)
+            self.assertTrue(service.is_running("item"))
+            service.release_standalone_runtime("item")
+            self.assertFalse(service.is_running("item"))
+
     def test_build_wires_callbacks_and_lazily_reuses_task_service(self) -> None:
         runner = Mock(return_value=0)
         background_runner = Mock(return_value=0)
@@ -119,6 +151,7 @@ class ShellWiringTest(TestCase):
                     _progress,
                     _download_limiter,
                     on_accept=None,
+                    task_service=None,
                 ) -> int:
                     if on_accept is not None:
                         on_accept("wired-task", "item")

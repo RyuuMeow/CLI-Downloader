@@ -4,11 +4,12 @@ import asyncio
 import random
 from collections.abc import Awaitable, Callable, Mapping
 from contextlib import asynccontextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
 from threading import BoundedSemaphore, Lock
-from time import monotonic, sleep
+from time import monotonic
 from typing import TypeVar
 
 from cli_downloader.application.item_scheduler import ItemLease, ItemScheduler, SchedulerPolicy
@@ -41,17 +42,52 @@ class _RequestGate:
         self.next_request_at = 0.0
         self.cooldown_until = 0.0
 
-    def acquire(self) -> None:
-        self.capacity.acquire()
-        with self.lock:
-            now = monotonic()
-            ready_at = max(now, self.next_request_at, self.cooldown_until)
-            self.next_request_at = ready_at + self.policy.min_interval_seconds
-        sleep(max(0.0, ready_at - now))
+    async def acquire(self) -> None:
+        # Never leave an uncancellable executor thread waiting for a permit.
+        # Check shared timing and capacity atomically across worker event loops.
+        while True:
+            with self.lock:
+                now = monotonic()
+                ready_at = max(self.next_request_at, self.cooldown_until)
+                if now >= ready_at and self.capacity.acquire(blocking=False):
+                    self.next_request_at = now + self.policy.min_interval_seconds
+                    return
+            await asyncio.sleep(0.02)
 
     def defer(self, delay: float) -> None:
         with self.lock:
             self.cooldown_until = max(self.cooldown_until, monotonic() + delay)
+
+
+class _RequestLease:
+    def __init__(self, gate: _RequestGate) -> None:
+        self.gate = gate
+        self.held = False
+
+    async def acquire(self) -> None:
+        if not self.held:
+            await self.gate.acquire()
+            self.held = True
+
+    def release(self) -> None:
+        if self.held:
+            self.held = False
+            self.gate.capacity.release()
+
+
+_current_request: ContextVar[_RequestLease | None] = ContextVar("current_request", default=None)
+
+
+def suspend_current_request() -> None:
+    lease = _current_request.get()
+    if lease is not None:
+        lease.release()
+
+
+async def resume_current_request() -> None:
+    lease = _current_request.get()
+    if lease is not None:
+        await lease.acquire()
 
 
 class GalleryDownloadLimiter:
@@ -76,6 +112,10 @@ class GalleryDownloadLimiter:
         self._request_policies = dict(request_policies or {})
         self._request_gates: dict[str, _RequestGate] = {}
         self._request_gates_lock = Lock()
+
+    @property
+    def max_concurrent_downloads(self) -> int:
+        return self._scheduler.max_concurrent_downloads
 
     async def __aenter__(self) -> GalleryDownloadLimiter:
         task = asyncio.current_task()
@@ -152,7 +192,9 @@ class GalleryDownloadLimiter:
         gate = self._gate(site_id)
         policy = gate.policy
         for attempt in range(1, policy.max_attempts + 1):
-            await asyncio.to_thread(gate.acquire)
+            lease = _RequestLease(gate)
+            await lease.acquire()
+            token = _current_request.set(lease)
             try:
                 return await operation()
             except Exception as error:
@@ -180,7 +222,8 @@ class GalleryDownloadLimiter:
                         }
                     )
             finally:
-                gate.capacity.release()
+                _current_request.reset(token)
+                lease.release()
         raise RuntimeError("request retry loop exited unexpectedly")
 
     def _gate(self, site_id: str) -> _RequestGate:

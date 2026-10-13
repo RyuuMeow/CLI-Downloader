@@ -190,6 +190,8 @@ def _run_batch_retry(
     cancellation: Event | None = None,
     progress: ProgressSink | None = None,
     resume: bool = False,
+    download_limiter: GalleryDownloadLimiter | None = None,
+    task_service: TaskHierarchyService | None = None,
 ) -> int:
     runtime.configure_plugins(config.values, config.secrets)
     entries = store.list_entries(parent_id)
@@ -209,7 +211,7 @@ def _run_batch_retry(
             )
         )
     completion_store = SQLiteCompletionStore(StateDatabase(layout.state_db))
-    download_limiter = _build_download_limiter(runtime, config.values)
+    download_limiter = download_limiter or _build_download_limiter(runtime, config.values)
     resolver = RuntimePackageResolver(
         runtime,
         profile=profile,
@@ -235,12 +237,17 @@ def _run_batch_retry(
         completion_store=completion_store,
         event_sink=lambda event: _report_progress(progress, event.reason, event.payload),
     )
-    runner = CoordinatedBatchRunner(
-        pipeline=pipeline,
-        coordinator=TaskExecutionCoordinator(task_store=task_store),
-    )
+    coordinator = TaskExecutionCoordinator(task_store=task_store)
+    runner = CoordinatedBatchRunner(pipeline=pipeline, coordinator=coordinator)
     retry_service = BatchRetryService(store=store, resolver=resolver, history_store=history_store)
     resume_service = BatchResumeService(store=store, resolver=resolver)
+    if task_service is not None:
+        task_service.configure_batch_runtime(
+            task_id=parent_id,
+            pipeline=pipeline,
+            retry_service=retry_service,
+            execution_coordinator=coordinator,
+        )
     operation = "batch_resume" if resume else "batch_retry"
     _report_progress(
         progress, operation, {"task_id": parent_id, "reason": f"{operation}_requested"}
@@ -282,6 +289,9 @@ def _run_batch_retry(
             )
         )
         return 1
+    finally:
+        if task_service is not None:
+            task_service.release_batch_runtime(parent_id, pipeline)
     if result.run.task_status is None:
         print(json.dumps({"error": "coordinated batch run did not commit a Task status"}))
         return 1
@@ -353,6 +363,7 @@ def _run_generic_download(
     cancellation: Event | None = None,
     progress: ProgressSink | None = None,
     download_limiter: GalleryDownloadLimiter | None = None,
+    task_service: TaskHierarchyService | None = None,
     task_id: str | None = None,
     interactive_renderer=None,
     on_accept: AcceptanceSink | None = None,
@@ -412,6 +423,7 @@ def _run_generic_download(
                 progress=progress,
                 download_limiter=download_limiter,
                 task_id=task_id,
+                task_service=task_service,
                 on_accept=on_accept,
             )
         if result.result_kind is not ResultKind.LIST_PAGE:
@@ -438,6 +450,7 @@ def _run_generic_download(
                 cancellation=cancellation,
                 progress=progress,
                 download_limiter=download_limiter,
+                task_service=task_service,
                 on_accept=on_accept,
             )
         if selection_policy is ListSelectionPolicy.EXPLICIT:
@@ -508,6 +521,7 @@ def _run_generic_download(
                 cancellation=cancellation,
                 progress=progress,
                 download_limiter=download_limiter,
+                task_service=task_service,
                 on_accept=None if provisional_parent_id is not None else on_accept,
                 provisional_parent_id=provisional_parent_id,
                 enumeration_service=enumeration_service,
@@ -546,6 +560,7 @@ def _run_generic_download(
                 cancellation=cancellation,
                 progress=progress,
                 download_limiter=download_limiter,
+                task_service=task_service,
                 on_accept=on_accept,
             )
         return 1
@@ -643,6 +658,7 @@ def _download_generic_gallery(
     download_limiter: GalleryDownloadLimiter | None = None,
     task_id: str | None = None,
     on_accept: AcceptanceSink | None = None,
+    task_service: TaskHierarchyService | None = None,
 ) -> int:
     data = result.data
     if not isinstance(data, GalleryData):
@@ -702,6 +718,8 @@ def _download_generic_gallery(
     if fetcher is None:
         print(serialize_operation_result(result, RenderMode.PLAIN))
         return 1
+    if task_service is not None:
+        task_service.register_standalone_runtime(task_id)
     try:
         completed = asyncio.run(
             DownloadService(
@@ -788,6 +806,9 @@ def _download_generic_gallery(
             error=error,
             metadata=operation_metadata,
         )
+    finally:
+        if task_service is not None:
+            task_service.release_standalone_runtime(task_id)
     if render_mode is RenderMode.INTERACTIVE and enumeration_progress:
         print()
     print(
@@ -840,6 +861,7 @@ def _run_confirmed_list_batch(
     cancellation: Event | None,
     progress: ProgressSink | None,
     download_limiter: GalleryDownloadLimiter | None = None,
+    task_service: TaskHierarchyService | None = None,
     on_accept: AcceptanceSink | None = None,
 ) -> int:
     data = result.data
@@ -864,6 +886,7 @@ def _run_confirmed_list_batch(
         cancellation=cancellation,
         progress=progress,
         download_limiter=download_limiter,
+        task_service=task_service,
         on_accept=on_accept,
     )
 
@@ -981,6 +1004,7 @@ def _run_selected_list_batch(
         return 130
     loaded_config = ConfigLoader(paths=environment.paths, registry=runtime.settings_registry).load()
     runtime.configure_plugins(loaded_config.values, loaded_config.secrets)
+    download_limiter = download_limiter or _build_download_limiter(runtime, loaded_config.values)
     fetchers = dict(runtime.asset_fetchers_by_site_id)
     override_instances = {}
     resolver = RuntimePackageResolver(
@@ -1015,6 +1039,7 @@ def _run_selected_list_batch(
     runner = CoordinatedBatchRunner(pipeline=pipeline, coordinator=coordinator)
     if task_service is not None:
         task_service.configure_batch_runtime(
+            task_id=parent_id,
             pipeline=pipeline,
             retry_service=BatchRetryService(
                 store=store,
@@ -1038,6 +1063,9 @@ def _run_selected_list_batch(
     except KeyboardInterrupt:
         print(json.dumps({"command": "download", "cancelled": True}))
         return 130
+    finally:
+        if task_service is not None:
+            task_service.release_batch_runtime(parent_id, pipeline)
 
     output_files = [
         asset.final_path

@@ -192,14 +192,15 @@ def _build_interactive_shell_impl(
 
     def load_task_service() -> TaskHierarchyService:
         nonlocal task_service
-        if task_service is None:
-            task_service = TaskHierarchyService(
-                task_store=task_store,
-                batch_store=batch_store,
-                history_store=history_store,
-                scheduler=shell_download_limiter,
-            )
-        return task_service
+        with execution_lock:
+            if task_service is None:
+                task_service = TaskHierarchyService(
+                    task_store=task_store,
+                    batch_store=batch_store,
+                    history_store=history_store,
+                    scheduler=shell_download_limiter,
+                )
+            return task_service
 
     def submit_selected_batch(items, source_url, title, cancellation, progress):
         return _run_selected_list_batch(
@@ -234,6 +235,7 @@ def _build_interactive_shell_impl(
                 progress,
                 shell_download_limiter,
                 on_accept,
+                task_service=load_task_service(),
             )
         finally:
             with execution_lock:
@@ -694,7 +696,7 @@ def _handle_owner_control(
     action = payload.get("action")
     if not isinstance(task_id, str) or not isinstance(action, str):
         raise ValueError("task control requires task_id and action")
-    node = task_service.get(task_id)
+    node = getattr(task_service, "get_root_summary", task_service.get)(task_id)
     task_kind = node.kind.value
     sequence = 1
     emit(
@@ -716,6 +718,10 @@ def _handle_owner_control(
         exit_code = 0
         if action in {"pause", "cancel"}:
             result = getattr(task_service, action)(task_id)
+        elif action == "resume" and getattr(task_service, "is_running", lambda _id: False)(task_id):
+            # Resume the existing worker and run generation. Starting recovery
+            # here would race the still-live paused pipeline for the same task.
+            result = task_service.resume(task_id)
         elif action in {"resume", "retry", "hard-retry"} and task_kind == TaskKind.BATCH.value:
             subcommand = "resume" if action == "resume" else "retry"
             with redirect_stdout(output):

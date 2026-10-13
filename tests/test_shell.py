@@ -1567,6 +1567,12 @@ class TextualShellAppTest(IsolatedAsyncioTestCase):
             self.assertIn("Downloader", detail)
             self.assertNotIn("Child", detail)
             self.assertNotIn("Asset", detail)
+            # A queued highlight from the now-hidden Items table must not
+            # overwrite the selected file's actions after navigation.
+            app.on_data_table_row_highlighted(
+                DataTable.RowHighlighted(task_table, 1, tuple(task_table.rows)[1])
+            )
+            self.assertEqual(app._task_file_path, "downloads/image-02.part")
             self.assertFalse(source_button.disabled)
             self.assertFalse(folder_button.disabled)
             self.assertEqual(source_button.label, "Open File")

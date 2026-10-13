@@ -285,7 +285,9 @@ def default_schema() -> ConfigSchema:
             ConfigField(
                 key="download.max_concurrent_galleries",
                 default=2,
-                description="Maximum number of galleries downloaded at the same time.",
+                description="Legacy alias for scheduler.max_concurrent_downloads.",
+                visible=False,
+                editable=False,
                 type="integer",
                 validator=lambda value: (
                     isinstance(value, int) and not isinstance(value, bool) and value > 0
@@ -309,7 +311,7 @@ def default_schema() -> ConfigSchema:
             ConfigField(
                 key="scheduler.max_concurrent_downloads_per_site",
                 default=2,
-                description="Fallback maximum active Item downloads for one site.",
+                description="Maximum active Items from one site within the global download limit.",
                 type="integer",
                 validator=_positive_int,
             ),

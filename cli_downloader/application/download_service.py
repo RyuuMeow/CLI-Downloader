@@ -28,7 +28,11 @@ from cli_downloader.core.models import (
 from cli_downloader.core.output import output_folder_fields
 from cli_downloader.core.task_tree import TaskKind
 from cli_downloader.core.pipeline import PipelineContext, PipelineRunner
-from cli_downloader.application.download_limiter import GalleryDownloadLimiter
+from cli_downloader.application.download_limiter import (
+    GalleryDownloadLimiter,
+    suspend_current_request,
+    resume_current_request,
+)
 from cli_downloader.integrations.torrent import (
     TorrentAsset,
     TorrentClient,
@@ -598,6 +602,11 @@ class WriteAssetsStage:
             record = self._task_store.get(context.task_id)
             if record is not None and record.status is TaskStatus.PAUSED:
                 self._download_limiter.suspend_root_sync(context.task_id)
+            if record is not None and (
+                record.status is TaskStatus.PAUSED
+                or record.desired_control is TaskDesiredControl.PAUSE
+            ):
+                await self._wait_until_runnable(context.task_id, lease_controller=controller)
             await controller.acquire()
         try:
             return await self._run(context, lease_controller=controller)
@@ -1136,13 +1145,22 @@ class WriteAssetsStage:
                     await lease_controller.release()
                     self._download_limiter.cancel_root_sync(task_id)
                 raise asyncio.CancelledError
-            if record.status is TaskStatus.PAUSED:
+            if (
+                record.status is TaskStatus.PAUSED
+                or record.desired_control is TaskDesiredControl.PAUSE
+            ):
                 if not suspended:
+                    suspend_current_request()
                     if self._download_limiter is not None:
                         self._download_limiter.suspend_root_sync(task_id)
                     if lease_controller is not None:
                         await lease_controller.release()
                     suspended = True
+                if record.status is not TaskStatus.PAUSED:
+                    self._task_store.compare_and_swap(
+                        record.transition(status=TaskStatus.PAUSED),
+                        expected_revision=record.revision,
+                    )
                 await asyncio.sleep(0.05)
                 continue
             if suspended:
@@ -1150,6 +1168,7 @@ class WriteAssetsStage:
                     self._download_limiter.resume_root_sync(task_id)
                 if lease_controller is not None:
                     await lease_controller.acquire()
+                await resume_current_request()
                 suspended = False
             if record.status is TaskStatus.PLANNED:
                 self._task_store.upsert(record.transition(status=TaskStatus.RUNNING))
@@ -1200,10 +1219,20 @@ class WriteAssetsStage:
 
     def _torrent_pause_requested(self, task_id: str) -> bool:
         record = self._task_store.get(task_id)
-        return record is not None and record.status is TaskStatus.PAUSED
+        return record is not None and (
+            record.status is TaskStatus.PAUSED or record.desired_control is TaskDesiredControl.PAUSE
+        )
 
     async def _wait_for_torrent_resume(self, task_id: str) -> None:
+        # The torrent integration invokes this only after its pause RPC succeeds.
         while self._torrent_pause_requested(task_id):
+            record = self._task_store.get(task_id)
+            if record is not None and record.status is not TaskStatus.PAUSED:
+                self._task_store.compare_and_swap(
+                    record.transition(status=TaskStatus.PAUSED), expected_revision=record.revision
+                )
+            if self._shutdown_requested():
+                raise OwnerShutdownRequested
             await asyncio.sleep(0.05)
 
 

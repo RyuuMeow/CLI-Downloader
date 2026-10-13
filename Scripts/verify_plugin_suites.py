@@ -16,7 +16,9 @@ CORE_TEST_ROOT = ROOT / "tests"
 # These suites exercise process-global Windows resources (MSYS git and a local
 # HTTP server).  Running them in a fresh interpreter prevents unrelated Textual
 # and asyncio cleanup from making the deterministic Core gate flaky.
-ISOLATED_CORE_MODULES = frozenset({"test_plugin_manager", "test_shell", "test_torrent"})
+ISOLATED_CORE_MODULES = frozenset(
+    {"test_plugin_manager", "test_shell", "test_shell_task_paging", "test_torrent"}
+)
 
 
 def _load_file_suite(path: Path, loader: unittest.TestLoader) -> unittest.TestSuite:

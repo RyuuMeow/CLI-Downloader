@@ -80,7 +80,9 @@ def shell_owner_process(directory: str, ready, stop, executed) -> None:
             stop.wait(30)
             return 0
 
-    def background_runner(_argv, _cancellation, _progress, _limiter, on_accept=None):
+    def background_runner(
+        _argv, _cancellation, _progress, _limiter, on_accept=None, task_service=None
+    ):
         executed.set()
         if on_accept is not None:
             on_accept("process-task", "item")

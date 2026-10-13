@@ -1003,6 +1003,7 @@ def main(
     cancellation: Event | None = None,
     progress: ProgressSink | None = None,
     download_limiter: GalleryDownloadLimiter | None = None,
+    task_service: TaskHierarchyService | None = None,
     _owner_claimed: bool = False,
     on_accept: AcceptanceSink | None = None,
 ) -> int:
@@ -1068,13 +1069,14 @@ def main(
                 runtime=shell_runtime,
                 _owner_claimed=True,
             ),
-            background_runner=lambda shell_argv, cancellation, progress, download_limiter, on_accept=None: (
+            background_runner=lambda shell_argv, cancellation, progress, download_limiter, on_accept=None, task_service=None: (
                 main(
                     shell_argv,
                     runtime=shell_runtime,
                     cancellation=cancellation,
                     progress=progress,
                     download_limiter=download_limiter,
+                    task_service=task_service,
                     _owner_claimed=True,
                     on_accept=on_accept,
                 )
@@ -1365,6 +1367,7 @@ def main(
                     cancellation=cancellation,
                     progress=progress,
                     download_limiter=download_limiter,
+                    task_service=task_service,
                     task_id=None,
                     interactive_renderer=render_interactive_result,
                     on_accept=on_accept,
@@ -1452,6 +1455,8 @@ def main(
                     return _run_batch_retry(
                         args.parent_id,
                         runtime=get_runtime(),
+                        download_limiter=download_limiter,
+                        task_service=task_service,
                         store=store,
                         layout=layout,
                         render_mode=render_mode,
@@ -1494,11 +1499,14 @@ def main(
                             cancellation=cancellation,
                             progress=progress,
                             download_limiter=download_limiter,
+                            task_service=task_service,
                             task_id=args.parent_id,
                         )
                     return _run_batch_retry(
                         args.parent_id,
                         runtime=get_runtime(),
+                        download_limiter=download_limiter,
+                        task_service=task_service,
                         store=store,
                         layout=layout,
                         render_mode=render_mode,
@@ -1525,7 +1533,7 @@ def main(
             if not _task_storage_exists():
                 print(current_translator()("cli.no_tasks"))
                 return 0
-        service = _build_task_hierarchy_service()
+        service = task_service or _build_task_hierarchy_service()
         task_id = getattr(args, "task_id", None)
         if (
             task_id
@@ -1632,6 +1640,17 @@ def main(
                     if args.tasks_command == "retry":
                         result = lifecycle.retry(task_id)
                     elif args.tasks_command == "resume":
+                        if service.is_running(task_id):
+                            result = service.resume(task_id)
+                            print(
+                                json.dumps(
+                                    result.to_dict()
+                                    if hasattr(result, "to_dict")
+                                    else {"task_id": task_id, "action": "resume"},
+                                    indent=2,
+                                )
+                            )
+                            return 0
                         result = lifecycle.resume(task_id)
                     else:
                         parser.print_help()
@@ -1648,7 +1667,10 @@ def main(
                             render_mode=RenderMode.JSON
                             if getattr(args, "json", False)
                             else RenderMode.PLAIN,
+                            cancellation=cancellation,
+                            progress=progress,
                             download_limiter=download_limiter,
+                            task_service=task_service,
                             task_id=task_id,
                         )
                 print(json.dumps(result.to_dict(), indent=2))

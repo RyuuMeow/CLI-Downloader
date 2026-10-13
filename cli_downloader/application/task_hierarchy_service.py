@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+from threading import RLock
 from time import monotonic, sleep
 from typing import Mapping
 
@@ -13,6 +14,7 @@ from cli_downloader.core.batch import (
     AssetStatus,
     BatchEntry,
     BatchEntryStatus,
+    BatchSummary,
     DownloadChildStatus,
 )
 from cli_downloader.core.errors import InvalidTaskTransitionError, TaskNotFoundError
@@ -25,6 +27,7 @@ from cli_downloader.core.task_tree import (
     TaskNode,
     TaskProgress,
     TaskRootSummary,
+    TaskRootPage,
     TaskState,
 )
 from cli_downloader.storage.state_batch_store import StateBatchStore
@@ -35,6 +38,9 @@ from cli_downloader.storage.task_store import (
     TaskStatus,
     TaskStore,
 )
+
+
+SchedulerProjection = dict[tuple[str, int | None], dict[str, object]]
 
 
 _STANDALONE_STATES = {
@@ -97,6 +103,13 @@ class TaskControlReceipt:
         }
 
 
+@dataclass(frozen=True)
+class _BatchRuntime:
+    pipeline: BatchPipeline
+    retry_service: BatchRetryService | None
+    coordinator: TaskExecutionCoordinator | None
+
+
 class TaskHierarchyService:
     def __init__(
         self,
@@ -114,8 +127,12 @@ class TaskHierarchyService:
         self._batch_pipeline = batch_pipeline
         self._batch_retry_service = batch_retry_service
         self._execution_coordinator = execution_coordinator
+        self._runtime_lock = RLock()
+        self._batch_runtimes: dict[str | BatchPipeline, _BatchRuntime] = {}
+        self._standalone_runtimes: set[str] = set()
         self._scheduler = scheduler
         self._byte_progress_by_asset: dict[str, tuple[int, int | None]] = {}
+        self._byte_progress_by_task: dict[str, dict[str, tuple[int, int | None]]] = {}
         self._standalone_lifecycle = TaskLifecycleService(
             task_store=task_store,
         )
@@ -124,16 +141,72 @@ class TaskHierarchyService:
         self,
         *,
         pipeline: BatchPipeline,
-        retry_service: BatchRetryService,
+        retry_service: BatchRetryService | None,
         execution_coordinator: TaskExecutionCoordinator | None = None,
+        task_id: str | None = None,
     ) -> None:
-        self._batch_pipeline = pipeline
-        self._batch_retry_service = retry_service
-        if execution_coordinator is not None:
-            self._execution_coordinator = execution_coordinator
+        with self._runtime_lock:
+            key = task_id if task_id is not None else pipeline
+            current = self._batch_runtimes.get(key)
+            if current is not None and current.pipeline is not pipeline:
+                raise InvalidTaskTransitionError(
+                    f"batch already has an execution runtime: {task_id}"
+                )
+            self._batch_runtimes[key] = _BatchRuntime(
+                pipeline, retry_service, execution_coordinator
+            )
+
+    def release_batch_runtime(self, task_id: str, pipeline: BatchPipeline) -> None:
+        """A finishing worker cannot unregister a newer execution of the same task."""
+        with self._runtime_lock:
+            for key in (task_id, pipeline):
+                current = self._batch_runtimes.get(key)
+                if current is not None and current.pipeline is pipeline:
+                    del self._batch_runtimes[key]
+
+    def _batch_runtime(self, task_id: str) -> _BatchRuntime | None:
+        with self._runtime_lock:
+            runtime = self._batch_runtimes.get(task_id)
+            candidates = tuple(self._batch_runtimes.values())
+        if runtime is not None:
+            return runtime
+        for candidate in candidates:
+            if candidate.pipeline.is_running(task_id):
+                return candidate
+        if self._batch_pipeline is not None:
+            return _BatchRuntime(
+                self._batch_pipeline, self._batch_retry_service, self._execution_coordinator
+            )
+        return None
+
+    def register_standalone_runtime(self, task_id: str) -> None:
+        with self._runtime_lock:
+            if task_id in self._standalone_runtimes:
+                raise InvalidTaskTransitionError(f"task already running: {task_id}")
+            self._standalone_runtimes.add(task_id)
+
+    def release_standalone_runtime(self, task_id: str) -> None:
+        with self._runtime_lock:
+            self._standalone_runtimes.discard(task_id)
+
+    def is_running(self, task_id: str) -> bool:
+        with self._runtime_lock:
+            if task_id in self._standalone_runtimes or task_id in self._batch_runtimes:
+                return True
+        return self.is_batch_running(task_id)
 
     def list_roots(self) -> tuple[TaskNode, ...]:
         return tuple(summary.to_task_node() for summary in self.list_root_summaries())
+
+    def get_root_summary(self, task_id: str) -> TaskNode:
+        """Read control identity and state without expanding a Batch graph."""
+        self._reject_batch_item_control(task_id)
+        record = self._task_store.get(task_id)
+        if record is None:
+            raise TaskNotFoundError(f"task not found: {task_id}")
+        if record.kind is TaskKind.BATCH:
+            return self._batch_root_summary(task_id, record=record).to_task_node()
+        return self._standalone_root_summary(record).to_task_node()
 
     def list_root_summaries(self) -> tuple[TaskRootSummary, ...]:
         """Build the root projection without materialising Batch children."""
@@ -142,15 +215,46 @@ class TaskHierarchyService:
         parent_ids = self._batch_store.list_parent_ids()
         item_ids = tuple(record.task_id for record in records if record.kind is TaskKind.ITEM)
         internal_entry_ids = self._batch_store.find_entry_ids(item_ids)
+        scheduler = self._scheduler_projection()
         standalone = tuple(
-            self._standalone_root_summary(record)
+            self._standalone_root_summary(record, scheduler=scheduler)
             for record in records
             if record.kind is TaskKind.ITEM
             and record.task_id not in internal_entry_ids
             and record.task_id not in parent_ids
         )
-        batches = tuple(self._batch_root_summary(parent_id) for parent_id in parent_ids)
+        batches = tuple(
+            self._batch_root_summary(parent_id, scheduler=scheduler) for parent_id in parent_ids
+        )
         return (*standalone, *batches)
+
+    def list_root_page(self, *, offset: int = 0, limit: int = 100) -> TaskRootPage:
+        """Newest roots first, with bounded row decoding and bulk aggregates."""
+        if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
+            raise ValueError("offset must be a non-negative integer")
+        if isinstance(limit, bool) or not isinstance(limit, int) or limit <= 0:
+            raise ValueError("limit must be a positive integer")
+        limit = min(limit, 500)
+        if not _uses_shared_state_stores(self._task_store, self._batch_store):
+            items = tuple(reversed(self.list_root_summaries()))
+            return TaskRootPage(items[offset : offset + limit], len(items), offset, limit)
+        records, total = self._task_store.list_root_page(offset=offset, limit=limit)
+        summaries = self._batch_store.get_summaries(
+            tuple(record.task_id for record in records if record.kind is TaskKind.BATCH)
+        )
+        scheduler = self._scheduler_projection()
+        items = tuple(
+            self._batch_root_summary(
+                record.task_id,
+                record=record,
+                summary=summaries[record.task_id],
+                scheduler=scheduler,
+            )
+            if record.kind is TaskKind.BATCH
+            else self._standalone_root_summary(record, scheduler=scheduler)
+            for record in records
+        )
+        return TaskRootPage(items, total, offset, limit)
 
     def list_children(self, parent_id: str) -> tuple[TaskNode, ...]:
         if parent_id not in self._batch_store.list_parent_ids():
@@ -172,8 +276,9 @@ class TaskHierarchyService:
             offset=offset,
             limit=limit,
         )
+        scheduler = self._scheduler_projection()
         items = tuple(
-            self._with_child_scheduler_detail(summary, sequence=offset + index)
+            self._with_child_scheduler_detail(summary, sequence=offset + index, scheduler=scheduler)
             for index, summary in enumerate(page.items)
         )
         return BatchChildPage(
@@ -308,8 +413,22 @@ class TaskHierarchyService:
             return self._batch_control("pause", task_id)
         record = self._task_store.get(task_id)
         if record is not None and record.kind is TaskKind.ITEM:
-            result = self._standalone_lifecycle.pause(task_id)
             self._scheduler_root_control("suspend", task_id)
+            waiting = getattr(self._scheduler, "waiting_snapshot_sync", lambda: ())()
+            queued = any(row.get("root_id") == task_id for row in waiting)
+            try:
+                result = self._standalone_lifecycle.pause(
+                    task_id, request_only=self.is_running(task_id) and not queued
+                )
+            except InvalidTaskTransitionError:
+                current = self._task_store.get(task_id)
+                if (
+                    current is None
+                    or current.status in _TERMINAL_TASK_STATUSES
+                    or current.desired_control is not TaskDesiredControl.PAUSE
+                ):
+                    self._scheduler_root_control("resume", task_id)
+                raise
             return result
         raise TaskNotFoundError(f"task not found: {task_id}")
 
@@ -376,11 +495,12 @@ class TaskHierarchyService:
     async def retry(self, task_id: str) -> object:
         self._reject_batch_item_control(task_id)
         if task_id in self._batch_store.list_parent_ids():
-            if self._batch_pipeline is None or self._batch_retry_service is None:
+            runtime = self._batch_runtime(task_id)
+            if runtime is None or runtime.retry_service is None:
                 raise InvalidTaskTransitionError("batch retry is unavailable")
-            return await self._batch_retry_service.retry_parent(
+            return await runtime.retry_service.retry_parent(
                 task_id,
-                pipeline=self._batch_pipeline,
+                pipeline=runtime.pipeline,
             )
         record = self._task_store.get(task_id)
         if record is not None and record.kind is TaskKind.ITEM:
@@ -389,24 +509,24 @@ class TaskHierarchyService:
 
     def is_batch_running(self, task_id: str) -> bool:
         """Whether this service currently owns the Batch's active Pipeline run."""
-        return self._batch_pipeline is not None and self._batch_pipeline.is_running(task_id)
+        runtime = self._batch_runtime(task_id)
+        return runtime is not None and runtime.pipeline.is_running(task_id)
 
     def _batch_control(self, action: str, task_id: str) -> bool:
         if task_id not in self._batch_store.list_parent_ids():
             raise TaskNotFoundError(f"batch not found: {task_id}")
 
-        if (
-            self._execution_coordinator is not None
-            and self._batch_pipeline is not None
-            and self._batch_pipeline.is_running(task_id)
-        ):
+        runtime = self._batch_runtime(task_id)
+        pipeline = runtime.pipeline if runtime is not None else None
+        coordinator = runtime.coordinator if runtime is not None else None
+        if coordinator is not None and pipeline is not None and pipeline.is_running(task_id):
             desired_control = {
                 "pause": TaskDesiredControl.PAUSE,
                 "resume": TaskDesiredControl.RUN,
                 "cancel": TaskDesiredControl.CANCEL,
             }[action]
             try:
-                self._execution_coordinator.request_control_sync(desired_control, task_id)
+                coordinator.request_control_sync(desired_control, task_id)
             except InvalidTaskTransitionError:
                 # The pipeline may finish between is_running() and the
                 # coordinator CAS. A late UI click must not turn a completed
@@ -415,7 +535,7 @@ class TaskHierarchyService:
                 if record is not None and record.status in _TERMINAL_TASK_STATUSES:
                     return record
                 raise
-            if getattr(self._batch_pipeline, action)(task_id):
+            if getattr(pipeline, action)(task_id):
                 return True
             record = self._task_store.get(task_id)
             if record is not None and record.status in _TERMINAL_TASK_STATUSES:
@@ -424,6 +544,8 @@ class TaskHierarchyService:
 
         # Always update Task DB (authoritative pause/resume/cancel source).
         record = self._task_store.get(task_id)
+        if record is not None and record.active_run_id is not None:
+            raise InvalidTaskTransitionError("active batch controls require its execution owner")
         if action == "pause":
             if record is not None:
                 self._task_store.upsert(
@@ -459,7 +581,7 @@ class TaskHierarchyService:
                 )
             )
 
-        if self._batch_pipeline is not None and getattr(self._batch_pipeline, action)(task_id):
+        if pipeline is not None and getattr(pipeline, action)(task_id):
             return True
 
         # Inactive parents preserve the execution graph. Only a worker may
@@ -477,9 +599,16 @@ class TaskHierarchyService:
         if callable(method):
             method(task_id)
 
-    def _batch_root_summary(self, parent_id: str) -> TaskRootSummary:
-        summary = self._batch_store.get_summary(parent_id)
-        record = self._task_store.get(parent_id)
+    def _batch_root_summary(
+        self,
+        parent_id: str,
+        *,
+        record: TaskRecord | None = None,
+        summary: BatchSummary | None = None,
+        scheduler: SchedulerProjection | None = None,
+    ) -> TaskRootSummary:
+        summary = summary if summary is not None else self._batch_store.get_summary(parent_id)
+        record = record if record is not None else self._task_store.get(parent_id)
         if record is None or record.kind is not TaskKind.BATCH:
             raise TaskNotFoundError(f"batch task record not found: {parent_id}")
         return TaskRootSummary(
@@ -502,18 +631,21 @@ class TaskHierarchyService:
                 "counts": summary.counts.to_dict(),
                 "created_at": record.created_at.astimezone().isoformat(),
                 "revision": record.revision,
-                **self._scheduler_detail(parent_id),
+                **self._scheduler_detail(parent_id, projection=scheduler),
             },
         )
 
-    def _standalone_root_summary(self, record: TaskRecord) -> TaskRootSummary:
-        node = self._standalone_node(record)
+    def _standalone_root_summary(
+        self, record: TaskRecord, *, scheduler: SchedulerProjection | None = None
+    ) -> TaskRootSummary:
+        node = self._standalone_node(record, scheduler=scheduler)
         compact_details: dict[str, object] = {
             "created_at": record.created_at.astimezone().isoformat(),
             "revision": record.revision,
         }
         for key in (
             "failure",
+            "scheduler_active",
             "scheduler_waiting_reason",
             "scheduler_queue_position",
             "scheduler_site_id",
@@ -597,9 +729,12 @@ class TaskHierarchyService:
         summary: BatchChildSummary,
         *,
         sequence: int,
+        scheduler: SchedulerProjection | None = None,
     ) -> BatchChildSummary:
         details = dict(summary.details)
-        details.update(self._scheduler_detail(summary.parent_id, sequence=sequence))
+        details.update(
+            self._scheduler_detail(summary.parent_id, sequence=sequence, projection=scheduler)
+        )
         return BatchChildSummary(
             task_id=summary.task_id,
             parent_id=summary.parent_id,
@@ -727,7 +862,9 @@ class TaskHierarchyService:
             raise TaskNotFoundError(f"batch task record not found: {task_id}")
         return _task_state_for_record(record)
 
-    def _standalone_node(self, record: TaskRecord) -> TaskNode:
+    def _standalone_node(
+        self, record: TaskRecord, *, scheduler: SchedulerProjection | None = None
+    ) -> TaskNode:
         output_files = tuple(
             value for value in record.metadata.get("output_files", ()) if isinstance(value, str)
         )
@@ -744,7 +881,8 @@ class TaskHierarchyService:
         completed_b = 0
         has_total = True
         has_any = False
-        prefix = f"{record.task_id}:"
+        with self._runtime_lock:
+            live_progress = dict(self._byte_progress_by_task.get(record.task_id, {}))
         checkpoints = record.metadata.get("torrent_checkpoints", {})
         if isinstance(checkpoints, Mapping):
             for checkpoint in checkpoints.values():
@@ -754,8 +892,8 @@ class TaskHierarchyService:
                 live_key = (
                     f"{record.task_id}:torrent:{client_id}" if isinstance(client_id, str) else None
                 )
-                if live_key is not None and live_key in self._byte_progress_by_asset:
-                    c, t = self._byte_progress_by_asset[live_key]
+                if live_key is not None and live_key in live_progress:
+                    c, t = live_progress[live_key]
                     has_any = True
                     completed_b += c
                     if t is not None:
@@ -771,8 +909,8 @@ class TaskHierarchyService:
                     else:
                         has_total = False
 
-        for key, (c, t) in self._byte_progress_by_asset.items():
-            if key.startswith(prefix) and ":torrent:" not in key:
+        for key, (c, t) in live_progress.items():
+            if ":torrent:" not in key:
                 has_any = True
                 completed_b += c
                 if t is not None:
@@ -797,7 +935,7 @@ class TaskHierarchyService:
             details={
                 **record.metadata,
                 "created_at": record.created_at.astimezone().isoformat(),
-                **self._scheduler_detail(record.task_id),
+                **self._scheduler_detail(record.task_id, projection=scheduler),
             },
         )
 
@@ -811,42 +949,40 @@ class TaskHierarchyService:
                 return sequence
         return 0
 
-    def _scheduler_detail(self, root_id: str, *, sequence: int | None = None) -> dict[str, object]:
-        waiting_method = getattr(self._scheduler, "waiting_snapshot_sync", None)
-        active_method = getattr(self._scheduler, "active_snapshot_sync", None)
-        if not callable(waiting_method) and not callable(active_method):
-            return {}
-        if callable(active_method):
+    def _scheduler_projection(self) -> SchedulerProjection:
+        projection = {}
+        # Active rows win over queued siblings for a Batch root.
+        for active, name in ((True, "active_snapshot_sync"), (False, "waiting_snapshot_sync")):
+            method = getattr(self._scheduler, name, None)
+            if not callable(method):
+                continue
             try:
-                active_rows = active_method()
+                rows = method()
             except Exception:
-                active_rows = ()
-            for row in active_rows:
-                if not isinstance(row, Mapping) or row.get("root_id") != root_id:
+                continue
+            for row in rows:
+                if not isinstance(row, Mapping) or not isinstance(row.get("root_id"), str):
                     continue
-                if sequence is not None and row.get("sequence") != sequence:
-                    continue
-                return {
-                    "scheduler_active": True,
-                    "scheduler_site_id": row.get("site_id"),
-                }
-        if callable(waiting_method):
-            try:
-                waiting_rows = waiting_method()
-            except Exception:
-                waiting_rows = ()
-            for row in waiting_rows:
-                if not isinstance(row, Mapping) or row.get("root_id") != root_id:
-                    continue
-                if sequence is not None and row.get("sequence") != sequence:
-                    continue
-                return {
-                    "scheduler_active": False,
-                    "scheduler_waiting_reason": row.get("reason"),
-                    "scheduler_queue_position": row.get("position"),
-                    "scheduler_site_id": row.get("site_id"),
-                }
-        return {}
+                details = {"scheduler_active": active, "scheduler_site_id": row.get("site_id")}
+                if not active:
+                    details.update(
+                        scheduler_waiting_reason=row.get("reason"),
+                        scheduler_queue_position=row.get("position"),
+                    )
+                projection.setdefault((row["root_id"], None), details)
+                projection.setdefault((row["root_id"], row.get("sequence")), details)
+        return projection
+
+    def _scheduler_detail(
+        self,
+        root_id: str,
+        *,
+        sequence: int | None = None,
+        projection: SchedulerProjection | None = None,
+    ) -> dict[str, object]:
+        if projection is None:
+            projection = self._scheduler_projection()
+        return projection.get((root_id, sequence), {})
 
     def _task_created_at(self, task_id: str) -> str | None:
         record = self._task_store.get(task_id)
@@ -863,10 +999,13 @@ class TaskHierarchyService:
             total_bytes = payload.get("total_bytes")
             if isinstance(asset_id, str):
                 completed, total = normalise_byte_progress(bytes_received, total_bytes)
-                self._byte_progress_by_asset[asset_id] = (
-                    completed,
-                    total,
-                )
+                with self._runtime_lock:
+                    self._byte_progress_by_asset[asset_id] = (completed, total)
+                    task_id = asset_id.split(":", 1)[0]
+                    self._byte_progress_by_task.setdefault(task_id, {})[asset_id] = (
+                        completed,
+                        total,
+                    )
 
 
 def _uses_shared_state_stores(task_store: object, batch_store: object) -> bool:

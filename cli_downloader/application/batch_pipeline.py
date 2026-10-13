@@ -9,7 +9,11 @@ from types import MappingProxyType
 from typing import Protocol
 from uuid import uuid4
 
-from cli_downloader.application.download_limiter import GalleryDownloadLimiter
+from cli_downloader.application.download_limiter import (
+    GalleryDownloadLimiter,
+    suspend_current_request,
+    resume_current_request,
+)
 from cli_downloader.application.execution_control import OwnerShutdownRequested
 from cli_downloader.core.batch import (
     AssetRecord,
@@ -183,6 +187,7 @@ class _TaskControl:
         if not paused_targets or self.is_set():
             return
 
+        suspend_current_request()
         if self.pause_boundary is not None:
             await self.pause_boundary()
         for target_id in paused_targets:
@@ -196,8 +201,10 @@ class _TaskControl:
                 break
             if self.is_shutdown_requested():
                 raise OwnerShutdownRequested
-        if not self.is_set() and self.resume_boundary is not None:
-            await self.resume_boundary()
+        if not self.is_set():
+            if self.resume_boundary is not None:
+                await self.resume_boundary()
+            await resume_current_request()
 
     async def release_admission(self) -> None:
         if self.admission_release is not None:
@@ -408,7 +415,9 @@ class BatchPipeline:
         self._store = store
         self._resolver = resolver
         self._downloader = downloader
-        self._config = config or BatchQueueConfig()
+        self._config = config or BatchQueueConfig(
+            download_workers=download_limiter.max_concurrent_downloads if download_limiter else 2
+        )
         self._history_store = history_store
         self._completion_store = completion_store
         self._event_sink = event_sink
@@ -1021,12 +1030,18 @@ class BatchPipeline:
                     return
                 raise
             controllers.append(lease_controller)
+        # With a central scheduler, only its Item lease controls global/site
+        # admission. Local workers and bounded queues provide backpressure.
         site_slots = self._site_download_slots.get(child.package.site_id)
         slot_controller = _SemaphoreLeaseController(
             *(
-                (site_slots, self._download_slots)
-                if site_slots is not None
-                else (self._download_slots,)
+                ()
+                if self._download_limiter is not None
+                else (
+                    (site_slots, self._download_slots)
+                    if site_slots is not None
+                    else (self._download_slots,)
+                )
             )
         )
         try:

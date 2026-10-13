@@ -489,11 +489,13 @@ class StateDatabase:
         )
 
     @contextmanager
-    def transaction(self) -> Iterator[sqlite3.Connection]:
+    def transaction(self, *, read_only: bool = False) -> Iterator[sqlite3.Connection]:
         """Run one all-or-nothing state transition on a dedicated connection."""
         connection = self._connect()
         try:
-            connection.execute("BEGIN IMMEDIATE")
+            if read_only:
+                connection.execute("PRAGMA query_only = ON")
+            connection.execute("BEGIN" if read_only else "BEGIN IMMEDIATE")
             yield connection
             connection.commit()
         except BaseException:
@@ -614,6 +616,32 @@ class TaskRepository(_StateRepository):
     def list(self) -> tuple[TaskRecord, ...]:
         rows = self.connection.execute("SELECT * FROM tasks ORDER BY rowid").fetchall()
         return tuple(_task_from_row(row) for row in rows)
+
+    def list_root_page(self, *, offset: int, limit: int) -> tuple[tuple[TaskRecord, ...], int]:
+        predicate = """NOT EXISTS (
+            SELECT 1 FROM execution_entries e WHERE e.entry_id = tasks.task_id
+        ) AND (kind = 'item' OR EXISTS (
+            SELECT 1 FROM execution_batches b WHERE b.task_id = tasks.task_id
+        ))"""
+        total = self.connection.execute(f"SELECT COUNT(*) FROM tasks WHERE {predicate}").fetchone()[
+            0
+        ]
+        rows = self.connection.execute(
+            f"""SELECT task_id, status, kind, desired_control, revision,
+                active_run_id, run_generation, created_at, updated_at, site_id,
+                source_url, title,
+                json_object(
+                    'total_files', json_extract(metadata_json, '$.total_files'),
+                    'asset_count', json_extract(metadata_json, '$.asset_count'),
+                    'completed_files', COALESCE(json_extract(metadata_json, '$.completed_files'),
+                        json_array_length(metadata_json, '$.output_files'), 0),
+                    'failure', json_extract(metadata_json, '$.failure'),
+                    'torrent_checkpoints', json_extract(metadata_json, '$.torrent_checkpoints')
+                )
+                FROM tasks WHERE {predicate} ORDER BY rowid DESC LIMIT ? OFFSET ?""",
+            (limit, offset),
+        ).fetchall()
+        return tuple(_task_from_row(row) for row in rows), int(total)
 
     def delete(self, task_id: str) -> None:
         cursor = self.connection.execute("DELETE FROM tasks WHERE task_id = ?", (task_id,))
@@ -1198,8 +1226,9 @@ def _history_event_from_row(row: tuple[object, ...]) -> HistoryEventRecord:
 class StateUnitOfWork:
     """Expose the four logical repositories within one SQLite transaction."""
 
-    def __init__(self, database: StateDatabase) -> None:
+    def __init__(self, database: StateDatabase, *, read_only: bool = False) -> None:
         self._database = database
+        self._read_only = read_only
         self._transaction: AbstractContextManager[sqlite3.Connection] | None = None
         self._connection_value: sqlite3.Connection | None = None
         self.tasks = TaskRepository(self)
@@ -1217,7 +1246,7 @@ class StateUnitOfWork:
     def __enter__(self) -> StateUnitOfWork:
         if self._transaction is not None:
             raise StateUnitOfWorkError("state unit of work is already active")
-        transaction = self._database.transaction()
+        transaction = self._database.transaction(read_only=self._read_only)
         self._transaction = transaction
         try:
             self._connection_value = transaction.__enter__()

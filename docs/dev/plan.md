@@ -1,16 +1,22 @@
 # Development Plan
 
-Updated: 2026-07-16
+Updated: 2026-10-13
 
 This document contains only current architectural boundaries and unfinished roadmap items.
-Completed implementation records belong in `CHANGELOG.md` and Git history. The application has
-not been released, so compatibility with removed legacy databases, imports, layouts, commands,
-and CLI argument forms remains out of scope.
+Completed implementation records belong in `CHANGELOG.md` and Git history. The current
+released baseline is v0.1.3; this branch includes those master fixes alongside the scheduler
+ownership refactor. Existing concurrency settings migrate to the canonical scheduler key.
 
 ## Active Order
 
-No active P5 tasks. P5-18 through P5-24 are complete; their implementation history is kept in
-`CHANGELOG.md` and Git history.
+Queue/state/performance integration is complete on `fix/queue-state-performance`:
+master release fixes are merged, per-task runtime routing and shared scheduling are in place,
+and Tasks roots/children use bounded read projections. Regression coverage includes cross-loop
+admission, older-Batch controls, request-permit release, root paging, refresh coalescing,
+and delayed table events. `Scripts/Verify.ps1 -NoVenvSetup` passed (Core/isolated tests,
+Ruff, compilation, diff checks and wheel build); the supplemental terminal-pause regression
+also passed with the queue, hierarchy and lifecycle suites.
+P5-18 through P5-24 are complete; the next planned feature remains P6-01 below.
 
 ## Direction And Boundaries
 

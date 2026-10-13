@@ -2,6 +2,16 @@
 
 All notable changes to CLI-Downloader will be documented in this file.
 
+## Unreleased
+
+### Fixed
+
+- Kept controls attached to each live Batch and reused active workers on resume, including commands received through owner IPC.
+- Shared Item admission across worker event loops, initial downloads and retries; removed the Batch two-worker ceiling and aligned round-robin queue display with scheduling preference.
+- Released Item and request permits at pause boundaries and prevented canceled request waiters from leaking capacity.
+- Paged Tasks roots as well as Batch children, aggregated root progress in bulk, and reused one scheduler snapshot per refresh. Slow refreshes no longer invalidate themselves; returning from details restores the page, and delayed events from hidden tables cannot overwrite file actions.
+- Migrated the legacy gallery concurrency setting when no scheduler limit was explicitly configured.
+
 ## v0.1.3 - 2026-08-14
 
 ### Fixed

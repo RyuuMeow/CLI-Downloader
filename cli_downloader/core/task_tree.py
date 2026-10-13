@@ -135,6 +135,14 @@ class TaskRootSummary:
 
 
 @dataclass(frozen=True)
+class TaskRootPage:
+    items: tuple[TaskRootSummary, ...]
+    total_count: int
+    offset: int
+    limit: int
+
+
+@dataclass(frozen=True)
 class BatchChildSummary:
     """One bounded-page Batch child row without its execution graph."""
 
