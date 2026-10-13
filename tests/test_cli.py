@@ -27,6 +27,13 @@ def _main(argv, **kwargs):
 
 
 class CLITest(TestCase):
+    def setUp(self) -> None:
+        directory = TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        environment = patch.dict("os.environ", {"CLI_DOWNLOADER_DATA_ROOT": directory.name})
+        environment.start()
+        self.addCleanup(environment.stop)
+
     def test_human_cli_errors_follow_the_selected_locale(self) -> None:
         stream = StringIO()
         with translation_context(TranslationService("zh-TW")):

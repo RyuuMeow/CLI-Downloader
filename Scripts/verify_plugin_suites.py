@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import importlib.util
+import os
 from pathlib import Path
 import subprocess
 import sys
 import unittest
+from tempfile import TemporaryDirectory
+from unittest.mock import patch
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -72,6 +75,21 @@ def _run_isolated_module(path: Path) -> bool:
 
 
 def main(argv: list[str] | None = None) -> int:
+    # Legacy tests can invoke CLI defaults. Never let them migrate the user's
+    # state database, contact a live Shell owner, or activate installed plugins.
+    with TemporaryDirectory(prefix="clid-verify-") as directory:
+        with patch.dict(
+            os.environ,
+            {
+                "CLI_DOWNLOADER_DATA_ROOT": str(Path(directory) / "data"),
+                "CLI_DOWNLOADER_PORTABLE_ROOT": "",
+                "LOCALAPPDATA": str(Path(directory) / "local"),
+            },
+        ):
+            return _verify()
+
+
+def _verify() -> int:
     loader = unittest.TestLoader()
     success = True
     for module_name in sorted(ISOLATED_CORE_MODULES):
