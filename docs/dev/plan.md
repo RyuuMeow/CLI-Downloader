@@ -16,7 +16,8 @@ admission, older-Batch controls, request-permit release, root paging, refresh co
 and delayed table events. `Scripts/Verify.ps1 -NoVenvSetup` passed (Core/isolated tests,
 Ruff, compilation, diff checks and wheel build); the supplemental terminal-pause regression
 also passed with the queue, hierarchy and lifecycle suites.
-P5-18 through P5-24 are complete; the next planned feature remains P6-01 below.
+P5-18 through P5-24 are complete. P5-25 below is a proposed design for unified site
+request control; implementation has not started. P6-01 remains deferred.
 
 ## Direction And Boundaries
 
@@ -380,6 +381,182 @@ bounded WAIT disconnect, DETACH acceptance, request replay, and a second restart
   event, or Completion identity.
 - The focused lifecycle suites and full verification gate pass without timing sleeps or live
   network dependencies.
+
+## P5-25 Unify Site Request Control Across Preparation And Downloads
+
+### Status And Scope
+
+Proposed design, requested 2026-10-13. Source audit only; no runtime changes or live-site
+validation. The existing d51ece4 Windows packages do not contain this proposal.
+
+Success means that, for a migrated plugin within one OwnerScope, every site HTTP attempt
+from listing, pagination, preparation, downloads, redirects and retries obeys one shared
+concurrency limit, request-start interval and cooldown. Download Item limits remain separate.
+Browser authentication traffic, other applications, other data-root owners and torrent peer
+transfers are outside this guarantee. No numeric configuration guarantees that a site will
+never throttle: its quota may also cover other clients sharing the account or IP address.
+
+### Evidence From The Current Implementation
+
+| Path | Current control | Gap |
+| --- | --- | --- |
+| Batch preparation | `RuntimePackageResolver.resolve()` wraps `instance.resolve()` in the shared limiter | One operation can issue several HTTP requests; `choose_strategy()` runs outside the wrapper and can call plugin code that performs more I/O |
+| Standalone preparation | `DownloadService._build_planned_record()` directly calls the adapter | Resolve and strategy I/O are outside the shared gate |
+| Listing and pagination | `OperationDispatcher` directly invokes `execute()` | No injected shared request gate; external `operation` commands also lack an Owner command route |
+| Asset download | Batch and standalone executors wrap fetch or fetch-and-write | Custom fetchers, redirects and internal retries are not counted individually; file writing can retain a request permit unnecessarily |
+| Streaming pause | `_current_request` releases its logical permit while the consumer waits | `UrlAssetFetcher.fetch_stream()` can retain an open response until iteration ends; logical release does not prove transport closure |
+| Plugin HTTP | Local Pinterest plugin uses `build_opener().open()` in an executor | Core cannot count arbitrary plugin network calls without plugin migration |
+
+Audit references: `application/download_limiter.py`, `application/batch_service.py`,
+`application/download_service.py`, `application/operation_dispatcher.py`, `core/fetch.py`,
+`plugins/runtime.py`, `cli/app.py`, and `core/owner_protocol.py` under `cli_downloader/`.
+
+### User Settings And Counting Rules
+
+Keep the existing keys and saved values. Do not silently redefine a download slot as a
+combined Prepare + Download slot, or add a Batch-count limit for rate-limit protection.
+
+| Setting | Intended meaning |
+| --- | --- |
+| `scheduler.max_concurrent_downloads` | Active download Items across all sites; Batch parents do not count |
+| `scheduler.max_concurrent_downloads_per_site` | Active download Items from one site |
+| `network.max_concurrent_requests` | Default site-wide maximum of in-flight HTTP attempts, including response-body reads |
+| `network.min_request_interval_seconds` | Default minimum interval between HTTP attempt starts across all phases; no accumulated burst credits |
+| `plugins.<id>.network.max_concurrency` / `min_interval_seconds` | Site-specific effective policy, overriding the corresponding fallback |
+| Existing attempts/backoff settings | Retry budget per HTTP request, not repeated execution of an entire plugin operation |
+
+Settings must show the effective site values and their source; changing a fallback must not
+appear to override an existing site policy. Preserve current defaults (2 requests, 0.5 seconds)
+as compatibility values, not a claim about a site's safe quota. Conflicting declarations for
+the same site resolve conservatively: minimum concurrency, maximum interval; report the conflict.
+Policy changes take effect at the next Owner restart in the first release and are labelled so.
+
+Example only: with a site cap of 2 and interval of 1 second, one download stream plus one
+preparation request fills the site capacity; another list/preparation/download request waits.
+A preparation operation needing five HTTP requests obtains admission five times. Pure parsing
+does not consume network capacity. The interval is between starts, not a delay after completion.
+Batch preparation workers and bounded queues remain internal backpressure, not site protection.
+
+### Proposed Components And Ownership
+
+- Extract a `SiteRequestCoordinator` from `GalleryDownloadLimiter`; keep the latter as a
+  compatibility facade for Item admission. One coordinator belongs to the live Owner and is
+  shared by all Batch, standalone and interactive operations, including retries.
+- Key request budgets by `(OwnerScope, site_id)`, shared across profiles. Requests to a site's
+  API and CDN retain the originating site budget, including redirects. Do not split quotas by
+  hostname or profile in the first release; add finer groups only with evidence of separate quotas.
+- Provide a typed `PluginHttpClient` with buffered `request()` and context-managed `stream()`.
+  Core owns admission, redirects, response lifetime, retry and normalized HTTP errors. Preserve
+  plugin headers, cookies, proxy/TLS settings, timeout and response decoding needs in the contract.
+- Add an optional, versioned `bind_services(PluginServices)` hook plus an explicit managed-HTTP
+  capability. Bind once when creating the runtime; pass immutable task/phase/auth context per
+  operation so concurrent profiles cannot overwrite shared plugin configuration. Client services
+  are runtime objects, never serialized into existing JSON operation requests.
+- Implement Core's default fetcher through the same client. Migrated custom fetchers must also
+  use it. A callback around arbitrary `resolve()` is not the managed-HTTP contract.
+- Route networked external plugin operations through a typed Owner operation command. Preserve
+  request IDs, confirmation requirements, wait/disconnect behavior and structured results.
+  A foreground process can execute only after acquiring ownership when no owner exists.
+  Keep local classification/help offline. Negotiate the new protocol capability; an incompatible
+  live owner must not cause a silent local network execution that bypasses its budget.
+
+### Admission, Fairness And Retry Rules
+
+- Under one coordinator lock, check capacity, monotonic next-start time and cooldown, then grant
+  the permit and reserve the next start atomically. Wait without holding capacity. Maintain
+  cancellable waiters associated with their owning event loop and wake them thread-safely.
+- Rotate eligible root/request IDs; preserve FIFO within each root. All phases share capacity,
+  with no permanent reservation that would deadlock a site cap of 1. Long streams retain their
+  permit, so fairness applies when a permit becomes available, not by interrupting healthy streams.
+- Count every redirect and retry as a new attempt. Close the previous response before re-entry;
+  disable hidden transport retries. Strip credentials on cross-origin redirects unless explicitly
+  authorized by the existing authentication policy. Do not invent a fresh quota for a redirect.
+- Normalize status and headers at the transport boundary. Existing stream wrappers can conceal
+  the HTTP status from `_retry_delay`; preserve structured causes through the writer/executor.
+- On 429, stop new requests for that site across every phase. Honor valid `Retry-After` seconds
+  or HTTP dates; otherwise use exponential backoff with jitter. Apply the same cooldown for 503
+  with Retry-After; keep other retryable statuses policy-driven. Cooldown is extended by the
+  maximum outstanding deadline, never shortened by another failure or success.
+- `max_backoff_seconds` caps locally generated delays, not a longer server-requested delay.
+  If a caller's wait deadline expires, report the pending retry and leave the site cooldown intact.
+  Close error responses and release permits before waiting. Do not automatically replay an
+  unsafe/non-idempotent operation; require explicit retry eligibility and replayable request bodies.
+- Persist only the site's cooldown deadline and minimal reason on cooldown changes, not on each
+  request. Restore it during Owner recovery; use monotonic timing while running. A restart must
+  not reset a known server cooldown or revive old leases. Reject malformed persisted timestamps.
+- Never acquire an Item slot while holding a request permit. At a safe checkpoint before a long
+  cooldown, return the Item slot and requeue with its not-before deadline; reacquire Item then
+  request admission. No SQLite transaction is held across network waits. Paused/canceled work
+  cannot reacquire either resource until eligible.
+
+### Streaming And Applied Pause
+
+A request permit represents a live HTTP attempt, not merely an executing Python coroutine.
+Keep it until EOF or confirmed response closure, including while the consumer applies backpressure.
+An idle reusable connection after response completion does not count as an in-flight request.
+
+On pause/cancel/shutdown, stop starting reads, close the response, settle outstanding blocking
+I/O, persist a valid partial-file checkpoint, then release request/Item permits and acknowledge
+the applied state. Canceling `to_thread`/executor awaits alone does not stop their I/O; retain
+accounting and show `Pausing` until closure is confirmed, with bounded transport timeouts and
+an observable failure path. Do not claim `Paused` or grant a replacement permit prematurely.
+
+Resume may restart the unfinished asset in the first release, preserving completed files.
+Range resume is optional later: validate validators, Content-Range and server response before
+appending; a full 200 response must never be appended to partial content. This avoids coupling
+the request-control fix to a new resumable-download feature.
+
+### Compatibility And User Feedback
+
+- Managed plugins bypass the old outer operation-level request wrapper, preventing nested
+  acquisition deadlock at concurrency 1. Internal fan-out receives distinct request permits;
+  ContextVar inheritance must not allow child tasks to reuse a parent's permit.
+- Keep old plugin APIs working through an explicitly labelled operation-level compatibility
+  mode. Route their resolve/strategy/list calls through coarse admission without double wrapping
+  nested calls. Do not automatically retry whole legacy operations that may have side effects.
+  Their internal request count, cancellation and retry timing remain unverified.
+- Display `request-level control` or `operation-level control` in plugin diagnostics. These are
+  capability claims backed by migration/conformance tests, not a sandbox guarantee: arbitrary
+  trusted Python plugins can still bypass the supplied client. Do not globally monkeypatch
+  urllib/requests/socket to create an unreliable appearance of enforcement.
+- Keep task lifecycle state separate from wait reasons: `download_slot`, `request_capacity`,
+  `request_interval`, and `site_cooldown`. Show phase and an expiry/countdown when known; do not
+  render an indefinite generic Queue or claim an exact queue position during a timed cooldown.
+- Expose compact site snapshots: in-flight/limit, waiting counts by phase, effective interval,
+  cooldown deadline and coverage mode. Never include cookies, tokens or signed request URLs.
+  Reuse one immutable snapshot per Tasks refresh to retain the current performance improvements.
+
+### Implementation Sequence And Acceptance Gates
+
+1. **Coordinator contract and deterministic tests.** Separate Item and request admission; add
+   normalized transport errors, fair cancelable waits, effective policy and persistent cooldown.
+   Prove shared caps/spacing across event loops and roots, cancellation at grant, no permit leak,
+   no burst after idle, and independent progress for another site during cooldown.
+2. **Managed transport and stream lifecycle.** Wire Core's fetcher, close-before-release pause,
+   explicit redirects and per-request retries. Test real close/read behavior with an offline
+   controlled transport or local test server, not only a mocked pause callback. Verify partial
+   files, failures, resume and shutdown while a read is blocked.
+3. **All entry points and plugin migration.** Inject services into Batch/standalone/dispatcher,
+   add Owner operation forwarding/capability negotiation, and migrate a representative external
+   plugin in its own repository. Inventory other installed plugins without changing their files.
+   Preserve legacy mode and publish the new client contract for plugin authors.
+4. **Settings, visibility and release validation.** Add effective policy/coverage and wait reasons
+   to Settings, Tasks and JSON diagnostics. Run full verification and packaged smoke tests;
+   perform a separately authorized, low-volume live check for each migrated target site before
+   claiming site-specific behavior. Produce new packages only after the integration gate passes.
+
+The decisive integration test starts Batch preparation, standalone preparation, list pagination
+and a download concurrently against one fake site: cap 2 is never exceeded and every attempt
+start is spaced correctly. A resolver issuing five requests produces five admissions; fan-out,
+redirects and retries cannot bypass them. A 429 in any phase delays all new same-site requests,
+including after Owner restart, while another site proceeds. Additional gates cover cap-1 nested
+calls, concurrent external CLIs, expired/canceled waiters, HTTP-date Retry-After, status preserved
+through streaming errors, old-owner incompatibility, profile credential isolation and unchanged
+bounded Tasks refresh behavior. Runtime implementation is not complete until all four stages pass.
+
+HTTP reference semantics: [RFC 6585 section 4 (429)](https://www.rfc-editor.org/rfc/rfc6585.html#section-4)
+and [RFC 9110 section 10.2.3 (Retry-After)](https://www.rfc-editor.org/rfc/rfc9110.html#name-retry-after).
+Site-wide sharing, compatibility policy and scheduling choices above are this project's design.
 
 ## Future Version Backlog
 
