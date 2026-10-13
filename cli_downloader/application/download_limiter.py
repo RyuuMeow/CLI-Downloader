@@ -1,92 +1,56 @@
 from __future__ import annotations
 
 import asyncio
-import random
 from collections.abc import Awaitable, Callable, Mapping
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
-from dataclasses import dataclass
 from datetime import UTC, datetime
-from email.utils import parsedate_to_datetime
-from threading import BoundedSemaphore, Lock
-from time import monotonic
 from typing import TypeVar
 
 from cli_downloader.application.item_scheduler import ItemLease, ItemScheduler, SchedulerPolicy
+from cli_downloader.core.http import interrupt_http_streams
+from cli_downloader.application.site_request_coordinator import (
+    RequestPolicy as RequestPolicy,
+    RequestPermit,
+    SiteRequestCoordinator,
+    http_status,
+)
 
 
 ResultT = TypeVar("ResultT")
 RetryReporter = Callable[[dict[str, object]], None]
 
 
-@dataclass(frozen=True)
-class RequestPolicy:
-    max_concurrency: int = 2
-    min_interval_seconds: float = 0.5
-    retryable_status_codes: tuple[int, ...] = (429,)
-    max_attempts: int = 5
-    max_backoff_seconds: float = 300.0
-
-    def __post_init__(self) -> None:
-        if self.max_concurrency <= 0 or self.max_attempts <= 0:
-            raise ValueError("request concurrency and attempts must be positive")
-        if self.min_interval_seconds < 0 or self.max_backoff_seconds <= 0:
-            raise ValueError("request timing values are invalid")
-
-
-class _RequestGate:
-    def __init__(self, policy: RequestPolicy) -> None:
-        self.policy = policy
-        self.capacity = BoundedSemaphore(policy.max_concurrency)
-        self.lock = Lock()
-        self.next_request_at = 0.0
-        self.cooldown_until = 0.0
-
-    async def acquire(self) -> None:
-        # Never leave an uncancellable executor thread waiting for a permit.
-        # Check shared timing and capacity atomically across worker event loops.
-        while True:
-            with self.lock:
-                now = monotonic()
-                ready_at = max(self.next_request_at, self.cooldown_until)
-                if now >= ready_at and self.capacity.acquire(blocking=False):
-                    self.next_request_at = now + self.policy.min_interval_seconds
-                    return
-            await asyncio.sleep(0.02)
-
-    def defer(self, delay: float) -> None:
-        with self.lock:
-            self.cooldown_until = max(self.cooldown_until, monotonic() + delay)
-
-
 class _RequestLease:
-    def __init__(self, gate: _RequestGate) -> None:
-        self.gate = gate
-        self.held = False
+    def __init__(self, coordinator: SiteRequestCoordinator, site_id: str) -> None:
+        self.coordinator = coordinator
+        self.site_id = site_id
+        self.task = asyncio.current_task()
+        self.permit: RequestPermit | None = None
 
     async def acquire(self) -> None:
-        if not self.held:
-            await self.gate.acquire()
-            self.held = True
+        if self.permit is None:
+            self.permit = await self.coordinator.acquire(self.site_id)
 
     def release(self) -> None:
-        if self.held:
-            self.held = False
-            self.gate.capacity.release()
+        if self.permit is not None:
+            self.permit.release()
+            self.permit = None
 
 
 _current_request: ContextVar[_RequestLease | None] = ContextVar("current_request", default=None)
 
 
-def suspend_current_request() -> None:
+async def suspend_current_request() -> None:
+    await interrupt_http_streams()
     lease = _current_request.get()
-    if lease is not None:
+    if lease is not None and lease.task is asyncio.current_task():
         lease.release()
 
 
 async def resume_current_request() -> None:
     lease = _current_request.get()
-    if lease is not None:
+    if lease is not None and lease.task is asyncio.current_task():
         await lease.acquire()
 
 
@@ -99,6 +63,7 @@ class GalleryDownloadLimiter:
         default_request_policy: RequestPolicy | None = None,
         item_policy: SchedulerPolicy | str = SchedulerPolicy.ROUND_ROBIN,
         item_site_limit: int | None = None,
+        request_coordinator: SiteRequestCoordinator | None = None,
     ) -> None:
         if isinstance(limit, bool) or not isinstance(limit, int) or limit <= 0:
             raise ValueError("gallery download limit must be a positive integer")
@@ -108,10 +73,9 @@ class GalleryDownloadLimiter:
             policy=item_policy,
         )
         self._legacy_leases: dict[asyncio.Task[object], ItemLease] = {}
-        self._default_request_policy = default_request_policy or RequestPolicy()
-        self._request_policies = dict(request_policies or {})
-        self._request_gates: dict[str, _RequestGate] = {}
-        self._request_gates_lock = Lock()
+        self.requests = request_coordinator or SiteRequestCoordinator(
+            policies=request_policies, default_policy=default_request_policy
+        )
 
     @property
     def max_concurrent_downloads(self) -> int:
@@ -188,81 +152,50 @@ class GalleryDownloadLimiter:
         operation: Callable[[], Awaitable[ResultT]],
         *,
         report_retry: RetryReporter | None = None,
+        retry_allowed: bool = True,
     ) -> ResultT:
-        gate = self._gate(site_id)
-        policy = gate.policy
-        for attempt in range(1, policy.max_attempts + 1):
-            lease = _RequestLease(gate)
+        # Compatibility admission for callbacks whose internal I/O is unknown.
+        # Same-task nested legacy calls share the outer operation, but child
+        # tasks must acquire their own permits despite ContextVar inheritance.
+        current = _current_request.get()
+        if (
+            current is not None
+            and current.task is asyncio.current_task()
+            and current.site_id == site_id
+        ):
+            return await operation()
+        policy = self.requests.policy(site_id)
+        attempts = policy.max_attempts if retry_allowed else 1
+        for attempt in range(1, attempts + 1):
+            lease = _RequestLease(self.requests, site_id)
             await lease.acquire()
             token = _current_request.set(lease)
             try:
                 return await operation()
             except Exception as error:
-                delay = _retry_delay(error, attempt, policy)
-                if delay is None:
-                    _annotate_failure(error, attempt, None)
-                    raise
-                gate.defer(delay)
-                next_retry_at = datetime.fromtimestamp(
-                    datetime.now(UTC).timestamp() + delay,
-                    UTC,
-                ).isoformat()
+                retry_at = self.requests.observe_error(site_id, error, attempt)
+                next_retry_at = (
+                    datetime.fromtimestamp(retry_at, UTC).isoformat()
+                    if retry_at is not None
+                    else None
+                )
                 _annotate_failure(error, attempt, next_retry_at)
-                if attempt == policy.max_attempts:
+                if retry_at is None or attempt == attempts:
                     raise
                 if report_retry is not None:
                     report_retry(
                         {
                             "site_id": site_id,
                             "attempt": attempt,
-                            "max_attempts": policy.max_attempts,
-                            "delay_seconds": round(delay, 3),
+                            "max_attempts": attempts,
                             "next_retry_at": next_retry_at,
-                            "http_status": getattr(error, "code", None),
+                            "http_status": http_status(error),
                         }
                     )
             finally:
                 _current_request.reset(token)
                 lease.release()
         raise RuntimeError("request retry loop exited unexpectedly")
-
-    def _gate(self, site_id: str) -> _RequestGate:
-        with self._request_gates_lock:
-            gate = self._request_gates.get(site_id)
-            if gate is None:
-                gate = _RequestGate(
-                    self._request_policies.get(site_id, self._default_request_policy)
-                )
-                self._request_gates[site_id] = gate
-            return gate
-
-
-def _retry_delay(error: Exception, attempt: int, policy: RequestPolicy) -> float | None:
-    status = getattr(error, "code", None)
-    if status not in policy.retryable_status_codes:
-        return None
-    retry_after = _retry_after_seconds(error)
-    if retry_after is not None:
-        return retry_after
-    fallback = min(policy.max_backoff_seconds, float(2 ** (attempt - 1)))
-    return fallback + random.uniform(0.0, min(1.0, fallback * 0.1))
-
-
-def _retry_after_seconds(error: Exception) -> float | None:
-    headers = getattr(error, "headers", None)
-    value = headers.get("Retry-After") if headers is not None else None
-    if value is None:
-        return None
-    try:
-        return max(0.0, float(value))
-    except (TypeError, ValueError):
-        try:
-            retry_at = parsedate_to_datetime(str(value))
-        except (TypeError, ValueError, OverflowError):
-            return None
-        if retry_at.tzinfo is None:
-            retry_at = retry_at.replace(tzinfo=UTC)
-        return max(0.0, (retry_at - datetime.now(UTC)).total_seconds())
 
 
 def _annotate_failure(error: Exception, attempt: int, next_retry_at: str | None) -> None:

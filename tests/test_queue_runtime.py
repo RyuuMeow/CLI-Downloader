@@ -344,3 +344,75 @@ class QueueRuntimeTests(IsolatedAsyncioTestCase):
                 limiter.acquire_item(root_id="finished", site_id="example"), 1
             )
             await lease.release()
+
+    async def test_full_batch_queue_and_item_waiters_can_acknowledge_parent_pause(self):
+        from cli_downloader.application.batch_pipeline import BatchQueueConfig
+
+        with TemporaryDirectory() as directory:
+            db = Path(directory) / "state.sqlite3"
+            batches, tasks = StateBatchStore(db), StateTaskStore(db)
+            create_batch(batches, "root", ("example",) * 6)
+            limiter = GalleryDownloadLimiter(1)
+            started, boundary = asyncio.Event(), asyncio.Event()
+
+            class Resolver:
+                async def resolve(self, entry, control, progress):
+                    return make_package(entry)
+
+            class Downloader:
+                async def execute(self, child, assets, control, progress):
+                    started.set()
+                    await boundary.wait()
+                    await control.wait_if_paused()
+                    return complete_assets(assets)
+
+            pipeline = BatchPipeline(
+                store=batches,
+                resolver=Resolver(),
+                downloader=Downloader(),
+                download_limiter=limiter,
+                config=BatchQueueConfig(
+                    resolution_workers=2,
+                    download_workers=3,
+                    resolution_queue_size=2,
+                    download_queue_size=1,
+                ),
+            )
+            coordinator = TaskExecutionCoordinator(task_store=tasks)
+            service = TaskHierarchyService(task_store=tasks, batch_store=batches, scheduler=limiter)
+            service.configure_batch_runtime(
+                task_id="root",
+                pipeline=pipeline,
+                retry_service=None,
+                execution_coordinator=coordinator,
+            )
+            runner = CoordinatedBatchRunner(pipeline=pipeline, coordinator=coordinator)
+            worker = asyncio.create_task(runner.run_batch("root"))
+            try:
+                await asyncio.wait_for(started.wait(), 2)
+
+                async def saturated():
+                    while (
+                        len(limiter.waiting_snapshot_sync()) < 2
+                        or len(batches.list_children("root")) < 5
+                    ):
+                        await asyncio.sleep(0.01)
+
+                await asyncio.wait_for(saturated(), 2)
+                await asyncio.to_thread(service.pause, "root")
+                boundary.set()
+
+                async def paused():
+                    while tasks.get("root").status is not TaskStatus.PAUSED:
+                        await asyncio.sleep(0.01)
+
+                await asyncio.wait_for(paused(), 1)
+                self.assertEqual(limiter.active_snapshot_sync(), ())
+                await asyncio.to_thread(service.resume, "root")
+                await asyncio.wait_for(worker, 3)
+                self.assertEqual(tasks.get("root").status, TaskStatus.COMPLETED)
+            finally:
+                pipeline.resume("root")
+                boundary.set()
+                await asyncio.wait_for(asyncio.gather(worker, return_exceptions=True), 3)
+                service.release_batch_runtime("root", pipeline)

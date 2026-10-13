@@ -67,6 +67,7 @@ class OwnerResponseMode(StrEnum):
 
 class OwnerCommand(StrEnum):
     DOWNLOAD = "download"
+    OPERATION = "operation"
     TASK_CONTROL = "task_control"
     TASK_QUERY = "task_query"
     HISTORY_QUERY = "history_query"
@@ -325,6 +326,9 @@ def _check_keys(value: Mapping[str, object], path: str, allowed: frozenset[str])
 
 
 _COMMAND_FIELDS: dict[OwnerCommand, frozenset[str]] = {
+    OwnerCommand.OPERATION: frozenset(
+        {"plugin_id", "operation_id", "params", "confirmations", "json"}
+    ),
     OwnerCommand.DOWNLOAD: frozenset(
         {
             "url",
@@ -372,7 +376,16 @@ def _validate_command_payload(
             "raw process commands and secret values are not allowed",
         )
     _check_keys(payload, "request.payload", _COMMAND_FIELDS[command])
-    if command is OwnerCommand.DOWNLOAD:
+    if command is OwnerCommand.OPERATION:
+        for name in ("plugin_id", "operation_id"):
+            _require_identifier(payload.get(name), f"request.payload.{name}")
+        if "params" in payload:
+            _freeze_json_object(payload["params"], "request.payload.params")
+        if "confirmations" in payload:
+            _freeze_identifiers(payload["confirmations"], "request.payload.confirmations")
+        if "json" in payload and not isinstance(payload["json"], bool):
+            raise _error("invalid_boolean", "request.payload.json", "must be a boolean")
+    elif command is OwnerCommand.DOWNLOAD:
         if "url" not in payload:
             raise _error("missing_field", "request.payload.url", "is required for download")
         _require_url(payload["url"], "request.payload.url")

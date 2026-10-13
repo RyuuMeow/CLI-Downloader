@@ -5,11 +5,13 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
 from types import MappingProxyType
+from threading import RLock
 from typing import cast
 
 from cli_downloader.config.schema import SettingsRegistry
 from cli_downloader.core.errors import PluginValidationError
 from cli_downloader.core.fetch import AssetFetcher, UrlAssetFetcher
+from cli_downloader.core.http import PluginServices, has_managed_http
 from cli_downloader.plugins.activation import (
     PluginActivationReport,
     PluginActivationStatus,
@@ -76,6 +78,38 @@ class ApplicationRuntime:
     asset_fetchers_by_site_id: Mapping[str, AssetFetcher]
     diagnostics: tuple[RuntimeDiagnostic, ...]
     external_code_enabled: bool = False
+    _network: dict[str, object] = field(default_factory=dict, repr=False, compare=False)
+    _network_lock: object = field(default_factory=RLock, repr=False, compare=False)
+
+    @property
+    def request_limiter(self):
+        return self._network.get("limiter")
+
+    def bind_http_services(self, limiter) -> None:
+        from cli_downloader.integrations.http_client import ManagedHttpClient
+
+        with self._network_lock:
+            existing = self.request_limiter
+            if existing is limiter:
+                return
+            if existing is not None:
+                raise RuntimeError("runtime already belongs to another network coordinator")
+            for entry in self.plugins_by_id.values():
+                services = PluginServices(ManagedHttpClient(entry.site_id, limiter.requests))
+                targets = (
+                    (entry.instance,)
+                    if entry.asset_fetcher is entry.instance
+                    else (entry.instance, entry.asset_fetcher)
+                )
+                for target in targets:
+                    if isinstance(target, UrlAssetFetcher) or has_managed_http(target):
+                        bind = getattr(target, "bind_services", None)
+                        if not callable(bind):
+                            raise PluginValidationError(
+                                "managed HTTP plugin must implement bind_services(services)"
+                            )
+                        bind(services)
+            self._network["limiter"] = limiter
 
     def plugin_for_id(self, plugin_id: str) -> SiteAdapter | None:
         entry = self.plugins_by_id.get(plugin_id)
@@ -131,6 +165,31 @@ class ApplicationRuntime:
             "plugin_ids": sorted(self.plugins_by_id),
             "site_ids": sorted(self.plugins_by_site_id),
             "hostnames": sorted(self.plugins_by_hostname),
+            "network_control": [
+                {
+                    "plugin_id": entry.plugin_id,
+                    "site_id": entry.site_id,
+                    "preparation": "request" if has_managed_http(entry.instance) else "operation",
+                    "downloads": "request"
+                    if has_managed_http(entry.asset_fetcher)
+                    else "operation",
+                    "bound": self.request_limiter is not None,
+                    "policy_source": f"plugins.{entry.plugin_id}.network"
+                    if entry.manifest.network is not None
+                    else "network",
+                    "effective_policy": {
+                        "max_concurrency": self.request_limiter.requests.policy(
+                            entry.site_id
+                        ).max_concurrency,
+                        "min_interval_seconds": self.request_limiter.requests.policy(
+                            entry.site_id
+                        ).min_interval_seconds,
+                    }
+                    if self.request_limiter is not None
+                    else None,
+                }
+                for entry in self.plugins_by_id.values()
+            ],
             "scan": self.scan_report.to_dict(),
             "activation": self.activation_report.to_dict(),
             "diagnostics": [diagnostic.to_dict() for diagnostic in self.diagnostics],

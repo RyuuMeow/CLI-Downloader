@@ -34,11 +34,14 @@ from cli_downloader.cli._output import (
 )
 from cli_downloader.cli._download_ops import (
     AcceptanceSink,
+    _build_download_limiter,
     ListSelectionPolicy,
     _batch_details,
     _run_batch_retry,
     _run_generic_download,
 )
+from cli_downloader.cli._owner_operations import forward_operation
+from cli_downloader.storage.site_cooldown_store import SiteCooldownStore
 from cli_downloader.cli import _inspect_ops
 from cli_downloader.cli import _shell_wiring
 from cli_downloader.cli.history import (
@@ -407,6 +410,10 @@ def build_parser() -> argparse.ArgumentParser:
         help="Allow validated external plugins to execute during application startup.",
     )
     subparsers = parser.add_subparsers(dest="command")
+
+    network_parser = subparsers.add_parser("network", help="Inspect live owner HTTP admission.")
+    network_parser.add_argument("network_command", choices=("status",))
+    network_parser.add_argument("--json", action="store_true", help="Emit JSON diagnostics.")
 
     doctor_parser = subparsers.add_parser(
         "doctor",
@@ -996,6 +1003,73 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _run_local_plugin_operation(args, runtime, download_limiter=None) -> int:
+    render_mode = select_render_mode(json_requested=args.json)
+    environment = diagnose_environment()
+    loaded_config = ConfigLoader(
+        paths=environment.paths,
+        registry=runtime.settings_registry,
+    ).load()
+    runtime.configure_plugins(loaded_config.values, loaded_config.secrets)
+
+    if args.operation_id != "help":
+        limiter = download_limiter or _build_download_limiter(runtime, loaded_config.values)
+        runtime.bind_http_services(limiter)
+        limiter.requests.bind_cooldown_store(
+            SiteCooldownStore(
+                StateDatabase(StorageLayout.from_app_paths(environment.paths).state_db)
+            )
+        )
+
+    dispatcher = OperationDispatcher(
+        runtime,
+        config=loaded_config,
+    )
+    params = {}
+    for arg in args.args:
+        if "=" in arg:
+            k, v = arg.split("=", 1)
+            params[k] = v
+
+    result = _dispatch_plugin_operation(
+        dispatcher,
+        args.plugin_id,
+        args.operation_id,
+        params=params,
+        confirmations=_EXPLICIT_DOWNLOAD_CONFIRMATIONS,
+    )
+    if result.result_kind is ResultKind.ERROR:
+        print(
+            serialize_operation_result(
+                result,
+                RenderMode.PLAIN if render_mode is RenderMode.INTERACTIVE else render_mode,
+            )
+        )
+        return 1
+
+    if result.result_kind is not ResultKind.LIST_PAGE:
+        print(
+            serialize_operation_result(
+                result,
+                RenderMode.PLAIN if render_mode is RenderMode.INTERACTIVE else render_mode,
+            )
+        )
+        return 0
+
+    data = result.data
+    if not isinstance(data, ListPageData):
+        print(
+            serialize_operation_result(
+                result,
+                RenderMode.PLAIN if render_mode is RenderMode.INTERACTIVE else render_mode,
+            )
+        )
+        return 1
+
+    print(serialize_operation_result(result, render_mode))
+    return 0
+
+
 def main(
     argv: Sequence[str] | None = None,
     *,
@@ -1029,6 +1103,11 @@ def main(
                 enable_external_code=args.runtime_enable_external_code,
             )
         return application_runtime
+
+    if args.command == "network":
+        from cli_downloader.cli._network_status import print_network_status
+
+        return print_network_status()
 
     if args.command == "diagnose":
         print(json.dumps(diagnose_environment().to_dict(), indent=2))
@@ -1377,61 +1456,25 @@ def main(
             return 1
 
     if args.command == "operation":
-        render_mode = select_render_mode(json_requested=args.json)
-        environment = diagnose_environment()
-        loaded_config = ConfigLoader(
-            paths=environment.paths,
-            registry=get_runtime().settings_registry,
-        ).load()
-        get_runtime().configure_plugins(loaded_config.values, loaded_config.secrets)
-
-        dispatcher = OperationDispatcher(
-            get_runtime(),
-            config=loaded_config,
-        )
-        params = {}
-        for arg in args.args:
-            if "=" in arg:
-                k, v = arg.split("=", 1)
-                params[k] = v
-
-        result = _dispatch_plugin_operation(
-            dispatcher,
-            args.plugin_id,
-            args.operation_id,
-            params=params,
-            confirmations=_EXPLICIT_DOWNLOAD_CONFIRMATIONS,
-        )
-        if result.result_kind is ResultKind.ERROR:
-            print(
-                serialize_operation_result(
-                    result,
-                    RenderMode.PLAIN if render_mode is RenderMode.INTERACTIVE else render_mode,
+        try:
+            if args.operation_id != "help" and not _owner_claimed:
+                forwarded = forward_operation(
+                    args,
+                    confirmations=_EXPLICIT_DOWNLOAD_CONFIRMATIONS,
+                    emit_error=_emit_owner_error,
                 )
+                if forwarded is not None:
+                    return forwarded
+            ownership = (
+                nullcontext()
+                if args.operation_id == "help"
+                else _owned_execution(owner_claimed=_owner_claimed)
             )
+            with ownership:
+                return _run_local_plugin_operation(args, get_runtime(), download_limiter)
+        except OwnerError as error:
+            _emit_owner_error(error, json_output=args.json)
             return 1
-
-        if result.result_kind is not ResultKind.LIST_PAGE:
-            print(
-                serialize_operation_result(
-                    result,
-                    RenderMode.PLAIN if render_mode is RenderMode.INTERACTIVE else render_mode,
-                )
-            )
-            return 0
-
-        data = result.data
-        if not isinstance(data, ListPageData):
-            print(
-                serialize_operation_result(
-                    result,
-                    RenderMode.PLAIN if render_mode is RenderMode.INTERACTIVE else render_mode,
-                )
-            )
-            return 1
-
-        print(serialize_operation_result(result, render_mode))
-        return 0
 
     if args.command == "batches":
         render_mode = select_render_mode(json_requested=getattr(args, "json", False))

@@ -102,3 +102,17 @@ def shell_owner_process(directory: str, ready, stop, executed) -> None:
             encoding="utf-8",
         )
         raise
+
+
+def operation_cli_process(directory, result_queue):
+    """An actual CLI process must forward without loading a local site plugin."""
+    from contextlib import redirect_stdout
+    from io import StringIO
+    from cli_downloader.cli.app import main
+
+    os.environ["CLI_DOWNLOADER_DATA_ROOT"] = directory
+    os.environ["CLI_DOWNLOADER_PORTABLE_ROOT"] = ""
+    output = StringIO()
+    with redirect_stdout(output):
+        code = main(["operation", "--json", "example", "browse_list"])
+    result_queue.put((code, output.getvalue()))

@@ -438,6 +438,12 @@ def _history_output_files(payload: dict[str, object]) -> tuple[str, ...]:
     return tuple(dict.fromkeys(values))
 
 
+def _create_site_cooldowns(connection: sqlite3.Connection) -> None:
+    connection.execute(
+        "CREATE TABLE site_cooldowns (site_id TEXT PRIMARY KEY, retry_at REAL NOT NULL, status INTEGER)"
+    )
+
+
 _MIGRATIONS = (
     StateMigration(1, "bootstrap_state_database", _bootstrap_schema),
     StateMigration(2, "create_completion_ledger", _create_completion_ledger),
@@ -448,6 +454,7 @@ _MIGRATIONS = (
     StateMigration(9, "add_execution_identity_columns", _add_execution_identity_columns),
     StateMigration(10, "create_download_history", _create_download_history),
     StateMigration(11, "backfill_download_history", _backfill_download_history),
+    StateMigration(12, "create_site_cooldowns", _create_site_cooldowns),
 )
 
 

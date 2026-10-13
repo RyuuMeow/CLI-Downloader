@@ -253,8 +253,8 @@
   "settings.description.url": "qBittorrent Web API 基底 URL。",
   "settings.description.username": "qBittorrent Web UI 使用者名稱。",
   "settings.description.password": "qBittorrent Web UI 密碼（儲存於 secrets.toml）。",
-  "settings.description.max_concurrent_requests": "每個網站的備援最大同時請求數。",
-  "settings.description.min_request_interval_seconds": "網站請求的備援最小延遲。",
+  "settings.description.max_concurrent_requests": "每站共用的備援上限，包含準備、列清單及下載；已接入的外掛逐次計算 HTTP 請求。",
+  "settings.description.min_request_interval_seconds": "同站相鄰請求開始時間的最小間隔備援值，準備、列清單及下載共用。",
   "settings.description.max_attempts": "可重試請求的備援最大嘗試次數。",
   "settings.description.auto_delete_on_complete": "下載成功完成後自動刪除任務紀錄。",
   "settings.description.max_backoff_seconds": "沒有 Retry-After 時的備援最大冷卻時間。",
@@ -320,5 +320,12 @@
   "cli.no_cancellable_tasks": "找不到可取消的任務。",
   "cli.cancelled_tasks": "已取消 {count} 個任務。",
   "cli.error_count": "發生 {count} 個錯誤。",
-  "cli.cancelled_task": "已取消任務：{task_id}"
+  "cli.cancelled_task": "已取消任務：{task_id}",
+  "task.queue.request_capacity": "等待 HTTP 請求名額",
+  "task.queue.request_interval": "等待請求間隔",
+  "task.queue.site_cooldown": "網站冷卻中",
+  "settings.network.restart": "網路限制變更會在重啟 Shell 後生效；網站專屬設定會覆蓋全域備援值。",
+  "settings.network.request_level": "逐次請求限流",
+  "settings.network.operation_level": "操作層級限流（外掛內部請求未驗證）",
+  "settings.network.effective": "{site}：同時 {limit} 個、開始間隔 {interval} 秒 · {source} · {coverage}"
 }

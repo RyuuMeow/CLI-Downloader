@@ -33,6 +33,9 @@ from cli_downloader.application.download_limiter import (
     suspend_current_request,
     resume_current_request,
 )
+from cli_downloader.application.plugin_network import invoke_plugin_network
+from cli_downloader.application.site_request_coordinator import RequestContext, request_context
+from cli_downloader.core.http import closing_stream, has_managed_http, restart_interrupted_download
 from cli_downloader.integrations.torrent import (
     TorrentAsset,
     TorrentClient,
@@ -157,6 +160,7 @@ class DownloadService:
         auto_delete_completed: bool = False,
         torrent_client: TorrentClient | None = None,
         auto_delete_torrent_file: bool = True,
+        request_limiter: GalleryDownloadLimiter | None = None,
     ) -> None:
         self._registry = registry
         self._task_store = task_store
@@ -169,6 +173,7 @@ class DownloadService:
         self._auto_delete_completed = auto_delete_completed
         self._torrent_client = torrent_client
         self._auto_delete_torrent_file = auto_delete_torrent_file
+        self._request_limiter = request_limiter
 
     async def plan_task(
         self,
@@ -229,14 +234,36 @@ class DownloadService:
         task_id: str | None = None,
         force: bool = False,
     ) -> CompletedTaskResult:
-        item, plan, record = await self._build_planned_record(
-            url,
-            profile=profile,
-            strategy=strategy,
-            record_metadata=record_metadata,
-            task_id=task_id,
-            force=force,
-        )
+        task_id = task_id or self._task_id_factory()
+        download_limiter = download_limiter or self._request_limiter
+        try:
+            item, plan, record = await self._build_planned_record(
+                url,
+                profile=profile,
+                strategy=strategy,
+                record_metadata=record_metadata,
+                task_id=task_id,
+                force=force,
+                request_limiter=download_limiter,
+                cancel_signal=cancel_signal,
+            )
+        except OwnerShutdownRequested:
+            current = self._task_store.get(task_id) or TaskRecord(
+                task_id,
+                TaskStatus.PLANNED,
+                source_url=url,
+                metadata={"profile": profile or "default", **(record_metadata or {})},
+            )
+            self._task_store.upsert(
+                current.transition(
+                    status=TaskStatus.PAUSED
+                    if current.status is TaskStatus.PAUSED
+                    else TaskStatus.PLANNED,
+                    active_run_id=None,
+                    metadata={**current.metadata, "owner_shutdown_checkpoint": True},
+                )
+            )
+            raise
         context = PipelineContext(
             task_id=record.task_id,
             data={
@@ -376,14 +403,37 @@ class DownloadService:
         record_metadata: dict[str, object] | None = None,
         task_id: str | None = None,
         force: bool = False,
+        request_limiter: GalleryDownloadLimiter | None = None,
+        cancel_signal: CancelSignal | None = None,
     ) -> tuple[ResolvedItem, DownloadStrategyPlan, TaskRecord]:
         adapter = self._registry.adapter_for_url(url)
         if adapter is None:
             raise AdapterResolutionError(f"no registered site adapter can handle URL: {url}")
 
-        item = await adapter.resolve(ResolveRequest(url=url, profile=profile, strategy=strategy))
-        plan = await adapter.choose_strategy(item)
         task_id = task_id or self._task_id_factory()
+        context = RequestContext(
+            task_id,
+            "prepare",
+            task_id=task_id,
+            profile=profile,
+            checkpoint=lambda: self._preparation_checkpoint(task_id, cancel_signal),
+        )
+        limiter = request_limiter or self._request_limiter
+        item = await invoke_plugin_network(
+            adapter,
+            limiter,
+            adapter.site_id,
+            lambda: adapter.resolve(ResolveRequest(url=url, profile=profile, strategy=strategy)),
+            context=context,
+        )
+        plan = await invoke_plugin_network(
+            adapter,
+            limiter,
+            adapter.site_id,
+            lambda: adapter.choose_strategy(item),
+            context=context,
+        )
+        await self._preparation_checkpoint(task_id, cancel_signal)
         existing = self._task_store.get(task_id)
 
         status = TaskStatus.PLANNED
@@ -444,6 +494,33 @@ class DownloadService:
         )
 
         return item, plan, record
+
+    async def _preparation_checkpoint(self, task_id, signal) -> None:
+        while True:
+            if signal is not None:
+                shutdown = getattr(signal, "is_owner_shutdown", None)
+                if callable(shutdown) and shutdown():
+                    raise OwnerShutdownRequested
+                if signal.is_set():
+                    raise asyncio.CancelledError
+            record = self._task_store.get(task_id)
+            if record is None:
+                return
+            if (
+                record.status is TaskStatus.CANCELED
+                or record.desired_control is TaskDesiredControl.CANCEL
+            ):
+                raise asyncio.CancelledError
+            if (
+                record.status is not TaskStatus.PAUSED
+                and record.desired_control is not TaskDesiredControl.PAUSE
+            ):
+                return
+            if record.status is not TaskStatus.PAUSED:
+                self._task_store.compare_and_swap(
+                    record.transition(status=TaskStatus.PAUSED), expected_revision=record.revision
+                )
+            await asyncio.sleep(0.05)
 
     def _append_history(self, events: tuple[TaskEvent, ...]) -> None:
         if self._history_store is not None:
@@ -609,7 +686,19 @@ class WriteAssetsStage:
                 await self._wait_until_runnable(context.task_id, lease_controller=controller)
             await controller.acquire()
         try:
-            return await self._run(context, lease_controller=controller)
+            with request_context(
+                RequestContext(
+                    context.task_id,
+                    "download",
+                    task_id=context.task_id,
+                    checkpoint=lambda: self._wait_until_runnable(
+                        context.task_id, lease_controller=controller
+                    ),
+                    release_item=controller.release if controller else None,
+                    resume_item=controller.acquire if controller else None,
+                )
+            ):
+                return await self._run(context, lease_controller=controller)
         except OwnerShutdownRequested:
             self._record_partial_checkpoint(context.task_id)
             raise
@@ -722,27 +811,30 @@ class WriteAssetsStage:
 
                     bytes_so_far = 0
                     last_report_time = 0.0
-                    async for chunk, total in self._fetcher.fetch_stream(asset):
-                        await self._wait_until_runnable(
-                            context.task_id,
-                            lease_controller=lease_controller,
-                        )
-                        bytes_so_far += len(chunk)
-                        hash_obj.update(chunk)
-                        if self._byte_progress is not None:
-                            now = time.monotonic()
-                            if (
-                                total is None
-                                or bytes_so_far == total
-                                or now - last_report_time > 0.1
-                            ):
-                                self._byte_progress(
-                                    f"{context.task_id}:{asset.url}", bytes_so_far, total
-                                )
-                                last_report_time = now
-                        yield chunk
+                    async with closing_stream(self._fetcher.fetch_stream(asset)) as chunks:
+                        async for chunk, total in chunks:
+                            await self._wait_until_runnable(
+                                context.task_id,
+                                lease_controller=lease_controller,
+                            )
+                            bytes_so_far += len(chunk)
+                            hash_obj.update(chunk)
+                            if self._byte_progress is not None:
+                                now = time.monotonic()
+                                if (
+                                    total is None
+                                    or bytes_so_far == total
+                                    or now - last_report_time > 0.1
+                                ):
+                                    self._byte_progress(
+                                        f"{context.task_id}:{asset.url}", bytes_so_far, total
+                                    )
+                                    last_report_time = now
+                            yield chunk
 
                 async def fetch_and_write() -> WrittenAsset:
+                    nonlocal hash_obj
+                    hash_obj = sha256()
                     return await self._file_writer.write_stream(
                         asset,
                         _chunk_generator(),
@@ -753,9 +845,11 @@ class WriteAssetsStage:
 
                 self._assert_execution_fence(context.task_id)
                 written_asset = (
-                    await self._download_limiter.request(item.site_id, fetch_and_write)
-                    if self._download_limiter is not None
-                    else await fetch_and_write()
+                    await self._download_limiter.request(
+                        item.site_id, lambda: restart_interrupted_download(fetch_and_write)
+                    )
+                    if self._download_limiter is not None and not has_managed_http(self._fetcher)
+                    else await restart_interrupted_download(fetch_and_write)
                 )
                 written_assets.append(written_asset)
                 content_sha256 = hash_obj.hexdigest()
@@ -769,7 +863,7 @@ class WriteAssetsStage:
                         item.site_id,
                         fetch_asset,
                     )
-                    if self._download_limiter is not None
+                    if self._download_limiter is not None and not has_managed_http(self._fetcher)
                     else await fetch_asset()
                 )
                 if self._cancel_signal is not None and self._cancel_signal.is_set():
@@ -1133,6 +1227,7 @@ class WriteAssetsStage:
                 raise RuntimeError(f"task disappeared during download: {task_id}")
             self._assert_execution_fence(task_id)
             if self._shutdown_requested():
+                await suspend_current_request()
                 if self._download_limiter is not None:
                     self._download_limiter.suspend_root_sync(task_id)
                 if lease_controller is not None:
@@ -1141,6 +1236,7 @@ class WriteAssetsStage:
             if record.status is TaskStatus.CANCELED or (
                 self._cancel_signal is not None and self._cancel_signal.is_set()
             ):
+                await suspend_current_request()
                 if lease_controller is not None:
                     await lease_controller.release()
                     self._download_limiter.cancel_root_sync(task_id)
@@ -1150,7 +1246,7 @@ class WriteAssetsStage:
                 or record.desired_control is TaskDesiredControl.PAUSE
             ):
                 if not suspended:
-                    suspend_current_request()
+                    await suspend_current_request()
                     if self._download_limiter is not None:
                         self._download_limiter.suspend_root_sync(task_id)
                     if lease_controller is not None:

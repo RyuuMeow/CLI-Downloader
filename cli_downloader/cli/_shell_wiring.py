@@ -7,6 +7,8 @@ state.
 
 from __future__ import annotations
 
+import asyncio
+
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import redirect_stdout
 from datetime import UTC, datetime
@@ -65,6 +67,8 @@ from cli_downloader.plugins.runtime import ApplicationRuntime
 from cli_downloader.storage.paths import StorageLayout
 from cli_downloader.storage.state_batch_store import StateBatchStore
 from cli_downloader.storage.state_database import StateDatabase
+from cli_downloader.storage.site_cooldown_store import SiteCooldownStore
+from cli_downloader.cli._owner_operations import handle_operation
 from cli_downloader.storage.state_history_store import StateHistoryStore
 from cli_downloader.storage.state_task_store import StateTaskStore
 from cli_downloader.storage.task_store import TaskDesiredControl, TaskStatus
@@ -98,10 +102,12 @@ def build_interactive_shell(
             session_id=session_id,
             capabilities=(
                 "download",
+                "operation",
                 "task_control",
                 "task_query",
                 "history_query",
                 "shell_status",
+                "network_status",
             ),
         )
         lease = OwnerManager(scope).acquire(metadata)
@@ -129,10 +135,12 @@ def build_interactive_shell(
                 session_id=session_id,
                 capabilities=(
                     "download",
+                    "operation",
                     "task_control",
                     "task_query",
                     "history_query",
                     "shell_status",
+                    "network_status",
                 ),
             )
             try:
@@ -168,6 +176,7 @@ def _build_interactive_shell_impl(
     )
     task_service: TaskHierarchyService | None = None
     state_database = StateDatabase(layout.state_db)
+    shell_download_limiter.requests.bind_cooldown_store(SiteCooldownStore(state_database))
     task_store = StateTaskStore(state_database)
     batch_store = StateBatchStore(state_database)
     history_store = StateHistoryStore(state_database)
@@ -242,6 +251,27 @@ def _build_interactive_shell_impl(
                 active_cancellations.discard(cancellation)
                 active_workers.discard(worker)
 
+    def run_operation(request):
+        worker = current_thread()
+        with execution_lock:
+            if shutdown_requested.is_set():
+                raise OwnerError("Shell owner is stopping")
+            active_workers.add(worker)
+        try:
+            payload = request.payload
+            return asyncio.run(
+                OperationDispatcher(runtime, config=shell_config).dispatch_plugin_operation(
+                    str(payload["plugin_id"]),
+                    str(payload["operation_id"]),
+                    request_id=request.request_id,
+                    params=dict(payload.get("params", {})),
+                    confirmations=tuple(payload.get("confirmations", ())),
+                )
+            )
+        finally:
+            with execution_lock:
+                active_workers.discard(worker)
+
     def persist_interruption_intent(*, normalize_running: bool = True) -> int:
         unfinished = 0
         for record in task_store.list():
@@ -272,6 +302,7 @@ def _build_interactive_shell_impl(
     def request_shutdown() -> str | None:
         first_request = not shutdown_requested.is_set()
         shutdown_requested.set()
+        shell_download_limiter.requests.stop()
         if first_request and owner_lease is not None:
             owner_lease.publish(
                 OwnerDiscoveryMetadata.for_current_process(
@@ -282,10 +313,12 @@ def _build_interactive_shell_impl(
                     session_id=owner_session_id or new_owner_session_id(),
                     capabilities=(
                         "download",
+                        "operation",
                         "task_control",
                         "task_query",
                         "history_query",
                         "shell_status",
+                        "network_status",
                     ),
                 )
             )
@@ -323,6 +356,10 @@ def _build_interactive_shell_impl(
                 break
             for worker in workers:
                 worker.join(timeout=max(0.0, min(0.1, deadline - monotonic())))
+        # A blocking HTTP operation cannot be abandoned when handing ownership
+        # to another process. Its bounded transport timeout must settle first.
+        while shell_download_limiter.requests.active_transport_count:
+            Event().wait(0.05)
         # A worker may have written a RUNNING checkpoint just before it noticed
         # cancellation; normalize it once more before the owner lock is freed.
         persist_interruption_intent()
@@ -344,10 +381,12 @@ def _build_interactive_shell_impl(
                 session_id=owner_session_id or new_owner_session_id(),
                 capabilities=(
                     "download",
+                    "operation",
                     "task_control",
                     "task_query",
                     "history_query",
                     "shell_status",
+                    "network_status",
                 ),
             )
         )
@@ -383,10 +422,12 @@ def _build_interactive_shell_impl(
                 application_version=__version__,
                 capabilities=(
                     "download",
+                    "operation",
                     "task_query",
                     "task_control",
                     "history_query",
                     "shell_status",
+                    "network_status",
                 ),
                 scope_fingerprint=owner_lease.scope.scope_fingerprint,
             ),
@@ -399,6 +440,12 @@ def _build_interactive_shell_impl(
                 notify_tasks=shell.notify_external_tasks,
                 is_shutting_down=shutdown_requested.is_set,
                 is_ready=startup_ready.is_set,
+                run_operation=run_operation,
+                network_snapshot=lambda: {
+                    "owner_available": True,
+                    "sites": list(shell_download_limiter.requests.snapshot()),
+                    "coverage": runtime.to_dict()["network_control"],
+                },
             ),
         )
         owner_server.start()
@@ -462,6 +509,8 @@ def _handle_owner_request(
     notify_tasks: Callable[[], None] | None = None,
     is_shutting_down: Callable[[], bool] | None = None,
     is_ready: Callable[[], bool] | None = None,
+    run_operation: Callable | None = None,
+    network_snapshot: Callable | None = None,
 ) -> None:
     """Run one externally submitted download inside the Shell owner.
 
@@ -474,6 +523,24 @@ def _handle_owner_request(
         raise OwnerError("Shell is stopping and is not accepting new commands")
     if is_ready is not None and not is_ready():
         raise OwnerError("Shell is recovering and is not accepting commands yet")
+    if request.command is OwnerCommand.SHELL_STATUS and network_snapshot is not None:
+        emit(
+            OwnerResponseEvent.terminal(
+                request.request_id,
+                1,
+                status=OwnerTerminalStatus.COMPLETED,
+                result=network_snapshot(),
+                exit_code=0,
+            )
+        )
+        return
+    if request.command is OwnerCommand.OPERATION:
+        if run_operation is None:
+            raise ValueError("Owner does not support plugin operations")
+        handle_operation(
+            request, emit, owner_session_id=owner_session_id, run_operation=run_operation
+        )
+        return
     if request.command is OwnerCommand.TASK_CONTROL:
         _handle_owner_control(
             request,

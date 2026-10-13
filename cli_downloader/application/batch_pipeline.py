@@ -176,6 +176,7 @@ class _TaskControl:
 
     async def wait_if_paused(self) -> None:
         if self.is_shutdown_requested():
+            await suspend_current_request()
             if self.pause_boundary is not None:
                 await self.pause_boundary()
             raise OwnerShutdownRequested
@@ -187,7 +188,7 @@ class _TaskControl:
         if not paused_targets or self.is_set():
             return
 
-        suspend_current_request()
+        await suspend_current_request()
         if self.pause_boundary is not None:
             await self.pause_boundary()
         for target_id in paused_targets:
@@ -286,6 +287,31 @@ class _SemaphoreLeaseController:
     async def detach(self) -> None:
         self._detached = True
         await self.release()
+
+
+async def _acquire_with_control(controller, control: _TaskControl) -> None:
+    """Queue waits are interruptible boundaries, not active download work."""
+    while True:
+        await control.wait_if_paused()
+        if control.is_set():
+            raise asyncio.CancelledError
+        pending = asyncio.create_task(controller.acquire())
+        try:
+            while not pending.done():
+                if control.is_paused() or control.is_set() or control.is_shutdown_requested():
+                    pending.cancel()
+                    await asyncio.gather(pending, return_exceptions=True)
+                    await controller.release()
+                    break
+                await asyncio.wait({pending}, timeout=0.05)
+            else:
+                await pending
+                return
+        except BaseException:
+            pending.cancel()
+            await asyncio.gather(pending, return_exceptions=True)
+            await controller.release()
+            raise
 
 
 def _compose_pause_boundaries(
@@ -798,7 +824,7 @@ class BatchPipeline:
         )
         slot_controller = _SemaphoreLeaseController(*resolution_slots)
         try:
-            await slot_controller.acquire()
+            await _acquire_with_control(slot_controller, control)
             pause_boundary, resume_boundary = _compose_pause_boundaries((slot_controller,))
             control = replace(
                 control,
@@ -934,7 +960,14 @@ class BatchPipeline:
             child_id=child.child_id,
             asset_count=len(package.assets),
         )
-        await self._put_download(state, download_queue, child)
+        # The package is durable and all parsing/request permits are released.
+        # Backpressure can keep this worker waiting for a paused download queue;
+        # it is already safe and must not block the parent's pause acknowledgement.
+        _mark_worker_boundary(state, parent_id, worker_id, True)
+        try:
+            await self._put_download(state, download_queue, child)
+        finally:
+            _mark_worker_boundary(state, parent_id, worker_id, False)
 
     async def _resolve_package(
         self,
@@ -1021,7 +1054,7 @@ class BatchPipeline:
                 cancelled=control.is_set,
             )
             try:
-                await lease_controller.acquire()
+                await _acquire_with_control(lease_controller, control)
             except asyncio.CancelledError:
                 if control.is_shutdown_requested():
                     return
@@ -1045,7 +1078,7 @@ class BatchPipeline:
             )
         )
         try:
-            await slot_controller.acquire()
+            await _acquire_with_control(slot_controller, control)
         except BaseException:
             for controller in reversed(controllers):
                 await controller.release()

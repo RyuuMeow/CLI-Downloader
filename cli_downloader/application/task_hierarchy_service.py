@@ -40,7 +40,7 @@ from cli_downloader.storage.task_store import (
 )
 
 
-SchedulerProjection = dict[tuple[str, int | None], dict[str, object]]
+SchedulerProjection = dict[tuple[str, int | str | None], dict[str, object]]
 
 
 _STANDALONE_STATES = {
@@ -649,6 +649,11 @@ class TaskHierarchyService:
             "scheduler_waiting_reason",
             "scheduler_queue_position",
             "scheduler_site_id",
+            "network_wait_reason",
+            "network_phase",
+            "network_retry_at",
+            "network_in_flight",
+            "network_limit",
         ):
             if key in node.details:
                 compact_details[key] = node.details[key]
@@ -735,6 +740,9 @@ class TaskHierarchyService:
         details.update(
             self._scheduler_detail(summary.parent_id, sequence=sequence, projection=scheduler)
         )
+        if scheduler is not None:
+            network_task = details.get("child_id", summary.task_id)
+            details.update(scheduler.get((network_task, "network"), {}))
         return BatchChildSummary(
             task_id=summary.task_id,
             parent_id=summary.parent_id,
@@ -776,6 +784,9 @@ class TaskHierarchyService:
                 "attempt_count": len(self._batch_store.list_attempts(child.child_id)),
                 **self._scheduler_detail(entry.parent_id, sequence=self._entry_sequence(entry)),
             }
+        scheduler = self._scheduler_projection()
+        network_task = child.child_id if child is not None else entry.entry_id
+        details.update(scheduler.get((network_task, "network"), {}))
         failure = entry.failure or (child.failure if child is not None else None)
         if failure is not None:
             details["failure"] = failure.to_dict()
@@ -969,8 +980,23 @@ class TaskHierarchyService:
                         scheduler_waiting_reason=row.get("reason"),
                         scheduler_queue_position=row.get("position"),
                     )
-                projection.setdefault((row["root_id"], None), details)
+                projection.setdefault((row["root_id"], None), dict(details))
                 projection.setdefault((row["root_id"], row.get("sequence")), details)
+        requests = getattr(self._scheduler, "requests", None)
+        if requests is not None:
+            for site in requests.snapshot():
+                for waiting in site["waiting"]:
+                    details = {
+                        "network_wait_reason": waiting["reason"],
+                        "network_phase": waiting["phase"],
+                        "network_retry_at": site["cooldown_until"],
+                        "network_in_flight": site["in_flight"],
+                        "network_limit": site["limit"],
+                    }
+                    root_key = (waiting["root_id"], None)
+                    projection.setdefault(root_key, {}).update(details)
+                    if waiting["task_id"] is not None:
+                        projection[(waiting["task_id"], "network")] = details
         return projection
 
     def _scheduler_detail(

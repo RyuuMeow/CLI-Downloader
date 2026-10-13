@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import UTC, datetime
 import json
 import os
 import re
@@ -2401,6 +2402,7 @@ class TextualShellApp(App[int]):
         )
         self.query_one("#settings-detail", Static).update(
             f"{field.key}\n{_setting_description(field, translator)}{constraints}"
+            + _network_settings_text(field, self._shell._runtime, translator)
         )
 
     def _apply_setting(self) -> None:
@@ -3104,9 +3106,7 @@ class TextualShellApp(App[int]):
             "type": tuple(_task_kind_label(node.kind, self._shell.translator) for node in nodes),
             "site": tuple(_display_name(node.site_id or "unknown") for node in nodes),
             "progress": tuple(_task_progress(node, self._shell.translator) for node in nodes),
-            "status": tuple(
-                _display_status(node.state.value, self._shell.translator) for node in nodes
-            ),
+            "status": tuple(_task_status_label(node, self._shell.translator) for node in nodes),
             "created": tuple(_short_datetime(node.details.get("created_at")) for node in nodes),
         }
         fixed_widths: dict[str, int] = {}
@@ -3253,7 +3253,7 @@ class TextualShellApp(App[int]):
                     Text(node.title, overflow="ellipsis", no_wrap=True),
                     _display_name(node.site_id or "unknown"),
                     _task_progress(node, self._shell.translator),
-                    _display_status(node.state.value, self._shell.translator),
+                    _task_status_label(node, self._shell.translator),
                     _short_datetime(node.details.get("created_at")),
                     key=node.task_id,
                 )
@@ -3270,7 +3270,7 @@ class TextualShellApp(App[int]):
                     "name": Text(node.title, overflow="ellipsis", no_wrap=True),
                     "site": _display_name(node.site_id or "unknown"),
                     "progress": _task_progress(node, self._shell.translator),
-                    "status": _display_status(node.state.value, self._shell.translator),
+                    "status": _task_status_label(node, self._shell.translator),
                     "created": _short_datetime(node.details.get("created_at")),
                 }
                 for column, value in values.items():
@@ -3345,7 +3345,7 @@ class TextualShellApp(App[int]):
         lines = [
             f"[N] {self._shell.translator('task.detail.name'):<10} {node.title}",
             f"[S] {self._shell.translator('task.detail.status'):<10} "
-            f"{_display_status(node.state.value, self._shell.translator)}",
+            f"{_task_status_label(node, self._shell.translator)}",
             f"[#] {self._shell.translator('task.detail.progress'):<10} "
             f"{_task_progress(node, self._shell.translator)}",
             f"[W] {self._shell.translator('task.detail.website'):<10} "
@@ -3361,6 +3361,10 @@ class TextualShellApp(App[int]):
                     if isinstance(node.details.get("scheduler_queue_position"), int)
                     else ""
                 )
+            )
+        if node.details.get("network_wait_reason"):
+            lines.append(
+                f"[HTTP] {node.details.get('network_in_flight', 0)}/{node.details.get('network_limit', '?')} · {node.details.get('network_phase', '')}"
             )
         failure = node.details.get("failure")
         if isinstance(failure, Mapping):
@@ -3413,7 +3417,7 @@ class TextualShellApp(App[int]):
         }
         pause.display = allow_lifecycle_control and not pause.disabled
         resume = self.query_one("#task-resume", Button)
-        resume.disabled = state is not TaskState.PAUSED
+        resume.disabled = state not in {TaskState.PAUSING, TaskState.PAUSED}
         resume.display = allow_lifecycle_control and not resume.disabled
         cancel = self.query_one("#task-cancel", Button)
         cancel.disabled = state not in {
@@ -4157,6 +4161,60 @@ def _display_status(value: str, translator: TranslationService | None = None) ->
         "cancelled": "Cancelled",
         "package_ready": "Ready",
     }.get(value, _display_name(value))
+
+
+def _network_settings_text(field, runtime, translator):
+    if not (field.key.startswith("network.") or ".network." in field.key):
+        return ""
+    lines = [translator("settings.network.restart")]
+    if runtime is None or runtime.request_limiter is None:
+        return "\n" + "\n".join(lines)
+    from cli_downloader.core.http import has_managed_http
+
+    for entry in runtime.plugins_by_id.values():
+        if field.key.startswith("plugins.") and not field.key.startswith(
+            f"plugins.{entry.plugin_id}."
+        ):
+            continue
+        policy = runtime.request_limiter.requests.policy(entry.site_id)
+        source = (
+            f"plugins.{entry.plugin_id}.network"
+            if entry.manifest.network is not None
+            else "network"
+        )
+        coverage = translator(
+            "settings.network.request_level"
+            if has_managed_http(entry.instance)
+            else "settings.network.operation_level"
+        )
+        lines.append(
+            translator(
+                "settings.network.effective",
+                site=entry.site_id,
+                limit=policy.max_concurrency,
+                interval=policy.min_interval_seconds,
+                source=source,
+                coverage=coverage,
+            )
+        )
+    return "\n" + "\n".join(lines)
+
+
+def _task_status_label(node, translator):
+    status = _display_status(node.state.value, translator)
+    reason = node.details.get("network_wait_reason")
+    if isinstance(reason, str) and node.state.value in {"preparing", "running", "queued"}:
+        status += " · " + translator(f"task.queue.{reason}")
+        retry_at = node.details.get("network_retry_at")
+        if isinstance(retry_at, str):
+            try:
+                remaining = max(
+                    0, int((datetime.fromisoformat(retry_at) - datetime.now(UTC)).total_seconds())
+                )
+                status += f" ({remaining}s)"
+            except ValueError:
+                pass
+    return status
 
 
 def _scheduler_waiting_label(

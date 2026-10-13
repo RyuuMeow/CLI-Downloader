@@ -18,6 +18,9 @@ from cli_downloader.application.batch_pipeline import (
 )
 from cli_downloader.application.execution_control import OwnerShutdownRequested
 from cli_downloader.application.download_limiter import GalleryDownloadLimiter
+from cli_downloader.application.plugin_network import invoke_plugin_network, checkpoint_control
+from cli_downloader.application.site_request_coordinator import RequestContext, request_context
+from cli_downloader.core.http import closing_stream, has_managed_http, restart_interrupted_download
 from cli_downloader.core.batch import (
     AssetRecord,
     AssetStatus,
@@ -533,20 +536,27 @@ class RuntimePackageResolver(BatchPackageResolver):
                 )
             )
 
-        item = (
-            await self._request_limiter.request(
-                entry.site_id,
-                resolve_item,
-                report_retry=lambda payload: progress("request_rate_limited", payload),
-            )
-            if self._request_limiter is not None
-            else await resolve_item()
+        context = RequestContext(
+            entry.parent_id,
+            "prepare",
+            task_id=entry.entry_id,
+            profile=self._profile,
+            checkpoint=lambda: checkpoint_control(cancel_event),
+        )
+        item = await invoke_plugin_network(
+            instance, self._request_limiter, entry.site_id, resolve_item, context=context
         )
         progress("gallery_resolved", {"candidate_id": entry.candidate_id})
         await _wait_if_paused(cancel_event)
         if cancel_event.is_set():
             raise asyncio.CancelledError
-        plan = await instance.choose_strategy(item)
+        plan = await invoke_plugin_network(
+            instance,
+            self._request_limiter,
+            entry.site_id,
+            lambda: instance.choose_strategy(item),
+            context=context,
+        )
         gallery_id = _gallery_id(item.metadata, entry.candidate_id)
         assets = tuple(
             DownloadAsset(
@@ -621,7 +631,20 @@ class SystemBatchDownloader(BatchDownloadExecutor):
         self._torrent_client = torrent_client
         self._auto_delete_torrent_file = auto_delete_torrent_file
 
-    async def execute(
+    async def execute(self, child, assets, cancel_event, progress):
+        with request_context(
+            RequestContext(
+                child.parent_id,
+                "download",
+                task_id=child.child_id,
+                checkpoint=lambda: checkpoint_control(cancel_event),
+                release_item=getattr(cancel_event, "pause_boundary", None),
+                resume_item=getattr(cancel_event, "resume_boundary", None),
+            )
+        ):
+            return await self._execute(child, assets, cancel_event, progress)
+
+    async def _execute(
         self,
         child: DownloadChild,
         assets: tuple[AssetRecord, ...],
@@ -699,33 +722,38 @@ class SystemBatchDownloader(BatchDownloadExecutor):
                     bytes_so_far = 0
                     last_report_time = 0.0
                     try:
-                        async for chunk, total in fetcher.fetch_stream(legacy_asset):
-                            if callable(wait_if_paused):
-                                await wait_if_paused()
-                            hash_obj.update(chunk)
-                            bytes_so_far += len(chunk)
-                            now = time.monotonic()
-                            if (
-                                total is None
-                                or bytes_so_far == total
-                                or now - last_report_time > 0.1
-                            ):
-                                progress(
-                                    "byte_progress",
-                                    {
-                                        "asset_id": record.asset.asset_id,
-                                        "bytes_received": bytes_so_far,
-                                        "total_bytes": total,
-                                    },
-                                )
-                                last_report_time = now
-                            yield chunk
+                        async with closing_stream(fetcher.fetch_stream(legacy_asset)) as chunks:
+                            async for chunk, total in chunks:
+                                if callable(wait_if_paused):
+                                    await wait_if_paused()
+                                if cancel_event.is_set():
+                                    raise asyncio.CancelledError
+                                hash_obj.update(chunk)
+                                bytes_so_far += len(chunk)
+                                now = time.monotonic()
+                                if (
+                                    total is None
+                                    or bytes_so_far == total
+                                    or now - last_report_time > 0.1
+                                ):
+                                    progress(
+                                        "byte_progress",
+                                        {
+                                            "asset_id": record.asset.asset_id,
+                                            "bytes_received": bytes_so_far,
+                                            "total_bytes": total,
+                                        },
+                                    )
+                                    last_report_time = now
+                                yield chunk
                     except OwnerShutdownRequested:
                         raise
                     except Exception as e:
                         raise FetchErrorWrap() from e
 
                 async def fetch_and_write() -> WrittenAsset:
+                    nonlocal hash_obj
+                    hash_obj = sha256()
                     return await self._file_writer.write_stream(
                         legacy_asset,
                         _chunk_generator(),
@@ -738,11 +766,11 @@ class SystemBatchDownloader(BatchDownloadExecutor):
                     written = (
                         await self._request_limiter.request(
                             record.asset.site_id,
-                            fetch_and_write,
+                            lambda: restart_interrupted_download(fetch_and_write),
                             report_retry=lambda payload: progress("request_rate_limited", payload),
                         )
-                        if self._request_limiter is not None
-                        else await fetch_and_write()
+                        if self._request_limiter is not None and not has_managed_http(fetcher)
+                        else await restart_interrupted_download(fetch_and_write)
                     )
                     digest = hash_obj.hexdigest()
                 except OwnerShutdownRequested:
@@ -796,7 +824,7 @@ class SystemBatchDownloader(BatchDownloadExecutor):
                             fetch_asset,
                             report_retry=lambda payload: progress("request_rate_limited", payload),
                         )
-                        if self._request_limiter is not None
+                        if self._request_limiter is not None and not has_managed_http(fetcher)
                         else await fetch_asset()
                     )
                 except Exception as error:

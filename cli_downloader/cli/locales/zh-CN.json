@@ -253,8 +253,8 @@
   "settings.description.url": "qBittorrent Web API 基础 URL。",
   "settings.description.username": "qBittorrent Web UI 用户名。",
   "settings.description.password": "qBittorrent Web UI 密码（存储于 secrets.toml）。",
-  "settings.description.max_concurrent_requests": "每个网站的备用最大同时请求数。",
-  "settings.description.min_request_interval_seconds": "网站请求的备用最小延迟。",
+  "settings.description.max_concurrent_requests": "每站共用的备用上限，包含准备、列清单及下载；已接入的插件逐次计算 HTTP 请求。",
+  "settings.description.min_request_interval_seconds": "同站相邻请求开始时间的最小间隔备用值，准备、列清单及下载共用。",
   "settings.description.max_attempts": "可重试请求的备用最大尝试次数。",
   "settings.description.auto_delete_on_complete": "下载成功完成后自动删除任务记录。",
   "settings.description.max_backoff_seconds": "没有 Retry-After 时的备用最大冷却时间。",
@@ -320,5 +320,12 @@
   "cli.no_cancellable_tasks": "找不到可取消的任务。",
   "cli.cancelled_tasks": "已取消 {count} 个任务。",
   "cli.error_count": "发生 {count} 个错误。",
-  "cli.cancelled_task": "已取消任务：{task_id}"
+  "cli.cancelled_task": "已取消任务：{task_id}",
+  "task.queue.request_capacity": "等待 HTTP 请求名额",
+  "task.queue.request_interval": "等待请求间隔",
+  "task.queue.site_cooldown": "网站冷却中",
+  "settings.network.restart": "网络限制变更会在重启 Shell 后生效；网站专属设置会覆盖全局备用值。",
+  "settings.network.request_level": "逐次请求限流",
+  "settings.network.operation_level": "操作层级限流（插件内部请求未验证）",
+  "settings.network.effective": "{site}：同时 {limit} 个、开始间隔 {interval} 秒 · {source} · {coverage}"
 }

@@ -66,6 +66,7 @@ from cli_downloader.storage.file_writer import AssetFileWriter
 from cli_downloader.storage.sqlite_completion_store import SQLiteCompletionStore
 from cli_downloader.storage.state_batch_store import StateBatchStore
 from cli_downloader.storage.state_database import StateDatabase
+from cli_downloader.storage.site_cooldown_store import SiteCooldownStore
 from cli_downloader.storage.state_history_store import StateHistoryStore
 from cli_downloader.storage.state_task_store import StateTaskStore
 from cli_downloader.storage.paths import StorageLayout
@@ -87,6 +88,8 @@ def _build_download_limiter(
     runtime: ApplicationRuntime,
     values: Mapping[str, object],
 ) -> GalleryDownloadLimiter:
+    if runtime.request_limiter is not None:
+        return runtime.request_limiter
     fallback = RequestPolicy(
         max_concurrency=int(values["network.max_concurrent_requests"]),
         min_interval_seconds=float(values["network.min_request_interval_seconds"]),
@@ -106,7 +109,7 @@ def _build_download_limiter(
             max_attempts=int(values[f"{prefix}max_attempts"]),
             max_backoff_seconds=float(values[f"{prefix}max_backoff_seconds"]),
         )
-    return GalleryDownloadLimiter(
+    limiter = GalleryDownloadLimiter(
         int(
             values.get(
                 "scheduler.max_concurrent_downloads", values["download.max_concurrent_galleries"]
@@ -125,6 +128,8 @@ def _build_download_limiter(
             )
         ),
     )
+    runtime.bind_http_services(limiter)
+    return limiter
 
 
 def _configured_file_writer(
@@ -212,6 +217,8 @@ def _run_batch_retry(
         )
     completion_store = SQLiteCompletionStore(StateDatabase(layout.state_db))
     download_limiter = download_limiter or _build_download_limiter(runtime, config.values)
+    runtime.bind_http_services(download_limiter)
+    download_limiter.requests.bind_cooldown_store(SiteCooldownStore(store.database))
     resolver = RuntimePackageResolver(
         runtime,
         profile=profile,
@@ -377,6 +384,10 @@ def _run_generic_download(
     download_limiter = download_limiter or _build_download_limiter(
         runtime,
         loaded_config.values,
+    )
+    runtime.bind_http_services(download_limiter)
+    download_limiter.requests.bind_cooldown_store(
+        SiteCooldownStore(StateDatabase(StorageLayout.from_app_paths(environment.paths).state_db))
     )
     entry = runtime.entry_for_url(url)
     dispatcher = OperationDispatcher(
@@ -1005,6 +1016,8 @@ def _run_selected_list_batch(
     loaded_config = ConfigLoader(paths=environment.paths, registry=runtime.settings_registry).load()
     runtime.configure_plugins(loaded_config.values, loaded_config.secrets)
     download_limiter = download_limiter or _build_download_limiter(runtime, loaded_config.values)
+    runtime.bind_http_services(download_limiter)
+    download_limiter.requests.bind_cooldown_store(SiteCooldownStore(store.database))
     fetchers = dict(runtime.asset_fetchers_by_site_id)
     override_instances = {}
     resolver = RuntimePackageResolver(

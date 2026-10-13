@@ -102,3 +102,49 @@ class ShellTaskPagingTests(IsolatedAsyncioTestCase):
                 await self.wait_for(lambda: app._task_refresh_thread is None)
             finally:
                 service.release.set()
+
+    async def test_pausing_roots_can_resume_without_starting_another_worker(self):
+        from dataclasses import replace
+        from unittest.mock import Mock
+        from textual.widgets import Button
+
+        service = PagedService()
+        service.items = tuple(
+            TaskRootSummary(kind.value, kind, TaskState.PAUSING, kind.value, TaskProgress())
+            for kind in (TaskKind.ITEM, TaskKind.BATCH)
+        )
+        resumed = []
+
+        def resume(task_id):
+            resumed.append(task_id)
+            service.items = tuple(
+                replace(row, state=TaskState.RUNNING) if row.task_id == task_id else row
+                for row in service.items
+            )
+
+        service.resume = resume
+        service.is_running = lambda _: True
+        service.is_batch_running = lambda _: True
+        background = Mock()
+        app = TextualShellApp(
+            InteractiveShell(
+                task_service_loader=lambda: service,
+                background_runner=background,
+            )
+        )
+        async with app.run_test(size=(100, 35)) as pilot:
+            app.query_one(TabbedContent).active = "tasks"
+            await self.wait_for(lambda: len(app._task_nodes) == 2)
+            await pilot.pause()
+            for task_id in ("item", "batch"):
+                app._active_task_id = task_id
+                app._set_task_actions(service.get(task_id))
+                button = app.query_one("#task-resume", Button)
+                self.assertTrue(button.display)
+                self.assertFalse(button.disabled)
+                await pilot.pause()
+                await pilot.click("#task-resume")
+                await self.wait_for(lambda: task_id in resumed)
+                await self.wait_for(lambda: app._task_nodes[task_id].state is TaskState.RUNNING)
+            self.assertEqual(resumed, ["item", "batch"])
+            background.assert_not_called()

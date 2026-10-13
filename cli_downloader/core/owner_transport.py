@@ -519,6 +519,11 @@ class OwnerPipeClient:
                     ),
                     None,
                 )
+                if task_id is None:
+                    raise OwnerTransportError(
+                        f"request {request.request_id} was accepted but its completion is unknown; "
+                        "do not automatically resubmit the operation"
+                    ) from error
                 owner_session_id = next(
                     (
                         event.payload.get("owner_session_id")

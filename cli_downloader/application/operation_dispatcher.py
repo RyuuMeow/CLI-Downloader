@@ -16,6 +16,8 @@ from cli_downloader.core.operations import (
     RouteMatch,
 )
 from cli_downloader.plugins.runtime import ApplicationRuntime, RuntimePlugin
+from cli_downloader.application.plugin_network import invoke_plugin_network
+from cli_downloader.application.site_request_coordinator import RequestContext
 from cli_downloader.sites.manifest import OperationSchema, ParameterSchema
 
 
@@ -118,14 +120,24 @@ class OperationDispatcher:
                 "Plugin does not provide execute(request)",
             )
         try:
-            pending_result = execute(request)
-            if not inspect.isawaitable(pending_result):
-                return _error_result(
-                    request_id,
-                    "invalid_plugin_contract",
-                    "Plugin execute(request) must be asynchronous",
-                )
-            result = await pending_result
+
+            async def execute_operation():
+                pending_result = execute(request)
+                if not inspect.isawaitable(pending_result):
+                    return _error_result(
+                        request_id,
+                        "invalid_plugin_contract",
+                        "Plugin execute(request) must be asynchronous",
+                    )
+                return await pending_result
+
+            result = await invoke_plugin_network(
+                entry.instance,
+                getattr(self._runtime, "request_limiter", None),
+                entry.site_id,
+                execute_operation,
+                context=RequestContext(request_id, "list", profile=profile),
+            )
         except Exception as error:
             return _error_result(
                 request_id,
@@ -278,14 +290,24 @@ class OperationDispatcher:
                 "Plugin does not provide execute(request)",
             )
         try:
-            pending_result = execute(request)
-            if not inspect.isawaitable(pending_result):
-                return _error_result(
-                    request_id,
-                    "invalid_plugin_contract",
-                    "Plugin execute(request) must be asynchronous",
-                )
-            result = await pending_result
+
+            async def execute_operation():
+                pending_result = execute(request)
+                if not inspect.isawaitable(pending_result):
+                    return _error_result(
+                        request_id,
+                        "invalid_plugin_contract",
+                        "Plugin execute(request) must be asynchronous",
+                    )
+                return await pending_result
+
+            result = await invoke_plugin_network(
+                entry.instance,
+                getattr(self._runtime, "request_limiter", None),
+                entry.site_id,
+                execute_operation,
+                context=RequestContext(request_id, "list", profile=profile),
+            )
         except Exception as error:
             return _error_result(
                 request_id,
