@@ -137,6 +137,28 @@ clid download <url> --dry-run
 clid download <url>
 ```
 
+命令行中的列表或 Batch 网址如果未指定 `--select`，会下载该 operation 返回的全部项目；可重复
+使用 `--select <item-id>` 将 Batch 限制为指定子集。交互式 Shell 仍会显示插件提供的选择页面。
+
+如果由 Agent 协助操作，请让下载留在用户可见的 Shell owner 中：
+
+```powershell
+clid shell status --json
+clid shell ensure --visible --wait-ready --json
+clid download <url> --dry-run --json
+clid download <url> --detach --json
+clid tasks show <task-id>
+clid tasks pause <task-id>
+clid tasks resume <task-id>
+```
+
+`--detach` 只表示任务已经持久化接受，并不代表下载最终成功。如果 owner 中断，请先查询
+原有 Task 和 History，再决定是否使用相同 request 重试，不要创建替代 Task。完整的授权与
+owner 流程请参考 [Agent Skill 指南](skills/cli-downloader/README.md)。
+
+如果可见的 Shell 在仍有未完成工作时关闭，会先显示警告、停止接受新命令，并留下可由下次
+Shell 启动时恢复的检查点。
+
 ## AI 代理技能 (Agent Skill)
 
 此项目包含一个开箱即用的 Agent Skill（位于 `skills/cli-downloader`）。用它来强化你的 AI 助手（例如 Claude Code 或 Codex）。

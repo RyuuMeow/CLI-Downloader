@@ -6,10 +6,27 @@ from unittest import TestCase
 from cli_downloader.application.task_hierarchy_service import TaskHierarchyService
 from cli_downloader.core.batch import BatchEntry, BatchParent
 from cli_downloader.core.task_tree import TaskKind, TaskState
-from cli_downloader.storage.task_store import TaskRecord, TaskStatus
+from cli_downloader.storage.task_store import TaskDesiredControl, TaskRecord, TaskStatus
 
 
 class TaskStateTests(TestCase):
+    def test_running_pause_intent_projects_as_pausing(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            tasks = StateTaskStore(root / "state.sqlite3")
+            batches = StateBatchStore(root / "state.sqlite3")
+            tasks.upsert(
+                TaskRecord(
+                    "item-1",
+                    TaskStatus.RUNNING,
+                    desired_control=TaskDesiredControl.PAUSE,
+                )
+            )
+
+            node = TaskHierarchyService(task_store=tasks, batch_store=batches).get("item-1")
+
+            self.assertEqual(node.state, TaskState.PAUSING)
+
     def test_batch_root_state_comes_only_from_authoritative_task_record(self) -> None:
         with TemporaryDirectory() as directory:
             root = Path(directory)

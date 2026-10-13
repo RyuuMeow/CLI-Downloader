@@ -1,23 +1,23 @@
 # Development Plan
 
-Updated: 2026-07-15
+Updated: 2026-10-13
 
-This document contains active work only. Completed P2, P3, P4, and P5-02 through P5-10 tasks
-have been removed. The application is not released, so compatibility with removed legacy
-databases, imports, layouts, commands, and CLI argument forms remains out of scope.
+This document contains only current architectural boundaries and unfinished roadmap items.
+Completed implementation records belong in `CHANGELOG.md` and Git history. The current
+released baseline is v0.1.3; this branch includes those master fixes alongside the scheduler
+ownership refactor. Existing concurrency settings migrate to the canonical scheduler key.
 
 ## Active Order
 
-| Order | Task | Status | Depends on |
-| --- | --- | --- | --- |
-| 1 | P5-11 Define The Scheduler Owner And IPC Contract | Planned | - |
-| 2 | P5-12 Enforce One Download Owner Across Processes | Planned | P5-11 |
-| 3 | P5-13 Add Shell Status, Start, And Ensure Commands | Planned | P5-12 |
-| 4 | P5-18 Scale Tasks UI And Batch Projections | Planned | - |
-| 5 | P5-14 Forward Download Requests With Wait And Detach Modes | Planned | P5-12, P5-13, P5-18 |
-| 6 | P5-15 Route Task Control Through The Scheduler Owner | Planned | P5-14 |
-| 7 | P5-16 Harden IPC Recovery, Security, And Packaging | Planned | P5-12 through P5-15 |
-| 8 | P5-17 Add The Agent-Control Workflow And End-To-End Verification | Planned | P5-13 through P5-16 |
+Queue/state/performance integration is complete on `fix/queue-state-performance`:
+master release fixes are merged, per-task runtime routing and shared scheduling are in place,
+and Tasks roots/children use bounded read projections. Regression coverage includes cross-loop
+admission, older-Batch controls, request-permit release, root paging, refresh coalescing,
+and delayed table events. `Scripts/Verify.ps1 -NoVenvSetup` passed (Core/isolated tests,
+Ruff, compilation, diff checks and wheel build); the supplemental terminal-pause regression
+also passed with the queue, hierarchy and lifecycle suites.
+P5-18 through P5-24 are complete. P5-25 below is a proposed design for unified site
+request control; implementation has not started. P6-01 remains deferred.
 
 ## Direction And Boundaries
 
@@ -27,451 +27,558 @@ databases, imports, layouts, commands, and CLI argument forms remains out of sco
   Plugins classify and resolve site content and may declare site policy metadata, but they do not
   create private worker pools that bypass Core scheduling.
 - The Scheduler decides which Item may execute. The Network limiter separately controls request
-  concurrency, pacing, retry, and backoff. A torrent client owns its own long-running transfer
-  queue after Core submits a torrent successfully.
+  concurrency, pacing, retry, and backoff. A torrent client owns its long-running transfer queue
+  after Core submits a torrent successfully.
 - User-facing progress keeps file counts, byte counts, and percentages as separate typed values.
-  Display code may defensively clamp values, but invalid client metrics must first be normalised at
-  the integration boundary before they are persisted.
-- Human-readable CLI syntax should use positional resource identifiers after an explicit action.
-  Internal task correlation must use application context rather than hidden public CLI arguments.
-- `pyproject.toml` remains the single version source. `CHANGELOG.md` owns curated release notes,
+  Invalid client metrics are normalised at the integration boundary before persistence.
+- Human-readable CLI syntax uses positional resource identifiers after an explicit action.
+  Internal task correlation uses application context rather than hidden public CLI arguments.
+- `pyproject.toml` is the single version source. `CHANGELOG.md` owns curated release notes,
   while Git tags trigger verified packaging and publication.
 - Exactly one process per user data root may own live download execution. The owner may be the
   interactive Shell or one foreground CLI command, but never both at the same time.
 - The interactive Shell is the preferred long-lived Scheduler owner. External `clid` processes
-  use a local, current-user-only IPC channel to submit typed commands instead of constructing a
-  second in-memory Scheduler.
-- IPC changes where a command executes, not its public wait contract. A normal foreground command
-  waits for its terminal result; `--detach` returns only after durable acceptance by an active
-  Shell owner.
-- Waiting through IPC must never mean waiting forever for a dead owner. Connection, handshake,
-  acknowledgement, and liveness deadlines are bounded independently from the optional overall
-  download timeout.
-- Tasks list projections are read models, not full execution graphs. A Batch row must not expand
-  all children, assets, attempts, or filesystem state merely to render summary progress.
+  use a local, current-user-only IPC channel to submit typed commands.
+- IPC changes where a command executes, not its wait contract. A normal command waits for its
+  terminal result; `--detach` returns after durable acceptance by an active Shell owner.
+- IPC connection, handshake, acknowledgement, and liveness deadlines remain bounded so a dead
+  owner cannot leave a client waiting indefinitely.
+- Tasks list projections are bounded read models, not full execution graphs. A Batch row does not
+  expand all children, assets, attempts, or filesystem state merely to render summary progress.
+- Command-line Batch URLs default to all items returned by the operation; repeated `--select`
+  values restrict the Batch to a subset. The Shell remains the interactive selection surface.
+- Tasks and History remain independent: deleting a Task does not delete its durable History.
 
-## P5-11 Define The Scheduler Owner And IPC Contract
+## P5-18 Lock The Pause Contract With Cross-Root Reproductions
 
 ### Status
 
-Planned.
+Completed. Investigation confirmed that the reported behavior was an execution-boundary defect,
+plus an unsafe cross-thread control path rather than an IPC routing failure:
 
-### Scope
+- Owner IPC calls the same `TaskHierarchyService.pause()` path as the Shell, but returns a
+  successful terminal response after persisting pause intent. It does not wait for the Pipeline's
+  later safe-boundary acknowledgement.
+- Batch controls were also being called directly from Textual/IPC threads, mutating asyncio state
+  (`paused_ids`, resume/cancel Events, and pipeline state) outside the owning event loop. This was
+  the direct cause of intermittent pause acknowledgement and unreleased queue capacity.
 
-- Introduce a platform-neutral Scheduler-owner boundary with a Windows implementation based on a
-  per-user ownership primitive and a local command channel. Keep Windows naming and process APIs
-  out of application services.
-- Scope owner identity to the resolved CLI-Downloader user data root so production, Portable,
-  development, and isolated-test stores cannot accidentally control one another.
-- Define owner modes for `shell` and `foreground`, plus lifecycle states for `starting`,
-  `recovering`, `ready`, `stopping`, `busy`, and `incompatible`.
-- Define a versioned, length-bounded IPC envelope containing protocol version, request ID, source,
-  command kind, typed arguments, response mode, timestamps, and structured error information.
-- Use an explicit command enum and validated payload models. Never send a raw Shell command,
-  arbitrary Python target, secret configuration value, cookie, or executable string across IPC.
-- Define capability negotiation so an older client can distinguish unsupported commands from an
-  unavailable or incompatible owner.
-- Deduplicate retries by request ID. Reconnecting after an uncertain acknowledgement must return
-  the existing accepted result rather than create a second Task.
-- Define a streamed response lifecycle with `accepted`, progress or control events, heartbeat,
-  and exactly one terminal result. Heartbeats prove owner liveness; they are not persisted as Task
-  progress and do not extend connection or acknowledgement deadlines.
-- Separate short connection, handshake, acknowledgement, and response-idle deadlines from the
-  overall command duration. A valid download may run for hours without a default total timeout,
-  but a client must detect a broken or silent owner within a bounded liveness window.
-- Define `owner_disconnected` with the request ID, known Task ID, last owner session, and an outcome
-  of either `not_accepted`, `accepted_completion_unknown`, or `terminal_result_lost`. A waiting
-  client exits nonzero instead of hanging, silently becoming the new owner, or resubmitting work.
-- Keep client cancellation distinct from owner loss. Closing a waiting terminal does not cancel
-  Shell-owned work; explicit Ctrl+C follows the typed cancellation contract and reports when its
-  delivery or acknowledgement is uncertain.
+The reproduction suites in `tests/test_pause_contract.py`, `tests/test_batch_execution_runner.py`,
+and `tests/test_download_service.py` now cover active-root pause, waiting-root pause, lease release,
+stream boundaries, and controls issued from a foreign thread. The remaining direct, torrent,
+terminal-race, and applied-control details are tracked by P5-20 and P5-21.
 
-### Command Behavior Matrix
+### Contract And Reproduction Tests
 
-| Shell owner | Command | Required result |
+- Define pause request and pause application as distinct phases. Persisted `desired_control=pause`
+  with a running status projects as `Pausing`; only the quiescent acknowledgement projects as
+  `Paused`.
+- Define the quiescent invariant: once a Task is `Paused`, it performs no new plugin resolution,
+  HTTP reads, filesystem publication, or child state advancement; Core holds no Item Scheduler,
+  download, or site-admission lease for that root; a submitted torrent is paused in its client.
+- Add a deterministic two-root test with global concurrency `1`: root A is active, root B is
+  queued, pausing A must let B start before A is resumed.
+- Add the inverse race: pause a root while it is waiting for a slot and prove it cannot acquire the
+  slot after another task releases it.
+- Cover pause during resolution, Scheduler acquisition, direct streaming, between assets, torrent
+  polling, and immediately before terminal completion.
+- Inspect Scheduler active leases in tests through a bounded diagnostic snapshot rather than
+  private timing sleeps.
+
+### Acceptance Criteria
+
+- The cross-root tests encode the documented defects and pass once P5-19 admission and lease
+  unwinding are active.
+- Tests distinguish `Pausing` from `Paused` and never treat persisted intent as resource release.
+- The reproduction is independent of Textual timing and exercises the same Pipeline control path
+  that Owner dispatch invokes; transport-level control coverage remains in P5-21.
+
+## P5-19 Make Scheduler Admission Pause-Aware
+
+### Status
+
+Completed. Root suspension, pending-waiter eligibility, central Item lease release/reacquisition,
+standalone Item admission, and Batch resolution/download semaphore release checkpoints are
+implemented and covered by deterministic cross-root tests.
+
+### Scheduler Ownership
+
+- Add root-level suspend/resume semantics to the central Item Scheduler. Suspended roots retain
+  their deterministic sequence and fairness metadata but are ineligible for new grants.
+- Make pause atomically prevent pending waiters from receiving a lease. Resume makes the root
+  eligible again without inserting duplicate waiters or moving it ahead of older work.
+- Make active workers unwind and release their Item lease at a declared checkpoint before pause is
+  acknowledged. Reacquisition after resume goes through the normal FIFO/Round Robin and per-site
+  policy; resume does not restore a private slot.
+- Make cancellation remove suspended/pending admissions and keep lease release idempotent across
+  pause/resume/cancel races.
+- Use the same suspension model for standalone Items and Batch children so one execution path
+  cannot bypass the other.
+
+### Remove Duplicate Admission Ownership
+
+- Keep Batch worker counts and bounded queues as pipeline backpressure, not as a second download
+  scheduler.
+- Remove or narrow Batch download/site semaphores that duplicate the central global/per-site Item
+  policy. No worker may block on pause while holding a legacy admission semaphore.
+- Keep resolution concurrency separate from Item download concurrency, but stop admitting new
+  resolution work for a suspended root and never wait for resume while holding a resolution permit.
+- Expose active and pending Scheduler snapshots by root so Tasks diagnostics and tests can prove
+  capacity release.
+
+### Acceptance Criteria
+
+- With one global slot, pausing the active root grants the slot to another eligible root.
+- Paused roots consume zero Item admission capacity and cannot acquire a site slot in the
+  background.
+- Resume preserves Batch child order and the selected FIFO/Round Robin fairness policy.
+- Repeated pause/resume and pause/cancel races leak no waiters, leases, or queue capacity.
+
+## P5-20 Add Quiescent Direct And Torrent Checkpoints
+
+### Status
+
+Completed. Batch direct streams now checkpoint each completed asset immediately, wait at chunk
+boundaries through the pause-aware control signal, and release both central and pipeline admission
+while paused. Successful Batch torrent submission invokes an admission-release callback so Core no
+longer occupies an Item slot during client polling. Standalone torrent polling releases its Item
+lease after the persisted client handle is known. Standalone and Batch completed direct outputs
+are now hash-verified during recovery; a mismatched or missing output is requeued in one atomic
+child/asset update. Deterministic qBittorrent-compatible restart tests cover downloading, paused,
+completed, missing, and client-error checkpoints without resubmitting accepted torrents.
+
+### Direct Downloads
+
+- Change the Batch executor contract from one opaque whole-child call to checkpointed asset
+  outcomes so completed assets are persisted before an unfinished child yields its lease.
+- Check pause during streamed reads as well as between assets. Close the active response and writer
+  at a controlled boundary, persist an unfinished checkpoint, unwind admission leases, and only
+  then acknowledge pause.
+- Define partial-file integrity explicitly. Range-capable fetchers may resume from a verified
+  offset; unsupported fetchers restart the unfinished asset safely. A partial file and its own
+  prefix hash must never be promoted as if it were a complete asset.
+- Keep completed assets completed across resume and do not duplicate output paths, History rows,
+  progress, or Completion identities.
+- Apply the same checkpoint/lease behavior to standalone Item downloads instead of retaining an
+  Item lease while `_wait_until_runnable()` polls a paused Task.
+
+### Torrent Downloads
+
+- Treat successful torrent submission as the end of Core Item admission. qBittorrent owns the
+  long-running transfer slot; Core polling must not retain a download Scheduler lease.
+- On Batch or Item pause, send the client pause request and wait for a bounded observed paused state
+  before acknowledging Core pause. Resume and cancel use the persisted torrent handle.
+- Preserve the existing safety rule for a missing client task, while distinguishing an externally
+  completed torrent from a lost pre-submission checkpoint.
+
+### Acceptance Criteria
+
+- After pause acknowledgement, direct byte progress and filesystem publication remain unchanged
+  until resume while another root can use the released slot.
+- Resuming never finalises a truncated `.part` file and never repeats already completed assets.
+- Torrent polling does not consume Core Item concurrency after submission; pause/resume/cancel are
+  mirrored to the client and survive restart reconciliation.
+
+## P5-21 Wait For Applied Controls Across IPC And UI
+
+### Status
+
+Completed. `TaskHierarchyService` exposes a bounded
+`TaskControlReceipt`, Owner control responses carry requested/applied status, revision, quiescence,
+and phase fields, and IPC control handlers report a non-success pending phase instead of claiming
+that a pause was complete. Batch pause/resume/cancel mutations are now dispatched to the owning
+asyncio loop, eliminating the foreign-thread race that could leave a lease held. Process-level
+WAIT/DETACH and restart replay coverage is included in the final owner lifecycle gate.
+
+### Control Result Model
+
+- Return a typed control receipt with separate `requested`, `applied`, `actual_status`,
+  `desired_control`, revision, and quiescence fields.
+- Keep the first IPC acceptance/control event fast, but do not emit a successful terminal pause
+  result until the Coordinator receives the resource-safe Pipeline acknowledgement.
+- Bound the applied-control wait. Owner crash, worker failure, or timeout returns the last durable
+  Task ID/revision and an explicit pending or failed phase; an external `clid` process must never
+  block indefinitely or silently submit a replacement command.
+- Make resume wait until the root is eligible/requeued and cancel wait until active admission and
+  external-client controls have reached their defined boundary.
+
+### Projection And Verification
+
+- Show `Pausing` while intent is pending and `Paused` only after quiescence in Tasks, JSON, Shell,
+  and IPC responses. Refresh the Tasks page on both requested and applied transitions.
+- Add Owner integration coverage for Shell-local and external CLI controls, including disconnect,
+  timeout, rapid pause/resume, and terminal-completion races.
+- Run Batch Pipeline, Scheduler, direct/torrent, Task state, recovery, Owner protocol/forwarding,
+  Shell projection, and the full repository verification gate.
+
+### Acceptance Criteria
+
+- When external `clid ... pause` reports success, the Task is durably `Paused`, its root owns no
+  Core admission lease, and another eligible Task has been allowed to run.
+- An in-progress pause is reported as `Pausing`, never as a completed pause.
+- IPC loss cannot leave the caller waiting forever, duplicate a control request, or change the
+  existing Task/History separation.
+
+## P5-22 Separate Owner Shutdown From User Cancellation
+
+### Status
+
+Completed. A typed stop signal now distinguishes `user_cancel` from `owner_shutdown`; Batch and
+standalone Item workers can checkpoint to `PLANNED` without emitting cancellation. Shell shutdown
+also publishes `STOPPING` and closes the IPC listener before draining. Standalone terminal
+boundaries now re-check owner shutdown and increment task revisions for checkpoints. Bounded drain
+now rotates the execution fence before the owner lease is released, late non-cooperative workers
+are discarded, and qBittorrent shutdown leaves the client task intact. An abrupt owner-process
+test now proves a WAIT client becomes a bounded typed disconnect with the accepted Task ID, and a
+replacement owner replays that request instead of executing it twice. Fully wired and process-level
+Shell coverage also proves repeated shutdown callbacks keep paused Tasks paused and cleanup
+idempotent.
+
+- Historical cancellation-on-shutdown reproductions are retained in the acceptance tests as
+  regression cases; the typed signal now routes owner shutdown through checkpoint paths.
+- Fully wired owner readiness, same-request retry after RECOVERING rejection, paused Batch child
+  normalization, and OS-process close/reopen timing are covered.
+
+### Shutdown Control Model
+
+- Replace the shared boolean cancellation Event with typed execution stop reasons at minimum:
+  `user_cancel`, `owner_shutdown`, and `owner_lost`/recovery fencing where required.
+- `user_cancel` retains the current terminal cancellation semantics. `owner_shutdown` requests a
+  resumable checkpoint and lease release; it must not emit cancellation History or Completion.
+- On graceful Shell close, stop accepting new Owner requests, publish `STOPPING` immediately,
+  suspend Scheduler roots, and ask active Item and Batch workers to reach the P5-20 checkpoint
+  boundary.
+- Preserve `desired_control=PAUSE` for already paused Tasks. Running Tasks retain run intent and
+  become recoverable without being reported as user-paused or canceled.
+- Do not send qBittorrent cancel/delete for owner shutdown. Persist the client handle and last
+  observed state for startup reconciliation.
+
+### Bounded Drain And Fencing
+
+- Keep shutdown bounded, but do not release the Owner lease while an old worker can still commit
+  an unfenced terminal result. Fence writes by owner session, run ID, generation, and revision.
+- If the graceful checkpoint deadline expires, persist an explicit interrupted checkpoint and
+  invalidate the old run before process ownership is released.
+- Close accepted IPC waits with a typed owner-stopping/disconnected outcome containing the durable
+  Task ID and revision. Clients remain bounded and never resubmit a replacement automatically.
+- Make repeated shutdown callbacks and late worker completion idempotent. The callback path is now
+  covered by a fully wired Shell regression test; late worker fencing remains covered by the
+  existing execution-fence tests.
+
+### Acceptance Criteria
+
+- Closing the Shell never changes a running or paused Task to `CANCELED` unless the user explicitly
+  requested cancel first.
+- A paused Item or Batch remains durably paused with no automatic startup command.
+- A running Item or Batch becomes resumable with its completed checkpoints intact.
+- Torrent handles remain in the external client and are reconciled rather than canceled.
+- No worker from the old owner can update the Task after a new owner has claimed its data root.
+
+## P5-23 Recover Checkpoints Without Retry Or Cancellation Semantics
+
+### Status
+
+Completed. Startup recovery now uses `resume` instead of `retry`, returns active Batch children
+and assets to schedulable queued states without creating retry attempts, skips verified standalone
+output files when the checkpoint still exists, clears stale standalone run leases before
+re-admission, and preserves recovered Task revision/run-generation identity. Direct streams persist
+an unfinished `.part` checkpoint and safely rebuild it on resume; stale owner fences are rotated
+before re-admission and late writes are rejected. Batch root recovery is transactional, partial
+explicitly partial checkpoints are never promoted to complete assets, completed direct outputs are
+verified and atomically requeued when corrupted, and the last observed torrent state is persisted
+on owner shutdown. End-to-end restart reconciliation uses deterministic torrent-client fixtures and
+preserves the accepted handle, paused/running state, and output identity.
+
+- Recovery now normalises active Batch children/assets back to queued states and clears stale Task
+  run leases for both `RUNNING` and `PLANNED` records before `resume` admission. Parent, graph, and
+  asset transitions commit atomically; a failed graph checkpoint rolls back the complete recovery
+  transaction. Recovery verifies direct completed assets with their persisted SHA-256 and rolls
+  corrupt outputs back to `QUEUED` in the same child/asset transaction. The latest full
+  verification gate passes with 612 core tests plus all three isolated plugin suites.
+
+### Recovery Matrix
+
+- Normalise Task status, desired control, active run lease, Batch execution rows, and History in one
+  transactional recovery operation per root.
+- `PAUSED + PAUSE`: clear only the stale owner/run lease, retain checkpoints, and enqueue nothing.
+- Interrupted nonterminal `RUN`: clear the stale lease, retain run intent, and enqueue
+  `tasks resume` or `batches resume`; do not route through retry.
+- Explicitly canceled, failed, partially completed, skipped, and completed roots remain terminal
+  and are never auto-resumed.
+- Preserve run generation until the recovery worker successfully claims a new generation.
+
+### Item And Batch Checkpoints
+
+- Make Batch resume convert persisted `RESOLVING`, `QUEUED`, and `DOWNLOADING` work into schedulable
+  recovery inputs without changing them to failure/cancellation states or creating retry attempts.
+- Persist completed Batch asset outcomes incrementally and never enqueue them again. Reconcile an
+  unfinished direct asset using the P5-20 partial-file policy.
+- Give standalone Items the same typed per-asset checkpoint identity. Recovery skips verified
+  completed assets and safely resumes or restarts only the unfinished asset.
+- Keep the original Task IDs, Batch child IDs, History records, output ownership markers, and
+  Completion identities. Recovery must not create duplicate tasks or files.
+- Reconcile standalone and Batch torrent checkpoints by client handle. Completed/missing/external
+  states follow the defined torrent safety matrix without resubmitting a known torrent.
+
+### Acceptance Criteria
+
+- A running direct Item and Batch continue after restart without re-downloading verified completed
+  assets and without adding retry/cancel History.
+- A downloading Batch child is actually scheduled by `batches resume`.
+- Paused roots remain paused across any number of restarts and resume only on an explicit command.
+- Stale active run IDs are cleared for both Task kinds before recovery admission.
+- Torrent recovery reuses the persisted client task and preserves its paused/running state.
+
+## P5-24 Gate Owner Readiness And Verify Restart Lifecycles
+
+### Status
+
+Completed. The premature pre-listener `READY` publication was removed, and shutdown now marks
+the owner `STOPPING` before closing IPC admission. Mutation requests remain rejected during
+`RECOVERING`; Textual and plain/embedded Shell paths now dispatch tracked startup recovery
+commands before publishing `READY`. Same-request retry after a typed RECOVERING rejection is now
+safe, fully wired readiness/DETACH behavior is covered, and process-level Shell tests prove
+bounded WAIT disconnect, DETACH acceptance, request replay, and a second restart readiness race.
+
+### Readiness Audit
+
+- Keep discovery lifecycle at `RECOVERING` while plugins, stores, checkpoint normalisation, and
+  recovery admission are being prepared.
+- Start the IPC endpoint before advertising an endpoint-capable state. Do not publish `READY`
+  before the pipe listener exists and startup recovery commands have been dispatched to tracked
+  owner workers (the recovery workers themselves may continue after the prompt is available).
+- Define whether read-only queries are available during `RECOVERING`; reject or queue downloads and
+  controls with a typed recovering response instead of letting forwarding race a missing pipe.
+- External forwarding must not treat discovery metadata alone as proof that the Owner can accept a
+  command. `shell ensure --wait-ready` returns only after the same readiness barrier.
+- Publish `STOPPING` when shutdown begins, not only after `shell.run()` returns, and reject new
+  mutation requests consistently during the drain.
+
+### End-To-End Restart Matrix
+
+- Add process-level or fully wired Shell-owner tests using deterministic fake fetchers and a
+  temporary data root. Exercise graceful close and abrupt owner loss separately.
+- Cover standalone Item and Batch roots in queued, resolving, downloading, pausing, paused,
+  resumed, and torrent-submitted states.
+- For each state, assert persisted Task/Batch/asset rows, desired control, active run lease, History,
+  Completion, Scheduler admission, startup commands, and final output identity before and after a
+  second owner starts.
+- Cover an external WAIT client and DETACH client during shutdown. Both remain bounded; an accepted
+  Task ID remains authoritative even if its terminal event is lost.
+- Test rapid close/reopen, recovery followed by pause/cancel, missing plugin/client, auto-delete on
+  completion, and a second restart during recovery.
+- Replace state-only recovery expectations that encode `CANCELLED + retry` with the resumable
+  checkpoint contract from P5-23.
+
+### Acceptance Criteria
+
+- `READY` means the IPC endpoint is reachable and startup recovery has crossed its defined
+  admission barrier.
+- Closing and reopening the Shell preserves paused work and resumes running work exactly once.
+- Graceful shutdown, crash recovery, and explicit cancel produce three distinguishable durable
+  outcomes.
+- No restart path duplicates a Task, Batch child, torrent submission, output file, History terminal
+  event, or Completion identity.
+- The focused lifecycle suites and full verification gate pass without timing sleeps or live
+  network dependencies.
+
+## P5-25 Unify Site Request Control Across Preparation And Downloads
+
+### Status And Scope
+
+Implemented and verified on `feat/site-request-control` for the 0.1.4 build. The full
+repository gate passed; the final pause-boundary changes additionally passed the 43-test
+Batch/queue/network regression set. The separate Pinterest 0.1.1 migration has three offline tests;
+no live-site validation or external plugin activation has been performed. The earlier
+d51ece4 Windows packages do not contain these changes.
+
+Implementation notes: duplicate site registrations are rejected at runtime rather than
+merging conflicting policies. Diagnostics are available through `clid network status --json`.
+Legacy plugin traffic remains operation-level compatibility coverage. The transport timeout
+bounds ordinary blocked reads; failed response closure retains accounting and ownership
+rather than pretending the request finished. Batch workers waiting for Item/backpressure
+capacity acknowledge pause at a safe boundary; the UI allows Resume during Pausing as
+well as Paused, reusing live workers.
+
+Success means that, for a migrated plugin within one OwnerScope, every site HTTP attempt
+from listing, pagination, preparation, downloads, redirects and retries obeys one shared
+concurrency limit, request-start interval and cooldown. Download Item limits remain separate.
+Browser authentication traffic, other applications, other data-root owners and torrent peer
+transfers are outside this guarantee. No numeric configuration guarantees that a site will
+never throttle: its quota may also cover other clients sharing the account or IP address.
+
+### Evidence From The Pre-change Implementation
+
+| Path | Current control | Gap |
 | --- | --- | --- |
-| Running | `download <url>` | Forward to Shell and wait for the terminal result. |
-| Running | `download <url> --detach` | Forward to Shell and return after durable acceptance. |
-| Not running | `download <url>` | Foreground CLI acquires ownership, blocks, and returns the terminal result. |
-| Not running | `download <url> --detach` | Fail with `shell_required_for_detach` and an actionable `shell ensure` hint. |
-| Foreground owner running | Another live download | Fail with `owner_busy`; do not construct or forward additional download work. |
-| Any owner running | A second owner start | Do not start another Scheduler or perform recovery. Report the active owner. |
-| No owner | Read-only Task, History, config, or diagnostic query | Read directly without claiming execution ownership. |
-| Shell crashes while a client waits | Accepted request | End the wait with `owner_disconnected`; preserve the Task for recovery and do not duplicate it. |
+| Batch preparation | `RuntimePackageResolver.resolve()` wraps `instance.resolve()` in the shared limiter | One operation can issue several HTTP requests; `choose_strategy()` runs outside the wrapper and can call plugin code that performs more I/O |
+| Standalone preparation | `DownloadService._build_planned_record()` directly calls the adapter | Resolve and strategy I/O are outside the shared gate |
+| Listing and pagination | `OperationDispatcher` directly invokes `execute()` | No injected shared request gate; external `operation` commands also lack an Owner command route |
+| Asset download | Batch and standalone executors wrap fetch or fetch-and-write | Custom fetchers, redirects and internal retries are not counted individually; file writing can retain a request permit unnecessarily |
+| Streaming pause | `_current_request` releases its logical permit while the consumer waits | `UrlAssetFetcher.fetch_stream()` can retain an open response until iteration ends; logical release does not prove transport closure |
+| Plugin HTTP | Local Pinterest plugin uses `build_opener().open()` in an executor | Core cannot count arbitrary plugin network calls without plugin migration |
 
-### Acceptance Criteria
+Audit references: `application/download_limiter.py`, `application/batch_service.py`,
+`application/download_service.py`, `application/operation_dispatcher.py`, `core/fetch.py`,
+`plugins/runtime.py`, `cli/app.py`, and `core/owner_protocol.py` under `cli_downloader/`.
 
-- Contract tests cover valid requests, malformed or oversized messages, duplicate request IDs,
-  version mismatch, unsupported capabilities, disconnects, and structured errors.
-- Contract tests cover disconnects before acceptance, after durable acceptance, and after terminal
-  persistence but before delivery, with a deterministic result for every phase.
-- A silent or broken in-memory owner cannot leave a waiting client blocked beyond the configured
-  liveness deadline, while a healthy long-running command is not terminated by that deadline.
-- Owner and client code can be tested through an in-memory transport before Windows process tests
-  are added.
-- No IPC request can bypass the same CLI validation, confirmation, plugin, Task, and History
-  boundaries used by an in-process command.
+### User Settings And Counting Rules
 
-## P5-12 Enforce One Download Owner Across Processes
+Keep the existing keys and saved values. Do not silently redefine a download slot as a
+combined Prepare + Download slot, or add a Batch-count limit for rate-limit protection.
 
-### Status
+| Setting | Intended meaning |
+| --- | --- |
+| `scheduler.max_concurrent_downloads` | Active download Items across all sites; Batch parents do not count |
+| `scheduler.max_concurrent_downloads_per_site` | Active download Items from one site |
+| `network.max_concurrent_requests` | Default site-wide maximum of in-flight HTTP attempts, including response-body reads |
+| `network.min_request_interval_seconds` | Default minimum interval between HTTP attempt starts across all phases; no accumulated burst credits |
+| `plugins.<id>.network.max_concurrency` / `min_interval_seconds` | Site-specific effective policy, overriding the corresponding fallback |
+| Existing attempts/backoff settings | Retry budget per HTTP request, not repeated execution of an entire plugin operation |
 
-Planned.
+Settings must show the effective site values and their source; changing a fallback must not
+appear to override an existing site policy. Preserve current defaults (2 requests, 0.5 seconds)
+as compatibility values, not a claim about a site's safe quota. The runtime rejects conflicting registrations for the same site, so ambiguous policies cannot
+silently replace one another.
+Policy changes take effect at the next Owner restart in the first release and are labelled so.
 
-### Scope
+Example only: with a site cap of 2 and interval of 1 second, one download stream plus one
+preparation request fills the site capacity; another list/preparation/download request waits.
+A preparation operation needing five HTTP requests obtains admission five times. Pure parsing
+does not consume network capacity. The interval is between starts, not a delay after completion.
+Batch preparation workers and bounded queues remain internal backpressure, not site protection.
 
-- Add an OS-released ownership lock so only one process can construct live download workers,
-  Batch pipelines, torrent monitoring, and the process-wide Scheduler for one user data root.
-- Derive one canonical owner scope from the resolved user data root. Normalise the absolute Windows
-  path, case, separators, trailing separators, and resolvable junction or symlink identity before
-  hashing it; do not use the executable or current working directory as the ownership boundary.
-- Use the same product namespace, current-user identity, data-root fingerprint, and protocol
-  generation to derive the OS lock, discovery record, and IPC endpoint identity. Never let those
-  three resources disagree about which store an owner controls.
-- Require ownership before live `download`, Item resume, Batch resume or retry, startup recovery,
-  or any operation that starts executable download work. Planning and read-only inspection do not
-  claim ownership.
-- Make the Shell acquire ownership before recovery. It must finish stale-lease reconciliation and
-  plugin/runtime setup before publishing `ready` or accepting mutating commands.
-- Let a Shell owner host the full command service. Let a foreground owner publish status and task
-  control capability while rejecting detached submissions and additional download work.
-- Persist only non-secret owner discovery metadata such as mode, PID, process start identity,
-  protocol version, application version, endpoint identity, and readiness state. Treat the OS lock
-  and live handshake as authoritative; stale metadata alone never proves an owner is alive.
-- A second Shell must not run recovery or build another Scheduler. It reports the existing owner
-  and exits cleanly; a future focus-existing-window action remains optional.
-- Keep every Task run claim and `active_run_id` check inside the existing durable execution
-  coordinator. The process lock protects the Scheduler boundary but does not replace per-Task
-  generation and revision checks.
+### Components And Ownership
 
-### Acceptance Criteria
+- Extract a `SiteRequestCoordinator` from `GalleryDownloadLimiter`; keep the latter as a
+  compatibility facade for Item admission. One coordinator belongs to the live Owner and is
+  shared by all Batch, standalone and interactive operations, including retries.
+- Key request budgets by `(OwnerScope, site_id)`, shared across profiles. Requests to a site's
+  API and CDN retain the originating site budget, including redirects. Do not split quotas by
+  hostname or profile in the first release; add finer groups only with evidence of separate quotas.
+- Provide a typed `PluginHttpClient` with buffered `request()` and context-managed `stream()`.
+  Core owns admission, redirects, response lifetime, retry and normalized HTTP errors. Preserve
+  plugin headers, cookies, proxy/TLS settings, timeout and response decoding needs in the contract.
+- Add an optional, versioned `bind_services(PluginServices)` hook plus an explicit managed-HTTP
+  capability. Bind once when creating the runtime; pass immutable task/phase/auth context per
+  operation so concurrent profiles cannot overwrite shared plugin configuration. Client services
+  are runtime objects, never serialized into existing JSON operation requests.
+- Implement Core's default fetcher through the same client. Migrated custom fetchers must also
+  use it. A callback around arbitrary `resolve()` is not the managed-HTTP contract.
+- Route networked external plugin operations through a typed Owner operation command. Preserve
+  request IDs, confirmation requirements, wait/disconnect behavior and structured results.
+  A foreground process can execute only after acquiring ownership when no owner exists.
+  Keep local classification/help offline. Negotiate the new protocol capability; an incompatible
+  live owner must not cause a silent local network execution that bypasses its budget.
 
-- Concurrent process tests prove that only one contender becomes owner and that a crashed process
-  releases ownership without manual cleanup.
-- Two Installer, Portable, or source runtimes resolving the same data root intentionally contend
-  for one owner scope. Runtimes resolving different data roots receive independent scopes even
-  when launched by the same Windows user.
-- Starting a Shell while a foreground download owns execution does not start a second Scheduler.
-- Two distinct `clid` processes cannot bypass global or per-site limits by constructing independent
-  pipelines.
-- Existing single-process Shell and foreground-download behavior remains functional after all live
-  execution paths require ownership.
+### Admission, Fairness And Retry Rules
 
-## P5-13 Add Shell Status, Start, And Ensure Commands
+- Under one coordinator lock, check capacity, monotonic next-start time and cooldown, then grant
+  the permit and reserve the next start atomically. Wait without holding capacity. Maintain
+  cancellable waiters associated with their owning event loop and wake them thread-safely.
+- Rotate eligible root/request IDs; preserve FIFO within each root. All phases share capacity,
+  with no permanent reservation that would deadlock a site cap of 1. Long streams retain their
+  permit, so fairness applies when a permit becomes available, not by interrupting healthy streams.
+- Count every redirect and retry as a new attempt. Close the previous response before re-entry;
+  disable hidden transport retries. Strip credentials on cross-origin redirects unless explicitly
+  authorized by the existing authentication policy. Do not invent a fresh quota for a redirect.
+- Normalize status and headers at the transport boundary. Existing stream wrappers can conceal
+  the HTTP status from `_retry_delay`; preserve structured causes through the writer/executor.
+- On 429, stop new requests for that site across every phase. Honor valid `Retry-After` seconds
+  or HTTP dates; otherwise use exponential backoff with jitter. Apply the same cooldown for 503
+  with Retry-After; keep other retryable statuses policy-driven. Cooldown is extended by the
+  maximum outstanding deadline, never shortened by another failure or success.
+- `max_backoff_seconds` caps locally generated delays, not a longer server-requested delay.
+  If a caller's wait deadline expires, report the pending retry and leave the site cooldown intact.
+  Close error responses and release permits before waiting. Do not automatically replay an
+  unsafe/non-idempotent operation; require explicit retry eligibility and replayable request bodies.
+- Persist only the site's cooldown deadline and minimal reason on cooldown changes, not on each
+  request. Restore it during Owner recovery; use monotonic timing while running. A restart must
+  not reset a known server cooldown or revive old leases. Reject malformed persisted timestamps.
+- Never acquire an Item slot while holding a request permit. At a safe checkpoint before a long
+  cooldown, return the Item slot and requeue with its not-before deadline; reacquire Item then
+  request admission. No SQLite transaction is held across network waits. Paused/canceled work
+  cannot reacquire either resource until eligible.
 
-### Status
+### Streaming And Applied Pause
 
-Planned.
+A request permit represents a live HTTP attempt, not merely an executing Python coroutine.
+Keep it until EOF or confirmed response closure, including while the consumer applies backpressure.
+An idle reusable connection after response completion does not count as an in-flight request.
 
-### Public Commands
+On pause/cancel/shutdown, stop starting reads, close the response, settle outstanding blocking
+I/O, persist a valid partial-file checkpoint, then release request/Item permits and acknowledge
+the applied state. Canceling `to_thread`/executor awaits alone does not stop their I/O; retain
+accounting and show `Pausing` until closure is confirmed, with bounded transport timeouts and
+an observable failure path. Do not claim `Paused` or grant a replacement permit prematurely.
 
-- Keep `clid shell` and double-clicking `CLI-Downloader.exe` as the normal visible Shell entry.
-- Add `clid shell status [--json]` to report `running`, `ready`, owner mode, PID, process start
-  identity, version, protocol version, session ID, capabilities, and recovery state.
-- Add `clid shell start --visible [--wait-ready] [--timeout SECONDS] [--json]` to launch a new
-  visible Shell window only when no owner exists.
-- Add `clid shell ensure --visible --wait-ready [--timeout SECONDS] [--json]` as an idempotent
-  status-then-start operation suitable for an Agent.
-- Resolve the correct launch command inside Core: packaged builds launch the current
-  `CLI-Downloader.exe`; source checkouts launch the active Python runtime with
-  `-m cli_downloader shell`. Do not ask an Agent to construct `Start-Process` arguments or infer
-  Installer versus Portable paths.
-- On Windows, create a genuinely visible new console window. `--wait-ready` succeeds only after
-  the owner endpoint is reachable, recovery has finished, plugins are loaded, and the Scheduler
-  advertises that it can accept commands.
-- If a foreground owner exists, `start` and `ensure` return `owner_busy` with owner details instead
-  of opening a misleading second Shell.
+Resume may restart the unfinished asset in the first release, preserving completed files.
+Range resume is optional later: validate validators, Content-Range and server response before
+appending; a full 200 response must never be appended to partial content. This avoids coupling
+the request-control fix to a new resumable-download feature.
 
-### Acceptance Criteria
+### Compatibility And User Feedback
 
-- `status` distinguishes absent, starting, recovering, ready, stopping, foreground-busy, stale,
-  and incompatible owners with stable JSON error codes.
-- Repeating `ensure` never launches duplicate Shell windows.
-- Timeout, launch failure, early process exit, incompatible protocol, and stale discovery metadata
-  produce actionable diagnostics and nonzero exit codes.
-- Portable and source-mode tests confirm that the resolved launch command points to the correct
-  runtime without depending on the current working directory.
+- Managed plugins bypass the old outer operation-level request wrapper, preventing nested
+  acquisition deadlock at concurrency 1. Internal fan-out receives distinct request permits;
+  ContextVar inheritance must not allow child tasks to reuse a parent's permit.
+- Keep old plugin APIs working through an explicitly labelled operation-level compatibility
+  mode. Route their resolve/strategy/list calls through coarse admission without double wrapping
+  nested calls. Do not automatically retry whole legacy operations that may have side effects.
+  Their internal request count, cancellation and retry timing remain unverified.
+- Display `request-level control` or `operation-level control` in plugin diagnostics. These are
+  capability claims backed by migration/conformance tests, not a sandbox guarantee: arbitrary
+  trusted Python plugins can still bypass the supplied client. Do not globally monkeypatch
+  urllib/requests/socket to create an unreliable appearance of enforcement.
+- Keep task lifecycle state separate from wait reasons: `download_slot`, `request_capacity`,
+  `request_interval`, and `site_cooldown`. Show phase and an expiry/countdown when known; do not
+  render an indefinite generic Queue or claim an exact queue position during a timed cooldown.
+- Expose compact site snapshots: in-flight/limit, waiting counts by phase, effective interval,
+  cooldown deadline and coverage mode. Never include cookies, tokens or signed request URLs.
+  Reuse one immutable snapshot per Tasks refresh to retain the current performance improvements.
 
-## P5-14 Forward Download Requests With Wait And Detach Modes
+### Implementation Sequence And Acceptance Gates
 
-### Status
+1. **Coordinator contract and deterministic tests.** Separate Item and request admission; add
+   normalized transport errors, fair cancelable waits, effective policy and persistent cooldown.
+   Prove shared caps/spacing across event loops and roots, cancellation at grant, no permit leak,
+   no burst after idle, and independent progress for another site during cooldown.
+2. **Managed transport and stream lifecycle.** Wire Core's fetcher, close-before-release pause,
+   explicit redirects and per-request retries. Test real close/read behavior with an offline
+   controlled transport or local test server, not only a mocked pause callback. Verify partial
+   files, failures, resume and shutdown while a read is blocked.
+3. **All entry points and plugin migration.** Inject services into Batch/standalone/dispatcher,
+   add Owner operation forwarding/capability negotiation, and migrate a representative external
+   plugin in its own repository. Inventory other installed plugins without changing their files.
+   Preserve legacy mode and publish the new client contract for plugin authors.
+4. **Settings, visibility and release validation.** Add effective policy/coverage and wait reasons
+   to Settings, Tasks and JSON diagnostics. Run full verification and packaged smoke tests;
+   perform a separately authorized, low-volume live check for each migrated target site before
+   claiming site-specific behavior. Produce new packages only after the integration gate passes.
 
-Planned.
+The decisive integration test starts Batch preparation, standalone preparation, list pagination
+and a download concurrently against one fake site: cap 2 is never exceeded and every attempt
+start is spaced correctly. A resolver issuing five requests produces five admissions; fan-out,
+redirects and retries cannot bypass them. A 429 in any phase delays all new same-site requests,
+including after Owner restart, while another site proceeds. Additional gates cover cap-1 nested
+calls, concurrent external CLIs, expired/canceled waiters, HTTP-date Retry-After, status preserved
+through streaming errors, old-owner incompatibility, profile credential isolation and unchanged
+bounded Tasks refresh behavior. The offline implementation gates passed. Windows artifacts use the repository build and
+smoke scripts; live-site verification remains separately authorized.
 
-### Scope
-
-- Add `--detach` to live `clid download`; keep foreground waiting as the default public behavior.
-  An optional explicit `--wait` alias may be added for scripts and documentation, but it must not
-  change the default.
-- When a Shell owner is ready, both modes submit typed download requests through IPC. Normal mode
-  waits for the Shell-owned terminal outcome; detach mode returns after durable acceptance.
-- When no Shell exists, normal mode acquires foreground ownership and executes the existing
-  blocking flow. Detach mode never spawns an invisible worker or silently falls back to blocking.
-- Refactor URL dispatch so an accepted direct Item or explicitly selected Batch receives a stable
-  Task or parent ID before the acknowledgement is returned. Persist a `preparing` record and source
-  arguments before plugin/network work begins.
-- For a list operation without explicit selection, return `requires_selection` and let the Shell
-  display the Operation page; do not fabricate a download Task. Agent usage continues to require
-  explicit repeated `--select` values.
-- A successful detached JSON response includes `accepted`, `request_id`, `task_id`, owner session,
-  owner PID, queued state, and whether the request created an Item or Batch. Duplicate completion
-  checks retain their existing `--force` policy.
-- A waiting client receives progress without owning the Task. An unexpected client disconnect does
-  not cancel Shell work. An explicit Ctrl+C sends the defined cancellation request; if delivery is
-  uncertain, output must tell the user to inspect and cancel by Task ID.
-- Show externally submitted commands in the Shell Console with their source and request ID, and
-  make the persisted Task visible in the Tasks page as soon as acceptance succeeds.
-
-### Acceptance Criteria
-
-- Tests cover all four rows of the Shell/detach behavior matrix for Item and explicitly selected
-  Batch downloads.
-- Detach returns only after durable state exists and never returns two Task IDs for one request ID.
-- The Shell and forwarded CLI report the same terminal status, failure origin, output paths, and
-  History identity as an in-Shell download.
-- JSON mode remains machine-readable: detached mode emits one acceptance document; waiting mode
-  emits a defined final document without mixing terminal-renderer output into stdout.
-
-## P5-15 Route Task Control Through The Scheduler Owner
-
-### Status
-
-Planned.
-
-### Scope
-
-- Route live `tasks pause`, `tasks resume`, `tasks cancel`, `tasks retry`, `tasks hard-retry`,
-  `batches resume`, and `batches retry` through the ready owner whenever one exists.
-- Add any missing positional Task control commands needed by the Agent workflow while preserving
-  the rule that resource IDs follow an explicit action.
-- Keep read-only `tasks list/show`, `history`, `batches show`, config, and diagnostics safe to run
-  in separate processes against persisted state. They may query owner status for fresher context
-  but do not need ownership.
-- Resolve Item and Batch control inside the owner using the shared hierarchy, execution
-  coordinator, Scheduler, and torrent-control services. Clients may not instantiate replacement
-  pipelines for an owner-controlled Task.
-- Make control requests idempotent and return the resulting persisted revision, desired control,
-  acknowledged state, owner session, and structured conflict information.
-- Refresh the Shell Tasks view immediately after external acceptance or control acknowledgement;
-  retain periodic persistence refresh as recovery rather than the primary notification mechanism.
-- Foreground owners expose control for their active Task but reject unrelated detached submissions.
-  If no owner exists, controls that only change durable non-running state may execute locally;
-  controls that start work must first acquire ownership.
-
-### Acceptance Criteria
-
-- An Agent can submit, inspect, pause, resume, cancel, retry, and observe one Task without touching
-  SQLite directly or constructing a second Scheduler.
-- Item, Batch parent, Batch child, direct, and torrent controls preserve the existing lifecycle and
-  desired-control rules.
-- Competing control requests resolve through revisions and deterministic conflict responses rather
-  than order-dependent duplicated actions.
-- Shell UI state and external JSON results converge on the same persisted Task projection.
-
-## P5-16 Harden IPC Recovery, Security, And Packaging
-
-### Status
-
-Planned.
-
-### Scope
-
-- Use a Windows local IPC implementation that can restrict access to the current user. Do not open
-  a localhost TCP listener. Add an authenticated handshake if the selected standard-library pipe
-  API cannot express the required access boundary by itself.
-- Derive the Named Pipe name from a stable CLI-Downloader namespace, the current Windows user SID,
-  a collision-resistant canonical data-root fingerprint, and the IPC protocol generation. Do not
-  expose the raw filesystem path in the Pipe or Mutex name.
-- Include the complete owner-scope fingerprint in discovery metadata and the authenticated
-  handshake. A client that reaches an endpoint for another store must reject it even if endpoint
-  discovery data is stale or a shortened name fingerprint were ever to collide.
-- Apply payload-size, connection-count, request-timeout, idle-timeout, protocol-version, command,
-  and argument validation before dispatch. Redact secrets from owner metadata, diagnostics, crash
-  logs, and IPC errors.
-- Implement broken-Pipe handling plus heartbeat-based liveness detection for half-open or stalled
-  connections. Bound connect, handshake, acknowledgement, and response-idle waits without imposing
-  a default timeout on the total duration of a healthy download.
-- Make request acknowledgement crash-safe. Persist request identity with the Task/submission so a
-  client retry after owner failure returns or recovers the same work instead of duplicating it.
-- On owner crash or forced exit, release the OS lock automatically, preserve Task checkpoints, and
-  let the next owner reconcile stale `active_run_id`, desired control, direct progress, Batch
-  checkpoints, and torrent-client state before becoming ready.
-- Define graceful Shell exit while work is active: warn the user, stop accepting new commands,
-  persist interruption intent, reach safe boundaries where possible, then release ownership.
-- Add isolated multi-process tests using a temporary data root and offline fixture plugins for
-  owner contention, status/start readiness, detach, wait, control, disconnect, crash, restart,
-  stale metadata, protocol mismatch, broken Pipe, silent owner, and client reconnect.
-- Include every required IPC module and launch helper in PyInstaller. Extend Portable smoke tests
-  to verify `clid.cmd shell status`, packaged owner discovery, and a headless test endpoint without
-  opening an interactive window in CI.
-
-### Acceptance Criteria
-
-- Another Windows user or unauthenticated client cannot submit commands to the owner endpoint.
-- Killing the Shell while a foreground `clid` waits always releases that client with a structured
-  nonzero result within the liveness deadline. Accepted work remains recoverable, and the client
-  never promotes itself or submits a replacement Task automatically.
-- Killing the owner during Item, Batch, paused, and torrent work leaves recoverable durable state
-  and does not permanently block a new owner.
-- No deterministic test requires a real website, external plugin installation, qBittorrent, or a
-  visible desktop session.
-- Installer, Portable, source, and test runtimes derive compatible owner identity from the intended
-  user data root and do not collide across isolated stores.
-- Two Portable copies using the same data root deliberately discover one owner; two copies using
-  distinct data roots do not share a Pipe, lock, metadata, or Scheduler. An incompatible runtime
-  on the same root reports `incompatible_owner` rather than creating a second endpoint.
-
-## P5-17 Add The Agent-Control Workflow And End-To-End Verification
-
-### Status
-
-Planned.
-
-### Agent Skill Contract
-
-- Update the repository Agent Skill to check `clid shell status --json`, run
-  `clid shell ensure --visible --wait-ready --json` when a visible Shell is absent, and use
-  `clid download <url> --detach --json` only after explicit download authorization.
-- Continue to dry-run and inspect URL routing before a live submission. List results still require
-  explicit selections; the Agent may not guess a bulk download.
-- Read the accepted Task ID, verify it with `tasks show`, and use owner-routed pause, resume, cancel,
-  retry, and Batch controls as needed.
-- Treat starting a visible Shell, downloading, deleting, plugin activation, and other mutations as
-  permission-bearing actions. Status, Task, History, and dry-run inspection remain read-only.
-- Document foreground fallback separately: without detach and without a Shell, the current CLI
-  blocks as the temporary owner. The Agent workflow should prefer the visible Shell unless the user
-  explicitly requests headless foreground execution.
-
-### Documentation And Acceptance
-
-- Update the three README languages, Agent Skill installation/usage guide, CLI help, Shell
-  experience design, System Design, System Structure, and changelog with the final command and
-  ownership contracts.
-- Add one offline end-to-end simulation: no owner, Agent status check, visible-start abstraction,
-  ready handshake, detached Item submission, immediate Task visibility, pause/resume, terminal
-  completion, durable History, Shell restart, and continued single-owner enforcement.
-- Add a selected Batch simulation covering the same submission and control path, including one
-  restart during execution and one duplicate request retry.
-- Verify that a normal waiting command returns the final exit code both through a Shell owner and
-  through a foreground owner, while detach returns an acceptance result and never claims final
-  success.
-
-### Acceptance Criteria
-
-- A compatible Agent can operate the currently visible Shell through public JSON commands without
-  direct database access, terminal keystroke injection, raw IPC, or a second Scheduler.
-- Users see Agent-created Tasks, progress, failures, and controls in the existing Shell pages.
-- Starting a second Shell, retrying a request, reconnecting a client, or restarting after a crash
-  never creates two active owners or duplicate accepted Tasks.
-- The complete isolated Core/plugin verification gate, multi-process IPC suite, Portable smoke,
-  build, and documentation checks pass.
-
-## P5-18 Scale Tasks UI And Batch Projections
-
-### Status
-
-Planned. This task is independent from IPC ownership, but it must finish before forwarded commands
-make the visible Shell the primary control surface for every download.
-
-### Confirmed Problem
-
-- The Tasks root view currently builds every child `TaskNode` to calculate one Batch parent row.
-  A Batch with 1000 Items therefore performs child, asset, attempt, scheduler, and byte projection
-  work even while the user remains outside the Batch.
-- The Batch child view rebuilds all child projections during periodic refresh. Per-child calls to
-  `get_child`, `list_assets`, `list_attempts`, and scheduler lookup create an N+1 query pattern.
-- Entry sequence calculation reloads and scans the complete parent entry list for each resolved
-  child. A 1000-Item Batch can therefore approach O(n^2) entry decoding during one refresh.
-- The Textual event loop performs synchronous projection, row comparison, cell updates, detail
-  refresh, focus changes, column resizing, and layout invalidation. Mouse hover, keyboard input,
-  tab switching, and other UI messages wait behind that work.
-- Background workers can enqueue progress callbacks faster than the UI consumes them. Byte and
-  torrent updates are partly throttled at the CLI output boundary, but the Shell needs its own
-  bounded latest-value coalescer.
-
-### Read-Model And Storage Refactor
-
-- Introduce explicit lightweight read models for `TaskRootSummary`, `BatchChildSummary`, and
-  selected Task detail. List rows contain only stable identity, display fields, aggregate progress,
-  status, queue reason, and revision; they do not carry the full execution graph.
-- Give the Tasks root view a Batch summary projection that reads title, source, site, aggregate
-  counts, byte progress, state, and revision without constructing child nodes or decoding every
-  entry payload. Maintain aggregate state transactionally with execution changes when a simple
-  bounded query cannot provide the required cost.
-- Add stable, paged Batch child-summary queries with total count and ordering. Fetch entries,
-  children, aggregated asset counts or bytes, attempt counts, and scheduler state in a bounded
-  number of bulk operations rather than one transaction per row.
-- Compute entry order once from a persisted sequence or the bulk query result. Remove list-view
-  use of per-child `_entry_sequence()` scans.
-- Do not read the same child's assets twice, call `os.path.getsize`, or calculate full output-file
-  lists for table rows. Load files, failures, attempts, and filesystem details only when the user
-  selects or opens one Task.
-- Expose projection revisions or `updated_at` generations so the UI can ask for rows changed since
-  its last snapshot and still run a periodic full consistency check after missed notifications.
-
-### Tasks UI Update Model
-
-- Build storage snapshots outside the Textual event loop using worker-safe database connections.
-  Tag every request with the current navigation and refresh generation; discard stale results when
-  the user changes tab, leaves a Batch, deletes a Task, or a newer refresh completes first.
-- Replace row-count-based refresh logic with a keyed diff that handles added, removed, reordered,
-  and replaced Task IDs even when the number of rows is unchanged. Update only changed cells and
-  preserve cursor, selection, and scroll position whenever their Task still exists.
-- Use a bounded child page or window for large Batches instead of mounting and diffing every child
-  on each refresh. Start with a stable 100-row page, show current range and total count, and keep
-  navigation deterministic while new children resolve or old Tasks are deleted.
-- Resize columns only after viewport, language, schema, or visible-column changes. Do not force
-  focus, selected-detail rendering, or layout recalculation after an unchanged progress refresh.
-- Keep the periodic refresh as a consistency fallback, not the primary live-update path. Apply
-  owner or worker notifications immediately to the cached read model when their revisions are
-  newer.
-- Coalesce high-frequency progress by Task or asset with latest-value-wins semantics and flush at
-  a bounded UI cadence, initially 100-250 ms. Deliver lifecycle transitions, failures, completion,
-  cancellation, and durable acceptance immediately and never drop their ordering.
-- Ensure closing or navigating away from Tasks cancels pending presentation work without
-  cancelling downloads or losing persisted progress.
-
-### Verification
-
-- Add deterministic 1000-child fixtures for unresolved, mixed, fully resolved, downloading,
-  paused, completed, failed, and auto-deleting Batches. Add a non-gating 10000-child stress fixture
-  for local profiling.
-- Instrument storage calls in tests. Root refresh must not call child-node construction, asset,
-  attempt, filesystem, or per-entry detail reads. One child page must use a bounded query count
-  independent of the Batch's total child count.
-- Verify that repeated unchanged snapshots cause no DataTable row or layout updates; same-count ID
-  replacement, reorder, deletion, and auto-delete apply the correct keyed diff.
-- Verify that a stale worker result cannot reopen a deleted Task, replace a newer page, reset the
-  cursor, or return the user to a Batch they already left.
-- Flood the Shell with progress updates and prove the pending UI queue remains bounded, final byte
-  progress is retained, and lifecycle events arrive in order.
-- Add a Textual responsiveness test with an event-loop sentinel during root and child refresh. Use
-  structural work and query bounds as the deterministic CI gate rather than fragile machine-speed
-  microbenchmarks.
-
-### Acceptance Criteria
-
-- Rendering or refreshing a Batch row in the Tasks root view never materialises its children.
-- Opening a 1000-Item Batch renders only the active bounded page and performs no N+1 or O(n^2)
-  storage work.
-- No synchronous UI-thread operation scales with the total number of children in an unopened or
-  paged Batch. Hover, keyboard, tab, and button state remain responsive during active downloads.
-- Progress coalescing cannot hide terminal state, regress the displayed revision, or allow its
-  in-memory queue to grow without a bound.
-- Existing Task controls, hierarchy navigation, i18n, auto-delete recovery, scheduler queue labels,
-  direct Items, Batch Items, torrent progress, and durable History behavior remain unchanged.
+HTTP reference semantics: [RFC 6585 section 4 (429)](https://www.rfc-editor.org/rfc/rfc6585.html#section-4)
+and [RFC 9110 section 10.2.3 (Retry-After)](https://www.rfc-editor.org/rfc/rfc9110.html#name-retry-after).
+Site-wide sharing, compatibility policy and scheduling choices above are this project's design.
 
 ## Future Version Backlog
 
-The tasks in this section are intentionally excluded from the active P5 order. They may be
-scheduled in a later release after torrent progress, scheduling, CLI, and release automation are
-stable.
+The following work is intentionally deferred and has no dependency from current work.
 
 ## P6-01 Add Workflow Provider Plugins And Post-Download Automation
 
 ### Status
 
-Deferred to a future version. No P5 task depends on this work.
+Deferred to a future version.
 
 ### Product Direction
 
@@ -479,8 +586,8 @@ Deferred to a future version. No P5 task depends on this work.
   visual programming engine.
 - Treat an installed Workflow Plugin as a provider of one or more processing capabilities.
 - Treat a Workflow Instance as a user-owned trigger and configuration that selects one provider.
-  One installed provider may therefore back multiple instances, such as separate Pixiv and
-  gallery-site `ToEpub` rules.
+  One provider may back multiple instances, such as separate Pixiv and gallery-site `ToEpub`
+  rules.
 - Keep plugin installation, update, source, and trust management in Plugins. Add a future Workflow
   page for instances, settings, execution status, retry, and output inspection.
 - Preserve a path to a later graph-based workflow provider without requiring a node editor in the
@@ -526,8 +633,8 @@ Deferred to a future version. No P5 task depends on this work.
   cover selection, page direction, or conversion quality.
 - Reuse schema-rendered settings and approved Core option sources; ordinary configuration may not
   inject arbitrary UI code.
-- Missing, disabled, or incompatible providers leave Instances visible as `Blocked` with actionable
-  diagnostics.
+- Missing, disabled, or incompatible providers leave Instances visible as `Blocked` with
+  actionable diagnostics.
 - Keep secrets in the existing secret-storage boundary.
 
 ### Artifact And File Safety
@@ -566,23 +673,3 @@ Deferred to a future version. No P5 task depends on this work.
   remain independently inspectable and retryable.
 - Existing download, Completion, History, Task, and plugin discovery behavior remains unchanged
   when no Workflow Instance is enabled.
-
-## Cross-Cutting Verification Gate
-
-Each active P5 task must add focused tests and keep the isolated Core/plugin verification gate
-green. Before the P5 series is release-ready, verify:
-
-- qBittorrent metric normalisation, checkpoint recovery, control, and missing-client behavior;
-- deterministic Round Robin and FIFO scheduling across standalone Items, Batch children, sites,
-  pause/resume, cancellation, retry, restart, and execution leases;
-- CLI parser, Shell forwarding, i18n, Doctor JSON, and positional Task/History actions;
-- single Scheduler-owner arbitration, local IPC protocol, Shell status/start/ensure, wait/detach
-  behavior, external Task control, crash recovery, and Agent-visible Task submission;
-- 1000-child Tasks root and Batch-page projections, bounded storage queries, keyed DataTable diffs,
-  progress coalescing, stale-refresh rejection, and Textual event-loop responsiveness;
-- Changelog extraction, tag/version validation, Release workflow structure, Portable, Installer,
-  and checksum asset naming;
-- Ruff and compilation for Core, verification scripts, and maintained project plugins;
-- isolated Plugin Manager, Shell, Torrent, Scheduler, packaging, and remaining Core suites;
-- no live plugin installation, download, release publication, or external-site mutation in
-  deterministic CI.

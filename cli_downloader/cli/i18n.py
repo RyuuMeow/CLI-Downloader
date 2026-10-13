@@ -24,6 +24,7 @@ _STATUS_TRANSLATION_KEYS = {
     "pending_resolution": "status.waiting",
     "resolving": "status.preparing",
     "running": "status.in_progress",
+    "pausing": "status.pausing",
     "queued": "status.queued",
     "downloading": "status.downloading",
     "completed": "status.completed",

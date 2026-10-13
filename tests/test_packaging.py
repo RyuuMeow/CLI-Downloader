@@ -1,4 +1,5 @@
 from pathlib import Path
+import tomllib
 import unittest
 
 
@@ -6,6 +7,16 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class PackagingConfigurationTest(unittest.TestCase):
+    def test_runtime_version_uses_the_single_project_version_source(self) -> None:
+        from cli_downloader import __version__
+
+        with (ROOT / "pyproject.toml").open("rb") as stream:
+            project_version = tomllib.load(stream)["project"]["version"]
+        spec = (ROOT / "Scripts" / "clid.spec").read_text(encoding="utf-8")
+
+        self.assertEqual(__version__, project_version)
+        self.assertIn('[(str(ROOT / "pyproject.toml"), ".")]', spec)
+
     def test_plugin_catalog_has_no_packaged_fallback_snapshot(self) -> None:
         project = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
         self.assertNotIn('"cli_downloader.plugins.catalogs" = ["*.json"]', project)

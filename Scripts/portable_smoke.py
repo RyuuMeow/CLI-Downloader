@@ -118,12 +118,21 @@ def verify_bundle(bundle: Path) -> None:
         help_started = time.perf_counter()
         _run(executable, ["--help"], environment=environment)
         help_seconds = time.perf_counter() - help_started
+        # The first one-folder launch can pay for Windows Defender and DLL
+        # extraction. Repeated launches are much faster, so keep this as a
+        # regression guard without making cold-start CI flaky.
         if help_seconds > 10:
             raise RuntimeError(f"packaged --help startup exceeded 10 seconds: {help_seconds:.2f}s")
 
         diagnose = json.loads(_run(executable, ["diagnose"], environment=environment))
         if Path(diagnose["paths"]["data_root"]) != data_root:
             raise RuntimeError("packaged application ignored CLI_DOWNLOADER_DATA_ROOT")
+
+        absent_status = json.loads(
+            _run(executable, ["shell", "status", "--json"], environment=environment)
+        )
+        if absent_status.get("status") not in {"absent", "stale"}:
+            raise RuntimeError(f"packaged Shell status was not initially absent: {absent_status}")
 
         defaults = json.loads(_run(executable, ["config", "defaults"], environment=environment))
         if "download.strategy" not in defaults:

@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
+from datetime import UTC, datetime
 from hashlib import sha256
 from pathlib import Path
 from types import MappingProxyType
@@ -15,7 +16,11 @@ from cli_downloader.application.batch_pipeline import (
     BatchPackageResolver,
     ProgressReporter,
 )
+from cli_downloader.application.execution_control import OwnerShutdownRequested
 from cli_downloader.application.download_limiter import GalleryDownloadLimiter
+from cli_downloader.application.plugin_network import invoke_plugin_network, checkpoint_control
+from cli_downloader.application.site_request_coordinator import RequestContext, request_context
+from cli_downloader.core.http import closing_stream, has_managed_http, restart_interrupted_download
 from cli_downloader.core.batch import (
     AssetRecord,
     AssetStatus,
@@ -133,6 +138,143 @@ class BatchService:
             )
         )
 
+    def begin_enumeration(
+        self,
+        *,
+        plugin_id: str,
+        site_id: str,
+        source_operation_id: str,
+        source_url: str,
+        title: str,
+        parent_id: str | None = None,
+    ) -> str:
+        """Persist an empty Batch root before a potentially slow list scan.
+
+        The returned identity is safe to expose as an owner acceptance: the
+        public Task, execution root, History aggregate, and audit event all
+        exist before this method returns. ``confirm_selection`` later rebuilds
+        this empty graph atomically with the enumerated entries.
+        """
+
+        if self._store is None or self._task_store is None:
+            raise RuntimeError("batch and task storage are required to begin enumeration")
+        parent_id = parent_id or uuid4().hex
+        parent = BatchParent(parent_id=parent_id, entry_ids=(), title=title)
+        task = TaskRecord(
+            task_id=parent_id,
+            status=TaskStatus.PENDING,
+            kind=TaskKind.BATCH,
+            site_id=site_id,
+            source_url=source_url,
+            title=title,
+            metadata={
+                "batch_enumeration": {
+                    "state": "enumerating",
+                    "plugin_id": plugin_id,
+                    "site_id": site_id,
+                    "source_operation_id": source_operation_id,
+                },
+                "scheduler": {
+                    "root_id": parent_id,
+                    "enqueue_sequence": 0,
+                    "site_id": site_id,
+                    "entry_order": {},
+                },
+            },
+        )
+        event = TaskEvent(
+            task_id=parent_id,
+            name="batch_enumeration_started",
+            reason="list_enumeration_started",
+            payload={
+                "plugin_id": plugin_id,
+                "site_id": site_id,
+                "source_operation_id": source_operation_id,
+                "source_url": source_url,
+                "title": title,
+            },
+        )
+        history_record = DownloadHistoryRecord(
+            record_id=parent_id,
+            task_id=parent_id,
+            kind=HistoryKind.BATCH,
+            plugin_id=plugin_id,
+            site_id=site_id,
+            title=title,
+            source_url=source_url,
+            status=TaskStatus.PENDING.value,
+        )
+        if _uses_shared_state_stores(self._store, self._task_store, self._history_store):
+            self._store.create_task_and_batch(
+                task,
+                parent,
+                (),
+                (event,),
+                history_records=(history_record,),
+            )
+            return parent_id
+
+        self._task_store.upsert(task)
+        try:
+            self._store.create_batch(parent, ())
+        except Exception:
+            self._task_store.delete(parent_id)
+            raise
+        if self._history_store is not None:
+            self._history_store.append(event)
+            if isinstance(self._history_store, StateHistoryStore):
+                self._history_store.upsert_record(history_record)
+        return parent_id
+
+    def fail_enumeration(self, parent_id: str, message: str, *, cancelled: bool = False) -> None:
+        """Close a provisional Batch when its list scan cannot be completed."""
+
+        if self._store is None or self._task_store is None:
+            raise RuntimeError("batch and task storage are required to fail enumeration")
+        current = self._task_store.get(parent_id)
+        if current is None or current.kind is not TaskKind.BATCH:
+            raise RuntimeError(f"provisional batch task not found: {parent_id}")
+        status = TaskStatus.CANCELED if cancelled else TaskStatus.FAILED
+        task = current.transition(
+            status=status,
+            metadata={
+                **current.metadata,
+                "batch_enumeration": {
+                    **dict(current.metadata.get("batch_enumeration", {})),
+                    "state": "cancelled" if cancelled else "failed",
+                    "error": message,
+                },
+                "failure": {"stage": "list_enumeration", "message": message},
+            },
+        )
+        event = TaskEvent(
+            task_id=parent_id,
+            name="batch_enumeration_finished",
+            reason="list_enumeration_cancelled" if cancelled else "list_enumeration_failed",
+            payload={"error": message},
+        )
+        history_record = None
+        if isinstance(self._history_store, StateHistoryStore):
+            current_history = self._history_store.get_record(parent_id)
+            if current_history is not None:
+                history_record = replace(
+                    current_history,
+                    status=status.value,
+                    finished_at=datetime.now(UTC),
+                )
+        if isinstance(self._store, StateBatchStore):
+            self._store.update_batch_task_and_history(
+                task,
+                history_events=(event,),
+                history_record=history_record,
+            )
+            return
+        self._task_store.upsert(task)
+        if self._history_store is not None:
+            self._history_store.append(event)
+            if history_record is not None:
+                self._history_store.upsert_record(history_record)
+
     def confirm_selection(
         self,
         *,
@@ -144,6 +286,7 @@ class BatchService:
         title: str | None = None,
         strategy: DownloadStrategy = DownloadStrategy.AUTO,
         force: bool = False,
+        parent_id: str | None = None,
     ) -> ConfirmedBatchResult:
         selected = tuple(items)
         if self._store is None:
@@ -160,7 +303,23 @@ class BatchService:
             for item in selected:
                 if self._completion_store.is_completed(site_id, item.source_url):
                     duplicates[item.item_id] = DuplicateKind.COMPLETED
-        parent_id = uuid4().hex
+        provisional_parent_id = parent_id
+        parent_id = parent_id or uuid4().hex
+        existing_task = (
+            self._task_store.get(parent_id) if provisional_parent_id is not None else None
+        )
+        if provisional_parent_id is not None:
+            existing_parent = parent_id in self._store.list_parent_ids()
+            if (existing_task is None) != (not existing_parent):
+                raise RuntimeError(f"incomplete provisional batch state: {parent_id}")
+        if existing_task is not None:
+            enumeration = existing_task.metadata.get("batch_enumeration")
+            if (
+                existing_task.kind is not TaskKind.BATCH
+                or not isinstance(enumeration, Mapping)
+                or enumeration.get("state") != "enumerating"
+            ):
+                raise RuntimeError(f"batch identity is not an active enumeration: {parent_id}")
 
         def _is_duplicate(item: ListItemData) -> bool:
             if force:
@@ -193,37 +352,57 @@ class BatchService:
             entry_ids=tuple(entry.entry_id for entry in entries),
             title=title or parent_id[:8],
         )
-        task_record = TaskRecord(
-            task_id=parent_id,
-            status=TaskStatus.PENDING,
-            kind=TaskKind.BATCH,
-            site_id=site_id,
-            source_url=source_url,
-            title=parent.title,
-            metadata={
-                "batch_selection": {
-                    "plugin_id": plugin_id,
-                    "site_id": site_id,
-                    "source_operation_id": source_operation_id,
-                    "strategy": strategy.value,
-                    "items": [
-                        {
-                            "candidate_id": item.item_id,
-                            "source_url": item.source_url,
-                            "title": item.title,
-                        }
-                        for item in selected
-                    ],
-                },
-                "scheduler": {
-                    "root_id": parent_id,
-                    "enqueue_sequence": 0,
-                    "site_id": site_id,
-                    "entry_order": {
-                        entry.entry_id: sequence for sequence, entry in enumerate(entries)
+        task_metadata = {
+            "batch_selection": {
+                "plugin_id": plugin_id,
+                "site_id": site_id,
+                "source_operation_id": source_operation_id,
+                "strategy": strategy.value,
+                "items": [
+                    {
+                        "candidate_id": item.item_id,
+                        "source_url": item.source_url,
+                        "title": item.title,
+                    }
+                    for item in selected
+                ],
+            },
+            "scheduler": {
+                "root_id": parent_id,
+                "enqueue_sequence": 0,
+                "site_id": site_id,
+                "entry_order": {entry.entry_id: sequence for sequence, entry in enumerate(entries)},
+            },
+        }
+        if existing_task is None:
+            task_record = TaskRecord(
+                task_id=parent_id,
+                status=TaskStatus.PENDING,
+                kind=TaskKind.BATCH,
+                site_id=site_id,
+                source_url=source_url,
+                title=parent.title,
+                metadata=task_metadata,
+            )
+        else:
+            task_record = existing_task.transition(
+                site_id=site_id,
+                source_url=source_url,
+                title=parent.title,
+                metadata={
+                    **existing_task.metadata,
+                    **task_metadata,
+                    "batch_enumeration": {
+                        **dict(existing_task.metadata["batch_enumeration"]),
+                        "state": "completed",
+                        "item_count": len(entries),
                     },
                 },
-            },
+            )
+        existing_history = (
+            self._history_store.get_record(parent_id)
+            if existing_task is not None and isinstance(self._history_store, StateHistoryStore)
+            else None
         )
         parent_history_record = DownloadHistoryRecord(
             record_id=parent_id,
@@ -234,6 +413,9 @@ class BatchService:
             title=parent.title,
             source_url=source_url,
             status=TaskStatus.PENDING.value,
+            created_at=(
+                existing_history.created_at if existing_history is not None else datetime.now(UTC)
+            ),
         )
         provisional_snapshot = derive_batch_snapshot(parent, entries, ())
         events_to_append = tuple(
@@ -271,21 +453,38 @@ class BatchService:
             ]
         )
         if _uses_shared_state_stores(self._store, self._task_store, self._history_store):
-            snapshot = self._store.create_task_and_batch(
-                task_record,
-                parent,
-                entries,
-                events_to_append,
-                history_records=(parent_history_record,),
-            )
+            if existing_task is not None:
+                snapshot = self._store.rebuild_task_and_batch(
+                    task_record,
+                    parent,
+                    entries,
+                    events_to_append,
+                    history_record=parent_history_record,
+                )
+            else:
+                snapshot = self._store.create_task_and_batch(
+                    task_record,
+                    parent,
+                    entries,
+                    events_to_append,
+                    history_records=(parent_history_record,),
+                )
         else:
             self._task_store.upsert(task_record)
             try:
-                self._store.create_batch(parent, entries)
+                if existing_task is not None and isinstance(self._store, StateBatchStore):
+                    snapshot = self._store.rebuild_task_and_batch(
+                        task_record,
+                        parent,
+                        entries,
+                    )
+                else:
+                    self._store.create_batch(parent, entries)
+                    snapshot = self._store.get_snapshot(parent_id)
             except Exception:
-                self._task_store.delete(task_record.task_id)
+                if existing_task is None:
+                    self._task_store.delete(task_record.task_id)
                 raise
-            snapshot = self._store.get_snapshot(parent_id)
             if self._history_store is not None:
                 self._history_store.append_many(events_to_append)
                 if isinstance(self._history_store, StateHistoryStore):
@@ -337,20 +536,27 @@ class RuntimePackageResolver(BatchPackageResolver):
                 )
             )
 
-        item = (
-            await self._request_limiter.request(
-                entry.site_id,
-                resolve_item,
-                report_retry=lambda payload: progress("request_rate_limited", payload),
-            )
-            if self._request_limiter is not None
-            else await resolve_item()
+        context = RequestContext(
+            entry.parent_id,
+            "prepare",
+            task_id=entry.entry_id,
+            profile=self._profile,
+            checkpoint=lambda: checkpoint_control(cancel_event),
+        )
+        item = await invoke_plugin_network(
+            instance, self._request_limiter, entry.site_id, resolve_item, context=context
         )
         progress("gallery_resolved", {"candidate_id": entry.candidate_id})
         await _wait_if_paused(cancel_event)
         if cancel_event.is_set():
             raise asyncio.CancelledError
-        plan = await instance.choose_strategy(item)
+        plan = await invoke_plugin_network(
+            instance,
+            self._request_limiter,
+            entry.site_id,
+            lambda: instance.choose_strategy(item),
+            context=context,
+        )
         gallery_id = _gallery_id(item.metadata, entry.candidate_id)
         assets = tuple(
             DownloadAsset(
@@ -425,7 +631,20 @@ class SystemBatchDownloader(BatchDownloadExecutor):
         self._torrent_client = torrent_client
         self._auto_delete_torrent_file = auto_delete_torrent_file
 
-    async def execute(
+    async def execute(self, child, assets, cancel_event, progress):
+        with request_context(
+            RequestContext(
+                child.parent_id,
+                "download",
+                task_id=child.child_id,
+                checkpoint=lambda: checkpoint_control(cancel_event),
+                release_item=getattr(cancel_event, "pause_boundary", None),
+                resume_item=getattr(cancel_event, "resume_boundary", None),
+            )
+        ):
+            return await self._execute(child, assets, cancel_event, progress)
+
+    async def _execute(
         self,
         child: DownloadChild,
         assets: tuple[AssetRecord, ...],
@@ -435,41 +654,54 @@ class SystemBatchDownloader(BatchDownloadExecutor):
         if child.package.strategy == DownloadStrategy.TORRENT:
             return await self._execute_torrent(child, assets, cancel_event, progress)
         outcomes: list[AssetRecord] = []
+
+        def append_outcome(outcome: AssetRecord) -> None:
+            outcomes.append(outcome)
+            if self._store is not None:
+                self._store.update_asset(child.child_id, outcome)
+
         for record in assets:
             wait_if_paused = getattr(cancel_event, "wait_if_paused", None)
             if callable(wait_if_paused):
                 await wait_if_paused()
             if cancel_event.is_set():
-                outcomes.append(replace(record, status=AssetStatus.CANCELLED))
+                append_outcome(replace(record, status=AssetStatus.CANCELLED))
                 continue
             legacy_asset = _legacy_asset(record.asset)
             resumed = None
             if record.partial_path is not None and record.content_sha256 is not None:
-                resumed = self._file_writer.resume(
-                    _legacy_asset(record.asset, include_plugin_asset_key=False),
-                    task_id=child.child_id,
-                    partial_path=record.partial_path,
-                    content_sha256=record.content_sha256,
-                    folder_fields=_package_folder_fields(child.package),
-                    folder_template=child.package.folder_template,
-                )
-                if resumed is None:
+                # An interrupted stream is explicitly marked partial and must
+                # be fetched again because the current fetcher contract has no
+                # range-resume capability. Older checkpoints represent a
+                # complete response whose atomic rename was interrupted; the
+                # writer promotes those only after verifying its hash.
+                if record.metadata.get("checkpoint_kind") != "partial":
                     resumed = self._file_writer.resume(
-                        legacy_asset,
+                        _legacy_asset(record.asset, include_plugin_asset_key=False),
                         task_id=child.child_id,
                         partial_path=record.partial_path,
                         content_sha256=record.content_sha256,
                         folder_fields=_package_folder_fields(child.package),
                         folder_template=child.package.folder_template,
                     )
+                    if resumed is None:
+                        resumed = self._file_writer.resume(
+                            legacy_asset,
+                            task_id=child.child_id,
+                            partial_path=record.partial_path,
+                            content_sha256=record.content_sha256,
+                            folder_fields=_package_folder_fields(child.package),
+                            folder_template=child.package.folder_template,
+                        )
             if resumed is not None:
-                outcomes.append(
+                append_outcome(
                     replace(
                         record,
                         status=AssetStatus.COMPLETED,
                         failure=None,
                         partial_path=None,
                         final_path=str(resumed.path),
+                        metadata={**record.metadata, "checkpoint_kind": "complete"},
                     )
                 )
                 progress(
@@ -490,29 +722,38 @@ class SystemBatchDownloader(BatchDownloadExecutor):
                     bytes_so_far = 0
                     last_report_time = 0.0
                     try:
-                        async for chunk, total in fetcher.fetch_stream(legacy_asset):
-                            hash_obj.update(chunk)
-                            bytes_so_far += len(chunk)
-                            now = time.monotonic()
-                            if (
-                                total is None
-                                or bytes_so_far == total
-                                or now - last_report_time > 0.1
-                            ):
-                                progress(
-                                    "byte_progress",
-                                    {
-                                        "asset_id": record.asset.asset_id,
-                                        "bytes_received": bytes_so_far,
-                                        "total_bytes": total,
-                                    },
-                                )
-                                last_report_time = now
-                            yield chunk
+                        async with closing_stream(fetcher.fetch_stream(legacy_asset)) as chunks:
+                            async for chunk, total in chunks:
+                                if callable(wait_if_paused):
+                                    await wait_if_paused()
+                                if cancel_event.is_set():
+                                    raise asyncio.CancelledError
+                                hash_obj.update(chunk)
+                                bytes_so_far += len(chunk)
+                                now = time.monotonic()
+                                if (
+                                    total is None
+                                    or bytes_so_far == total
+                                    or now - last_report_time > 0.1
+                                ):
+                                    progress(
+                                        "byte_progress",
+                                        {
+                                            "asset_id": record.asset.asset_id,
+                                            "bytes_received": bytes_so_far,
+                                            "total_bytes": total,
+                                        },
+                                    )
+                                    last_report_time = now
+                                yield chunk
+                    except OwnerShutdownRequested:
+                        raise
                     except Exception as e:
                         raise FetchErrorWrap() from e
 
                 async def fetch_and_write() -> WrittenAsset:
+                    nonlocal hash_obj
+                    hash_obj = sha256()
                     return await self._file_writer.write_stream(
                         legacy_asset,
                         _chunk_generator(),
@@ -525,13 +766,30 @@ class SystemBatchDownloader(BatchDownloadExecutor):
                     written = (
                         await self._request_limiter.request(
                             record.asset.site_id,
-                            fetch_and_write,
+                            lambda: restart_interrupted_download(fetch_and_write),
                             report_retry=lambda payload: progress("request_rate_limited", payload),
                         )
-                        if self._request_limiter is not None
-                        else await fetch_and_write()
+                        if self._request_limiter is not None and not has_managed_http(fetcher)
+                        else await restart_interrupted_download(fetch_and_write)
                     )
                     digest = hash_obj.hexdigest()
+                except OwnerShutdownRequested:
+                    _target, partial = self._file_writer.paths(
+                        legacy_asset,
+                        task_id=child.child_id,
+                        folder_fields=_package_folder_fields(child.package),
+                        folder_template=child.package.folder_template,
+                    )
+                    append_outcome(
+                        replace(
+                            record,
+                            status=AssetStatus.DOWNLOADING,
+                            partial_path=str(partial) if partial.exists() else None,
+                            content_sha256=hash_obj.hexdigest(),
+                            metadata={**record.metadata, "checkpoint_kind": "partial"},
+                        )
+                    )
+                    return tuple(outcomes)
                 except Exception as error:
                     _target, partial = self._file_writer.paths(
                         legacy_asset,
@@ -545,11 +803,12 @@ class SystemBatchDownloader(BatchDownloadExecutor):
                     actual_error = error.__cause__ if is_fetch_error and error.__cause__ else error
                     stage = FailureStage.FETCH if is_fetch_error else FailureStage.WRITE
 
-                    outcomes.append(
+                    append_outcome(
                         replace(
                             _failed_record(record, actual_error, stage),
                             partial_path=str(partial) if partial.exists() else None,
                             content_sha256=hash_obj.hexdigest(),
+                            metadata={**record.metadata, "checkpoint_kind": "partial"},
                         )
                     )
                     continue
@@ -565,11 +824,11 @@ class SystemBatchDownloader(BatchDownloadExecutor):
                             fetch_asset,
                             report_retry=lambda payload: progress("request_rate_limited", payload),
                         )
-                        if self._request_limiter is not None
+                        if self._request_limiter is not None and not has_managed_http(fetcher)
                         else await fetch_asset()
                     )
                 except Exception as error:
-                    outcomes.append(_failed_record(record, error, FailureStage.FETCH))
+                    append_outcome(_failed_record(record, error, FailureStage.FETCH))
                     continue
                 digest = sha256(content).hexdigest()
                 try:
@@ -587,22 +846,24 @@ class SystemBatchDownloader(BatchDownloadExecutor):
                         folder_fields=_package_folder_fields(child.package),
                         folder_template=child.package.folder_template,
                     )
-                    outcomes.append(
+                    append_outcome(
                         replace(
                             _failed_record(record, error, FailureStage.WRITE),
                             partial_path=str(partial) if partial.exists() else None,
                             content_sha256=digest,
+                            metadata={**record.metadata, "checkpoint_kind": "complete"},
                         )
                     )
                     continue
 
-            outcomes.append(
+            append_outcome(
                 replace(
                     record,
                     status=AssetStatus.COMPLETED,
                     partial_path=None,
                     final_path=str(written.path),
                     content_sha256=digest,
+                    metadata={**record.metadata, "checkpoint_kind": "complete"},
                 )
             )
             progress(
@@ -835,9 +1096,19 @@ class SystemBatchDownloader(BatchDownloadExecutor):
             outcomes.append(resumed_record)
 
         # Phase 2: poll all added torrents until completion.
+        release_admission = getattr(cancel_event, "release_admission", None)
+        if pending and callable(release_admission):
+            await release_admission()
+
+        def _shutdown_requested() -> bool:
+            shutdown = getattr(cancel_event, "is_shutdown_requested", None)
+            return callable(shutdown) and bool(shutdown())
+
         for idx, handle, written_record in pending:
 
             def _cancel_requested() -> bool:
+                if _shutdown_requested():
+                    return False
                 return cancel_event.is_set()
 
             def _status_callback(outcome: TorrentOutcome) -> None:
@@ -872,6 +1143,8 @@ class SystemBatchDownloader(BatchDownloadExecutor):
                         "cancel_requested": _cancel_requested,
                         "status_callback": _status_callback,
                     }
+                    if poll_supports_argument(poll_method, "shutdown_requested"):
+                        poll_kwargs["shutdown_requested"] = _shutdown_requested
                     if callable(
                         getattr(cancel_event, "is_paused", None)
                     ) and poll_supports_argument(poll_method, "pause_requested"):
@@ -882,6 +1155,12 @@ class SystemBatchDownloader(BatchDownloadExecutor):
                         handle,
                         **poll_kwargs,
                     )
+                    # qBittorrent returns the last observed state directly on
+                    # owner shutdown, before its polling helper can emit the
+                    # normal callback. Persist that observation so restart
+                    # reconciliation does not mistake a submitted torrent
+                    # for an unknown state.
+                    _status_callback(outcome)
                 else:
                     outcome = await self._torrent_client.get_status(handle)
                     _status_callback(outcome)
@@ -925,6 +1204,9 @@ class SystemBatchDownloader(BatchDownloadExecutor):
                 )
             if self._store is not None:
                 self._store.update_asset(child.child_id, outcomes[idx])
+
+        if _shutdown_requested():
+            return tuple(outcomes)
 
         # Phase 3: auto-delete .torrent files.
         if self._auto_delete_torrent_file:

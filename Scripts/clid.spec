@@ -10,10 +10,19 @@ main_analysis = Analysis(
     [str(ROOT / "cli_downloader" / "__main__.py")],
     pathex=[str(ROOT)],
     binaries=[],
-    datas=collect_data_files("cli_downloader") + copy_metadata("cli-downloader"),
+    datas=collect_data_files("cli_downloader")
+    + copy_metadata("cli-downloader")
+    + [(str(ROOT / "pyproject.toml"), ".")],
     # External plugins are imported only at runtime, so PyInstaller cannot
     # discover standard-library modules used exclusively by plugin code.
-    hiddenimports=collect_submodules("textual") + ["html.parser"],
+    hiddenimports=collect_submodules("textual")
+    + [
+        "html.parser",
+        "multiprocessing.connection",
+        "cli_downloader.core.owner_protocol",
+        "cli_downloader.core.owner_scope",
+        "cli_downloader.core.owner_transport",
+    ],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

@@ -234,6 +234,25 @@ class TorrentReconciliationTest(TestCase):
         self.assertEqual(result.handle, handle)
         self.assertEqual(client.handles, [handle])
 
+    def test_paused_checkpoint_reuses_handle_without_resubmission(self) -> None:
+        handle = TorrentHandle("abc123", "test.torrent")
+        client = _CheckpointClient(
+            TorrentOutcome(
+                handle,
+                "paused",
+                "/downloads",
+                found=True,
+                client_state="pausedDL",
+            )
+        )
+
+        result = asyncio.run(reconcile_torrent_checkpoint(client, self._checkpoint()))
+
+        self.assertEqual(result.action, "resume")
+        self.assertEqual(result.handle, handle)
+        self.assertEqual(result.outcome.client_state, "pausedDL")
+        self.assertEqual(client.handles, [handle])
+
     def test_accepted_missing_checkpoint_is_external_completion(self) -> None:
         handle = TorrentHandle("abc123", "test.torrent")
         client = _CheckpointClient(

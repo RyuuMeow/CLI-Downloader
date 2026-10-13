@@ -259,6 +259,7 @@ class TaskStateTest(TestCase):
             "preparing",
             "queued",
             "running",
+            "pausing",
             "paused",
             "completed",
             "partially_completed",

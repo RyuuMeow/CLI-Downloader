@@ -58,7 +58,7 @@ class StateDatabaseTest(TestCase):
             database = StateDatabase(Path(directory) / "state" / "state.sqlite3")
 
             self.assertTrue(database.path.exists())
-            self.assertEqual(database.schema_version, 11)
+            self.assertEqual(database.schema_version, 12)
             self.assertEqual(
                 tuple((record.version, record.name) for record in database.migration_records()),
                 (
@@ -71,6 +71,7 @@ class StateDatabaseTest(TestCase):
                     (9, "add_execution_identity_columns"),
                     (10, "create_download_history"),
                     (11, "backfill_download_history"),
+                    (12, "create_site_cooldowns"),
                 ),
             )
             with closing(sqlite3.connect(database.path)) as connection:
@@ -87,8 +88,8 @@ class StateDatabaseTest(TestCase):
 
             reopened = StateDatabase(db_path)
 
-            self.assertEqual(reopened.schema_version, 11)
-            self.assertEqual(len(reopened.migration_records()), 9)
+            self.assertEqual(reopened.schema_version, 12)
+            self.assertEqual(len(reopened.migration_records()), 10)
 
     def test_rejects_newer_schema_before_any_repository_can_write(self) -> None:
         with TemporaryDirectory() as directory:
@@ -96,7 +97,7 @@ class StateDatabaseTest(TestCase):
             StateDatabase(db_path)
             with closing(sqlite3.connect(db_path)) as connection:
                 connection.execute(
-                    "UPDATE schema_metadata SET value = '12' WHERE key = 'schema_version'"
+                    "UPDATE schema_metadata SET value = '13' WHERE key = 'schema_version'"
                 )
                 connection.commit()
 
@@ -260,7 +261,8 @@ class StateDatabaseTest(TestCase):
                             created_at,
                         ),
                     )
-                connection.execute("DELETE FROM migration_journal WHERE version = 11")
+                connection.execute("DROP TABLE site_cooldowns")
+                connection.execute("DELETE FROM migration_journal WHERE version >= 11")
                 connection.execute(
                     "UPDATE schema_metadata SET value = '10' WHERE key = 'schema_version'"
                 )

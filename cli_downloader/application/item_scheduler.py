@@ -8,11 +8,12 @@ file requests and qBittorrent's long-running transfer queue to their owners.
 from __future__ import annotations
 
 import asyncio
-from collections import defaultdict
+from collections import defaultdict, deque
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from enum import StrEnum
+from threading import RLock
 from uuid import uuid4
 
 
@@ -29,6 +30,8 @@ class _Waiter:
     sequence: int
     order: int
     event: asyncio.Event
+    loop: asyncio.AbstractEventLoop
+    cancelled: bool = False
 
 
 class ItemLease:
@@ -84,7 +87,9 @@ class ItemScheduler:
         self.max_concurrent_downloads = max_concurrent_downloads
         self.max_concurrent_downloads_per_site = per_site
         self.policy = selected_policy
-        self._lock = asyncio.Lock()
+        # Shell workers run on separate asyncio loops. Protect shared admission
+        # synchronously and deliver notifications on each waiter's own loop.
+        self._lock = RLock()
         self._pending: list[_Waiter] = []
         self._active: dict[str, _Waiter] = {}
         self._active_by_site: defaultdict[str, int] = defaultdict(int)
@@ -92,6 +97,7 @@ class ItemScheduler:
         self._root_order: list[str] = []
         self._last_root: str | None = None
         self._next_order = 0
+        self._suspended_roots: set[str] = set()
 
     async def acquire(
         self,
@@ -112,8 +118,9 @@ class ItemScheduler:
             sequence=sequence,
             order=0,
             event=asyncio.Event(),
+            loop=asyncio.get_running_loop(),
         )
-        async with self._lock:
+        with self._lock:
             waiter.order = self._next_order
             self._next_order += 1
             self._pending.append(waiter)
@@ -124,14 +131,44 @@ class ItemScheduler:
         try:
             await waiter.event.wait()
         except asyncio.CancelledError:
-            async with self._lock:
+            with self._lock:
                 if waiter.token in self._active:
                     self._release_locked(waiter)
                 else:
                     self._remove_pending_locked(waiter)
                     self._grant_locked()
             raise
+        if waiter.cancelled:
+            raise asyncio.CancelledError
         return ItemLease(self, waiter)
+
+    async def suspend_root(self, root_id: str) -> None:
+        _require_root_id(root_id)
+        with self._lock:
+            self._suspended_roots.add(root_id)
+            self._grant_locked()
+
+    async def resume_root(self, root_id: str) -> None:
+        _require_root_id(root_id)
+        with self._lock:
+            self._suspended_roots.discard(root_id)
+            self._grant_locked()
+
+    async def cancel_root(self, root_id: str) -> None:
+        _require_root_id(root_id)
+        with self._lock:
+            self._cancel_pending_root_locked(root_id)
+            self._suspended_roots.discard(root_id)
+            self._grant_locked()
+
+    def suspend_root_sync(self, root_id: str) -> None:
+        self._run_root_control_sync("suspend", root_id)
+
+    def resume_root_sync(self, root_id: str) -> None:
+        self._run_root_control_sync("resume", root_id)
+
+    def cancel_root_sync(self, root_id: str) -> None:
+        self._run_root_control_sync("cancel", root_id)
 
     @asynccontextmanager
     async def item(
@@ -148,19 +185,43 @@ class ItemScheduler:
             await lease.release()
 
     async def release(self, waiter: _Waiter) -> None:
-        async with self._lock:
+        with self._lock:
             self._release_locked(waiter)
 
     async def waiting_snapshot(self) -> tuple[dict[str, object], ...]:
         """Return stable waiting rows for Tasks/diagnostic projections."""
 
-        async with self._lock:
+        with self._lock:
             return self._waiting_snapshot_locked()
+
+    async def active_snapshot(self) -> tuple[dict[str, object], ...]:
+        """Return the currently granted Item leases for bounded diagnostics."""
+
+        with self._lock:
+            return self._active_snapshot_locked()
 
     def waiting_snapshot_sync(self) -> tuple[dict[str, object], ...]:
         """Return a best-effort synchronous view for the synchronous Tasks UI."""
 
-        return self._waiting_snapshot_locked()
+        with self._lock:
+            return self._waiting_snapshot_locked()
+
+    def active_snapshot_sync(self) -> tuple[dict[str, object], ...]:
+        """Return a best-effort synchronous active-lease view for diagnostics."""
+
+        with self._lock:
+            return self._active_snapshot_locked()
+
+    def _active_snapshot_locked(self) -> tuple[dict[str, object], ...]:
+        rows = [
+            {
+                "root_id": waiter.root_id,
+                "site_id": waiter.site_id,
+                "sequence": waiter.sequence,
+            }
+            for waiter in self._active.values()
+        ]
+        return tuple(sorted(rows, key=lambda row: (str(row["root_id"]), int(row["sequence"]))))
 
     def _waiting_snapshot_locked(self) -> tuple[dict[str, object], ...]:
         rows = []
@@ -186,7 +247,7 @@ class ItemScheduler:
             self._active[waiter.token] = waiter
             self._active_by_site[waiter.site_id] += 1
             self._active_by_root[waiter.root_id] += 1
-            waiter.event.set()
+            self._signal_waiter(waiter)
 
     def _eligible_locked(self) -> list[_Waiter]:
         heads: dict[str, _Waiter] = {}
@@ -200,6 +261,7 @@ class ItemScheduler:
         candidates = [
             waiter
             for waiter in heads.values()
+            if waiter.root_id not in self._suspended_roots
             if self._active_by_site[waiter.site_id] < self.max_concurrent_downloads_per_site
         ]
         if not candidates:
@@ -250,16 +312,37 @@ class ItemScheduler:
     def _ordered_pending_locked(self) -> list[_Waiter]:
         if self.policy is SchedulerPolicy.FIFO:
             return sorted(self._pending, key=lambda waiter: waiter.order)
-        return sorted(
-            self._pending,
-            key=lambda waiter: (
-                self._root_order.index(waiter.root_id),
-                waiter.sequence,
-                waiter.order,
+        by_root: dict[str, deque[_Waiter]] = defaultdict(deque)
+        for waiter in sorted(self._pending, key=lambda row: (row.sequence, row.order)):
+            by_root[waiter.root_id].append(waiter)
+        start = (
+            (self._root_order.index(self._last_root) + 1) % len(self._root_order)
+            if self._last_root in self._root_order
+            else 0
+        )
+        rotation = self._root_order[start:] + self._root_order[:start]
+        # Ineligible roots remain visible but do not precede runnable work.
+        roots = sorted(
+            (root for root in rotation if root in by_root),
+            key=lambda root: (
+                root in self._suspended_roots,
+                self._active_by_site[by_root[root][0].site_id]
+                >= self.max_concurrent_downloads_per_site,
+                self._active_by_root[root] > 0,
             ),
         )
+        pending_roots = deque(roots)
+        ordered: list[_Waiter] = []
+        while pending_roots:
+            root = pending_roots.popleft()
+            ordered.append(by_root[root].popleft())
+            if by_root[root]:
+                pending_roots.append(root)
+        return ordered
 
     def _waiting_reason_locked(self, waiter: _Waiter) -> str:
+        if waiter.root_id in self._suspended_roots:
+            return "root_suspended"
         if len(self._active) >= self.max_concurrent_downloads:
             return "global_slot"
         if self._active_by_site[waiter.site_id] >= self.max_concurrent_downloads_per_site:
@@ -272,7 +355,43 @@ class ItemScheduler:
             return "root_order"
         return "fair_turn"
 
+    def _cancel_pending_root_locked(self, root_id: str) -> None:
+        for waiter in tuple(self._pending):
+            if waiter.root_id != root_id:
+                continue
+            waiter.cancelled = True
+            self._pending.remove(waiter)
+            self._signal_waiter(waiter)
+
+    def _run_root_control_sync(self, action: str, root_id: str) -> None:
+        _require_root_id(root_id)
+        with self._lock:
+            if action == "suspend":
+                self._suspended_roots.add(root_id)
+            elif action == "resume":
+                self._suspended_roots.discard(root_id)
+            else:
+                self._cancel_pending_root_locked(root_id)
+                self._suspended_roots.discard(root_id)
+            self._grant_locked()
+
+    @staticmethod
+    def _signal_waiter(waiter: _Waiter) -> None:
+        try:
+            current_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            current_loop = None
+        if current_loop is waiter.loop:
+            waiter.event.set()
+        else:
+            waiter.loop.call_soon_threadsafe(waiter.event.set)
+
 
 def _positive_int(value: int, name: str) -> None:
     if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
         raise ValueError(f"{name} must be a positive integer")
+
+
+def _require_root_id(root_id: str) -> None:
+    if not isinstance(root_id, str) or not root_id:
+        raise ValueError("root_id must be a non-empty string")

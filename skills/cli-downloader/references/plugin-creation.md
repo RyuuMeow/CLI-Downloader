@@ -39,7 +39,7 @@ Plugins/<plugin_id>/
    `- site.json
 ```
 
-`plugin.json` identifies `plugin_id`, display name, semantic version, description, `plugin.py:Plugin` entrypoint, and manifest filename. The manifest file must live below `manifests/`.
+`plugin.json` identifies `plugin_id`, display name, semantic version, description, `plugin.py:Plugin` entrypoint, and manifest filename. It may also declare `requires_python` and `requires_core_api` version requirements. The manifest file must live below `manifests/`.
 
 ## Contract boundaries
 

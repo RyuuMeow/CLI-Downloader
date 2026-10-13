@@ -102,6 +102,35 @@ routing rule remains unchanged.
 Operation identifiers may be plugin-defined and are validated against manifest
 schemas.
 
+## Scheduler Owner And Agent IPC
+
+One `OwnerScope` (product namespace, current-user identity, canonical data root,
+and protocol generation) has exactly one live Scheduler owner. The interactive
+Shell is the preferred owner. A foreground CLI may own the scope only when no
+Shell is ready; an external CLI otherwise submits a validated `OwnerRequest`
+through the local owner transport.
+
+Windows uses a scope-derived Named Pipe with an authenticated handshake;
+POSIX development uses a private Unix socket. Restricted Windows runners may
+use an ephemeral loopback endpoint only as an authenticated fallback. Endpoint
+metadata contains the complete scope fingerprint and is treated as discovery,
+not proof of liveness. The OS lease remains authoritative.
+
+Requests carry a stable request ID and response mode (`wait` or `detach`). The
+owner persists response events before sending them, so a retry can replay the
+same acceptance and terminal result instead of creating duplicate Tasks. Connect,
+handshake, acceptance, and response-idle waits are independently bounded;
+heartbeat and `owner_disconnected` events make a dead owner observable without
+inventing completion. Accepted work is reconciled from persisted Task, Batch,
+and torrent checkpoints by the next owner.
+
+Shell shutdown sets a stopping boundary before releasing the `OwnerScope` lease:
+new owner requests are rejected, active cancellation signals are propagated to
+download workers, active run checkpoints are normalized to recoverable planned
+state, and the Shell waits briefly for safe worker boundaries. The wait is bounded
+so a stuck integration cannot orphan the CLI indefinitely; the next owner performs
+the remaining checkpoint reconciliation.
+
 ## View And Interaction
 
 Plugins compose dynamic pages from core widget classes and enum-controlled
@@ -154,14 +183,46 @@ first-party domains. An expired session or one missing its login-proof Cookie is
 recoverable connection state instead of a fatal configuration error, so the Shell can
 display it as expired and let the user authenticate again.
 
-Network pacing is a system policy shared by every active Task for the same
-Plugin/site identity. Manifest `network` declares request concurrency, minimum
-interval, retryable HTTP statuses, total attempts, and fallback backoff ceiling;
-the settings registry exposes scalar overrides under
-`plugins.<plugin_id>.network`. Plugin resolution and Asset fetch boundaries use
-the same core request gate. `Retry-After` takes precedence over exponential
-backoff with jitter, and exhausted failures persist their attempt count and
-`next_retry_at` so manual Batch retry cannot bypass an active cooldown.
+Network pacing belongs to one `SiteRequestCoordinator` per live Owner. Its budget is
+keyed by site ID and shared across profiles, list/pagination operations, Batch and
+standalone preparation, and downloads. Item admission remains a separate scheduler:
+HTTP concurrency does not count Batch parents or replace the download Item limit.
+Manifest network policies override global fallback settings; changes become effective
+at the next Owner restart. Duplicate site registrations are rejected by the runtime.
+
+Plugins declaring `managed_http_version = 1` receive `PluginServices.http` once through
+`bind_services()`. Every buffered request, stream, redirect and eligible retry gets its
+own permit, including concurrent child tasks. Core's default asset fetcher uses the
+same client. Legacy plugins retain operation-level admission for resolve, strategy and
+listing; their internal traffic cannot be counted or certified by Core. See
+[the plugin HTTP contract](../../Plugins/README.md#managed-http-services-core-014).
+
+Admission combines capacity, monotonic start spacing and cooldown under one lock,
+rotating eligible root IDs and preserving FIFO within a root. There are no burst credits.
+A transport-thread start check handles executor delays without starting two requests at
+once. A new cooldown after admission returns the attempt to the asynchronous queue.
+429 and 503 with Retry-After extend the site's cooldown; server deadlines can exceed the
+local backoff ceiling. Only safe/replayable requests retry automatically. SQLite schema
+12 persists site cooldown changes, never per-request leases or credentials.
+
+Responses retain their permits until EOF or confirmed closure. Cancellation waits for
+blocking I/O to settle; pausing a managed asset closes its response before returning its
+Item slot. Resume restarts the unfinished asset while preserving completed files. During
+cooldown a sequential download returns its Item slot and reacquires Item admission before
+HTTP admission. Managed preparation fan-out has a supervisor that acknowledges pause only
+when all its HTTP responses have closed. Shutdown fences new starts and retains ownership
+until outstanding managed transports settle; a failed close does not falsely free capacity.
+Batch admission waits cancel their pending acquisition before acknowledging pause, and a
+Prepare worker waiting to enqueue an already persisted package counts as quiescent.
+This prevents full queues from leaving a Batch indefinitely Pausing. Resume is available
+during both Pausing and Paused and reuses its existing worker.
+
+External `operation` commands use typed Owner IPC and negotiate the `operation` capability.
+An incompatible owner is rejected, and an accepted operation with an unknown completion
+is never automatically resubmitted. `clid network status --json` reads the live owner's
+compact site counters, wait phases, cooldowns, effective settings and coverage. Tasks uses
+one network snapshot per projection; wait reasons do not change durable lifecycle states.
+Browser authentication and torrent peer traffic are outside this HTTP budget.
 
 The global `download.folder_template` remains the fallback relative Gallery
 folder policy. A Plugin may register additional scalar output fields and a
@@ -222,9 +283,26 @@ plugin resolve and enumerate
 
 Site plugins produce complete core download packages. Application services own
 validation, task creation, queues, task events, output writing, and history.
-Standalone Items and Batch children acquire the same process-wide Gallery
-download limiter before entering the system fetch/write stage. The default
-limit is two and is controlled by `download.max_concurrent_galleries`.
+Standalone Items and Batch children, including retries and resumed work, acquire
+one shared process-wide Item scheduler before entering the system fetch/write stage.
+`scheduler.max_concurrent_downloads` controls the global limit (default two), while
+`scheduler.max_concurrent_downloads_per_site` provides the per-site fallback. A Batch
+can use the available global capacity; it has no additional fixed two-worker cap.
+The former `download.max_concurrent_galleries` setting is hidden and is migrated on
+load only when no explicit scheduler limit exists. Network request concurrency,
+pacing, and retry backoff remain separate from Item admission.
+
+Each live Batch retains its own pipeline/coordinator registration until it finishes.
+Owner and Shell controls address that registration, and resume reuses a live worker.
+Pause intent projects as Pausing until the worker reaches a safe boundary. Paused
+streams release their active Item and request permits and reacquire them on resume;
+torrent pause acknowledgement follows the client pause call.
+
+Tasks roots and Batch children load in pages of 100 off the Textual event loop.
+Root pages decode compact metadata, aggregate Batch progress in bulk, and share one
+scheduler snapshot per refresh. Read projections use deferred, query-only SQLite
+transactions; state transitions retain immediate write transactions. Periodic refreshes
+coalesce while a page is loading, while navigation changes discard stale results.
 
 ## Pipelined Scheduling
 

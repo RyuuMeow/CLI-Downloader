@@ -66,6 +66,22 @@ docs/
 `HANDOFF.md` and RFC proposal files only exist while needed. Accepted decisions
 move to ADRs and completed implementation records move to `progress.md`.
 
+## Scheduler Owner And IPC Modules
+
+The single-owner boundary is implemented by the following maintained modules:
+
+| Path | Responsibility |
+| --- | --- |
+| `cli_downloader/core/owner_scope.py` | Canonical data-root/user identity, OS lease, discovery metadata, and lifecycle status |
+| `cli_downloader/core/owner_protocol.py` | Versioned handshake, request/event schemas, wait policy, liveness, and request ledger |
+| `cli_downloader/core/owner_transport.py` | Named Pipe/Unix-socket transport, scoped endpoint metadata, bounded connections, and durable response replay |
+| `cli_downloader/core/shell_control.py` | `shell status/start/ensure` readiness and visible Shell launch contract |
+| `cli_downloader/cli/_shell_wiring.py` | Shell-owned download/task-control dispatch, shutdown boundaries, and external refresh notifications |
+
+`clid download --detach --json` and owner-routed Task controls are public
+frontends. Agents must use these commands instead of opening the database,
+injecting terminal keystrokes, or starting a second Scheduler.
+
 ## Site Package Layout
 
 Core site contracts live under:

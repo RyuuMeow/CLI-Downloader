@@ -31,9 +31,9 @@
 
 ## Why CLI-Downloader?
 
-Browse an artist’s works, select multiple galleries, sign in when required, and automatically organize the results. 
+Browse an artist’s works, select multiple galleries, sign in when required, and automatically organize the results.
 
-Instead of dealing with ad-hoc scripts or managing separate tools for different sites, CLI-Downloader provides a single cohesive interface. 
+Instead of dealing with ad-hoc scripts or managing separate tools for different sites, CLI-Downloader provides a single cohesive interface.
 
 ### The Workflow
 
@@ -103,7 +103,7 @@ flowchart LR
 
 ## Supported Websites
 
-CLI-Downloader Core itself does not contain website scrapers. **Website support is installed separately through the Plugin Marketplace.** 
+CLI-Downloader Core itself does not contain website scrapers. **Website support is installed separately through the Plugin Marketplace.**
 
 Currently available repository official plugins:
 - **[Pixiv](https://github.com/RyuuMeow/Pixiv-Plugin.git)** (Images, Illustrations)
@@ -137,9 +137,33 @@ clid download <url> --dry-run
 clid download <url>
 ```
 
+A command-line list or Batch URL without `--select` downloads every item returned by that
+operation. Repeat `--select <item-id>` to restrict the Batch to a subset. The interactive Shell
+continues to show the plugin-provided selection page.
+
+For Agent-assisted work, keep downloads in the visible Shell owner:
+
+```powershell
+clid shell status --json
+clid shell ensure --visible --wait-ready --json
+clid download <url> --dry-run --json
+clid download <url> --detach --json
+clid tasks show <task-id>
+clid tasks pause <task-id>
+clid tasks resume <task-id>
+```
+
+`--detach` reports durable acceptance and the Task ID; it does not claim final success. If the
+owner disconnects, inspect that existing Task and History before retrying, rather than creating a
+replacement Task. See the [Agent Skill guide](skills/cli-downloader/README.md) for the full
+authorization and ownership workflow.
+
+When the visible Shell closes with unfinished work, it warns, stops accepting new commands,
+and leaves recoverable checkpoints for the next Shell startup.
+
 ## Agent Skill
 
-This project includes a ready-to-use Agent Skill (`skills/cli-downloader`). Use it to supercharge your AI assistants (like Claude Code or Codex). 
+This project includes a ready-to-use Agent Skill (`skills/cli-downloader`). Use it to supercharge your AI assistants (like Claude Code or Codex).
 
 **Ask an Agent to:** research a website, scaffold a plugin, implement routing, add tests, and generate documentation.
 
@@ -158,7 +182,7 @@ Yes. You can invoke a browser-based login flow that securely persists your sessi
 
 ## Disclaimer & Security
 
-CLI-Downloader is an open-source download framework provided "AS IS". We do not endorse or guarantee the lawfulness of third-party plugins. 
+CLI-Downloader is an open-source download framework provided "AS IS". We do not endorse or guarantee the lawfulness of third-party plugins.
 
 - For security practices and vulnerability reporting, see [SECURITY.md](SECURITY.md).
 - For complete terms, limitations of liability, and plugin warnings, read [DISCLAIMER.md](DISCLAIMER.md).

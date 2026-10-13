@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from hashlib import sha256
+from pathlib import Path
 from uuid import uuid4
 
 from cli_downloader.application.batch_pipeline import (
@@ -9,12 +11,14 @@ from cli_downloader.application.batch_pipeline import (
     BatchRunResult,
 )
 from cli_downloader.core.batch import (
+    AssetStatus,
     BatchEntryStatus,
     DownloadChildStatus,
     FailureStage,
     RetryPlan,
     RetryScope,
 )
+from cli_downloader.core.models import DownloadStrategy
 from cli_downloader.storage.state_batch_store import StateBatchStore
 
 from .batch_retry import ParentRetryPlan
@@ -50,6 +54,7 @@ class BatchResumeService:
         self._resolver = resolver
 
     def plan_resume(self, parent_id: str) -> ParentRetryPlan:
+        self._requeue_corrupt_completed_assets(parent_id)
         plans: list[RetryPlan] = []
 
         # Entries stuck in operational states.
@@ -89,6 +94,36 @@ class BatchResumeService:
                 continue
 
         return ParentRetryPlan(parent_id=parent_id, plans=tuple(plans))
+
+    def _requeue_corrupt_completed_assets(self, parent_id: str) -> None:
+        """Invalidate direct completions whose durable output no longer matches."""
+
+        invalid: dict[str, list[str]] = {}
+        for child in self._store.list_children(parent_id):
+            if child.package.strategy is DownloadStrategy.TORRENT:
+                # Torrent descriptor files may be removed after the client
+                # accepts them. The persisted client checkpoint is authoritative.
+                continue
+            for record in self._store.list_assets(child.child_id):
+                if record.status is not AssetStatus.COMPLETED:
+                    continue
+                if not record.final_path or not record.content_sha256:
+                    # Older records without a digest cannot be verified here;
+                    # leave them intact and let the normal completion contract
+                    # preserve their identity.
+                    continue
+                path = Path(record.final_path)
+                try:
+                    valid = path.is_file() and _sha256_file(path) == record.content_sha256
+                except OSError:
+                    valid = False
+                if not valid:
+                    invalid.setdefault(child.child_id, []).append(record.asset.asset_id)
+        if invalid:
+            self._store.requeue_corrupt_completed_assets(
+                parent_id,
+                {child_id: tuple(asset_ids) for child_id, asset_ids in invalid.items()},
+            )
 
     async def resume_parent(
         self,
@@ -131,3 +166,11 @@ class BatchResumeService:
         recovery_run = getattr(pipeline, "run_recovery_batch", pipeline.run_batch)
         run = await recovery_run(parent_id, retry_plans=resume.plans)
         return BatchResumeResult(resume=resume, run=run)
+
+
+def _sha256_file(path: Path) -> str:
+    digest = sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()

@@ -220,6 +220,10 @@ def _task_summary(node: TaskNode) -> dict[str, object]:
         "progress": _task_progress_text(node),
         "status": node.state.value,
         "created_at": node.details.get("created_at"),
+        "wait_reason": node.details.get("network_wait_reason")
+        or node.details.get("scheduler_waiting_reason"),
+        "network_phase": node.details.get("network_phase"),
+        "retry_at": node.details.get("network_retry_at"),
     }
 
 

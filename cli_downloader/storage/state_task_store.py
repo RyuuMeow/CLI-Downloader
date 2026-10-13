@@ -25,12 +25,22 @@ class StateTaskStore:
             return unit_of_work.tasks.compare_and_swap(record, expected_revision)
 
     def get(self, task_id: str) -> TaskRecord | None:
-        with StateUnitOfWork(self._database) as unit_of_work:
+        with StateUnitOfWork(self._database, read_only=True) as unit_of_work:
             return unit_of_work.tasks.get(task_id)
 
     def list(self) -> tuple[TaskRecord, ...]:
-        with StateUnitOfWork(self._database) as unit_of_work:
+        with StateUnitOfWork(self._database, read_only=True) as unit_of_work:
             return unit_of_work.tasks.list()
+
+    def list_root_page(
+        self, *, offset: int = 0, limit: int = 100
+    ) -> tuple[tuple[TaskRecord, ...], int]:
+        if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
+            raise ValueError("offset must be a non-negative integer")
+        if isinstance(limit, bool) or not isinstance(limit, int) or limit <= 0:
+            raise ValueError("limit must be a positive integer")
+        with StateUnitOfWork(self._database, read_only=True) as unit_of_work:
+            return unit_of_work.tasks.list_root_page(offset=offset, limit=min(limit, 500))
 
     def delete(self, task_id: str) -> None:
         with StateUnitOfWork(self._database) as unit_of_work:

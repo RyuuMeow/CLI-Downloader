@@ -166,6 +166,7 @@ _CHILD_TRANSITIONS = {
     ),
     DownloadChildStatus.DOWNLOADING: frozenset(
         {
+            DownloadChildStatus.QUEUED,
             DownloadChildStatus.COMPLETED,
             DownloadChildStatus.PARTIALLY_COMPLETED,
             DownloadChildStatus.FAILED,
@@ -221,13 +222,18 @@ def _require_datetime(value: object, path: str) -> datetime:
     return value
 
 
-def _require_unique_ids(values: object, path: str) -> tuple[str, ...]:
+def _require_unique_ids(
+    values: object,
+    path: str,
+    *,
+    allow_empty: bool = False,
+) -> tuple[str, ...]:
     if not isinstance(values, (tuple, list)):
         raise _error("invalid_sequence", path, "must be a sequence of ids")
     result = tuple(
         _require_text(value, f"{path}[{index}]", maximum=128) for index, value in enumerate(values)
     )
-    if not result:
+    if not result and not allow_empty:
         raise _error("empty_sequence", path, "must contain at least one id")
     if len(set(result)) != len(result):
         raise _error("duplicate_value", path, "must not contain duplicate ids")
@@ -522,7 +528,13 @@ class BatchParent:
             self, "parent_id", _require_text(self.parent_id, "parent.parent_id", maximum=128)
         )
         object.__setattr__(
-            self, "entry_ids", _require_unique_ids(self.entry_ids, "parent.entry_ids")
+            self,
+            "entry_ids",
+            _require_unique_ids(
+                self.entry_ids,
+                "parent.entry_ids",
+                allow_empty=True,
+            ),
         )
         if self.title is not None:
             object.__setattr__(
@@ -739,6 +751,97 @@ class BatchSnapshot:
         }
 
 
+@dataclass(frozen=True)
+class BatchSummary:
+    """Lightweight aggregate projection for a Batch root row.
+
+    Unlike :class:`BatchSnapshot`, this model deliberately carries no entry
+    IDs, child packages, assets, attempts, or output paths.  It is safe to
+    build for a large Batch while the user is still on the Tasks root page.
+    """
+
+    parent_id: str
+    title: str | None
+    first_entry_id: str | None
+    site_id: str | None
+    source_url: str | None
+    counts: BatchCounts
+    execution_status: BatchExecutionStatus
+    completed_files: int = 0
+    total_files: int = 0
+    completed_bytes: int = 0
+    total_bytes: int | None = None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self, "parent_id", _require_text(self.parent_id, "batch_summary.parent_id")
+        )
+        object.__setattr__(self, "title", _optional_text(self.title, "batch_summary.title"))
+        object.__setattr__(
+            self,
+            "first_entry_id",
+            _optional_text(self.first_entry_id, "batch_summary.first_entry_id"),
+        )
+        object.__setattr__(self, "site_id", _optional_text(self.site_id, "batch_summary.site_id"))
+        if self.source_url is not None:
+            object.__setattr__(
+                self,
+                "source_url",
+                _require_url(self.source_url, "batch_summary.source_url"),
+            )
+        if type(self.counts) is not BatchCounts:
+            raise _error("invalid_counts", "batch_summary.counts", "must be BatchCounts")
+        _require_enum(
+            self.execution_status,
+            BatchExecutionStatus,
+            "batch_summary.execution_status",
+        )
+        object.__setattr__(
+            self,
+            "completed_files",
+            _require_non_negative_int(self.completed_files, "batch_summary.completed_files"),
+        )
+        object.__setattr__(
+            self,
+            "total_files",
+            _require_non_negative_int(self.total_files, "batch_summary.total_files"),
+        )
+        if self.completed_files > self.total_files:
+            object.__setattr__(self, "completed_files", self.total_files)
+        object.__setattr__(
+            self,
+            "completed_bytes",
+            _require_non_negative_int(self.completed_bytes, "batch_summary.completed_bytes"),
+        )
+        if self.total_bytes is not None:
+            object.__setattr__(
+                self,
+                "total_bytes",
+                _require_non_negative_int(self.total_bytes, "batch_summary.total_bytes"),
+            )
+        if self.total_bytes is not None:
+            object.__setattr__(
+                self,
+                "completed_bytes",
+                min(self.completed_bytes, self.total_bytes),
+            )
+
+    def to_dict(self) -> dict[str, JsonValue]:
+        return {
+            "parent_id": self.parent_id,
+            "title": self.title,
+            "first_entry_id": self.first_entry_id,
+            "site_id": self.site_id,
+            "source_url": self.source_url,
+            "counts": self.counts.to_dict(),
+            "execution_status": self.execution_status.value,
+            "completed_files": self.completed_files,
+            "total_files": self.total_files,
+            "completed_bytes": self.completed_bytes,
+            "total_bytes": self.total_bytes,
+        }
+
+
 def derive_batch_snapshot(
     parent: BatchParent,
     entries: tuple[BatchEntry, ...],
@@ -803,24 +906,31 @@ def derive_batch_snapshot(
             counts[child_category] += 1
 
     result_counts = BatchCounts(**counts)
-    successful = result_counts.completed + result_counts.skipped
-    active = result_counts.resolving + result_counts.queued + result_counts.downloading
-    problems = result_counts.rejected + result_counts.failed + result_counts.cancelled
-    if successful == result_counts.total:
-        status = BatchExecutionStatus.COMPLETED
-    elif active:
-        status = BatchExecutionStatus.RUNNING
-    elif result_counts.unresolved:
-        status = BatchExecutionStatus.PENDING
-    elif successful and problems:
-        status = BatchExecutionStatus.PARTIALLY_COMPLETED
-    elif result_counts.cancelled == result_counts.total:
-        status = BatchExecutionStatus.CANCELLED
-    elif problems:
-        status = BatchExecutionStatus.FAILED
-    else:
-        status = BatchExecutionStatus.PENDING
+    status = derive_batch_execution_status(result_counts)
     return BatchSnapshot(parent=parent, counts=result_counts, execution_status=status)
+
+
+def derive_batch_execution_status(counts: BatchCounts) -> BatchExecutionStatus:
+    """Derive a Batch status from aggregate counts without materialising rows."""
+
+    if type(counts) is not BatchCounts:
+        raise _error("invalid_counts", "batch.counts", "must be BatchCounts")
+    successful = counts.completed + counts.skipped
+    active = counts.resolving + counts.queued + counts.downloading
+    problems = counts.rejected + counts.failed + counts.cancelled
+    if successful == counts.total:
+        return BatchExecutionStatus.COMPLETED
+    if active:
+        return BatchExecutionStatus.RUNNING
+    if counts.unresolved:
+        return BatchExecutionStatus.PENDING
+    if successful and problems:
+        return BatchExecutionStatus.PARTIALLY_COMPLETED
+    if counts.cancelled == counts.total:
+        return BatchExecutionStatus.CANCELLED
+    if problems:
+        return BatchExecutionStatus.FAILED
+    return BatchExecutionStatus.PENDING
 
 
 @dataclass(frozen=True)

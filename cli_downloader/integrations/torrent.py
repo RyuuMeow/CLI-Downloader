@@ -380,6 +380,7 @@ class QbittorrentClient:
         handle: TorrentHandle,
         *,
         cancel_requested: callable | None = None,
+        shutdown_requested: callable | None = None,
         pause_requested: Callable[[], bool] | None = None,
         pause_waiter: Callable[[], Awaitable[None]] | None = None,
         status_callback: Callable[[TorrentOutcome], None] | None = None,
@@ -393,6 +394,10 @@ class QbittorrentClient:
         """
         client_paused = False
         while True:
+            if shutdown_requested is not None and shutdown_requested():
+                # Preserve the client task and return the last observed state;
+                # the owning pipeline persists it as a resumable checkpoint.
+                return await self.get_status(handle)
             if cancel_requested is not None and cancel_requested():
                 await self.cancel(handle)
                 return TorrentOutcome(

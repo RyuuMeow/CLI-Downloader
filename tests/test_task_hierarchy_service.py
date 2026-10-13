@@ -29,7 +29,7 @@ from cli_downloader.storage.state_database import StateDatabase
 from cli_downloader.storage.state_history_store import StateHistoryStore
 from cli_downloader.storage.state_batch_store import StateBatchStore as ProductionStateBatchStore
 from cli_downloader.storage.state_task_store import StateTaskStore as ProductionStateTaskStore
-from cli_downloader.storage.task_store import TaskRecord, TaskStatus
+from cli_downloader.storage.task_store import TaskDesiredControl, TaskRecord, TaskStatus
 
 
 def _entry(entry_id: str, parent_id: str = "batch-1") -> BatchEntry:
@@ -140,6 +140,135 @@ class _FinishedBatchPipeline:
 
 
 class TaskHierarchyServiceTest(TestCase):
+    def test_control_receipt_waits_for_quiescent_pause(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            tasks = StateTaskStore(root / "state.sqlite3")
+            batches = StateBatchStore(root / "state.sqlite3")
+            tasks.upsert(
+                TaskRecord(
+                    "item-1",
+                    TaskStatus.PAUSED,
+                    desired_control=TaskDesiredControl.PAUSE,
+                    revision=4,
+                )
+            )
+
+            receipt = TaskHierarchyService(
+                task_store=tasks,
+                batch_store=batches,
+            ).wait_for_control_applied("item-1", "pause", timeout=0.1)
+
+            self.assertTrue(receipt.requested)
+            self.assertTrue(receipt.applied)
+            self.assertTrue(receipt.quiescent)
+            self.assertEqual(receipt.phase, "applied")
+            self.assertEqual(receipt.to_dict()["actual_status"], "paused")
+
+    def test_control_receipt_times_out_without_claiming_pause(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            tasks = StateTaskStore(root / "state.sqlite3")
+            batches = StateBatchStore(root / "state.sqlite3")
+            tasks.upsert(
+                TaskRecord(
+                    "item-1",
+                    TaskStatus.RUNNING,
+                    desired_control=TaskDesiredControl.PAUSE,
+                    revision=4,
+                )
+            )
+
+            receipt = TaskHierarchyService(
+                task_store=tasks,
+                batch_store=batches,
+            ).wait_for_control_applied("item-1", "pause", timeout=0.05)
+
+            self.assertTrue(receipt.requested)
+            self.assertFalse(receipt.applied)
+            self.assertFalse(receipt.quiescent)
+            self.assertEqual(receipt.phase, "pending")
+
+    def test_available_folder_uses_item_metadata_and_bounded_batch_assets(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            tasks = StateTaskStore(root / "state.sqlite3")
+            batches = StateBatchStore(root / "state.sqlite3")
+            tasks.upsert(
+                TaskRecord(
+                    "item-1",
+                    TaskStatus.COMPLETED,
+                    kind=TaskKind.ITEM,
+                    metadata={"output_files": ["downloads/item-1/001.jpg"]},
+                )
+            )
+            entry = _entry("entry-1")
+            batches.create_batch(BatchParent("batch-1", (entry.entry_id,)), (entry,))
+            _attach_partial(batches, entry)
+            service = TaskHierarchyService(task_store=tasks, batch_store=batches)
+
+            self.assertEqual(
+                service.get_available_folder("item-1"),
+                str(Path("downloads") / "item-1"),
+            )
+            self.assertEqual(service.get_available_folder("entry-1"), "output")
+            self.assertEqual(service.get_available_folder("batch-1"), "output")
+
+    def test_large_batch_root_projection_does_not_materialise_children(self) -> None:
+        class GuardBatchStore(ProductionStateBatchStore):
+            def list_entries(self, _parent_id):
+                raise AssertionError("root projection decoded all entries")
+
+            def list_children(self, _parent_id):
+                raise AssertionError("root projection materialised all children")
+
+            def list_assets(self, _child_id):
+                raise AssertionError("root projection read child assets")
+
+            def list_attempts(self, _child_id):
+                raise AssertionError("root projection read child attempts")
+
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            database = StateDatabase(root / "state.sqlite3")
+            tasks = ProductionStateTaskStore(database)
+            batches = GuardBatchStore(database)
+            entries = tuple(_entry(f"entry-{index}") for index in range(1000))
+            tasks.upsert(TaskRecord("batch-1", TaskStatus.RUNNING, kind=TaskKind.BATCH))
+            batches.create_batch(
+                BatchParent("batch-1", tuple(entry.entry_id for entry in entries)), entries
+            )
+
+            summary = TaskHierarchyService(
+                task_store=tasks, batch_store=batches
+            ).list_root_summaries()
+
+            self.assertEqual(len(summary), 1)
+            self.assertEqual(summary[0].progress.total_files, 0)
+            self.assertEqual(summary[0].progress.preparing_items, 1000)
+            self.assertEqual(summary[0].details["counts"]["unresolved"], 1000)
+
+    def test_large_batch_child_projection_is_paged_and_ordered(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            batches = ProductionStateBatchStore(StateDatabase(root / "state.sqlite3"))
+            entries = tuple(_entry(f"entry-{index}") for index in range(1000))
+            StateTaskStore(StateDatabase(root / "state.sqlite3")).upsert(
+                TaskRecord("batch-1", TaskStatus.PENDING, kind=TaskKind.BATCH)
+            )
+            batches.create_batch(
+                BatchParent("batch-1", tuple(entry.entry_id for entry in entries)), entries
+            )
+
+            page = batches.list_child_summaries("batch-1", offset=400, limit=100)
+
+            self.assertEqual(page.total_count, 1000)
+            self.assertEqual(page.offset, 400)
+            self.assertEqual(len(page.items), 100)
+            self.assertEqual(page.items[0].task_id, "entry-400")
+            self.assertEqual(page.items[-1].task_id, "entry-499")
+            self.assertTrue(all(item.state is TaskState.PREPARING for item in page.items))
+
     def test_state_batch_delete_is_atomic_and_preserves_history_completion(self) -> None:
         with TemporaryDirectory() as directory:
             database = StateDatabase(Path(directory) / "state.sqlite3")

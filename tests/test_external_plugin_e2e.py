@@ -166,6 +166,8 @@ class ExternalPluginCLITests(unittest.TestCase):
                             "--enable-external-code",
                             "download",
                             "https://external.test/list",
+                            "--selection-policy",
+                            "interactive",
                             "--json",
                         ]
                     )

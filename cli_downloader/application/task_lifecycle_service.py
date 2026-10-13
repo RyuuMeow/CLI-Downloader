@@ -28,7 +28,7 @@ RESUMABLE_STATUSES = frozenset(
         TaskStatus.PAUSED,
     }
 )
-PAUSABLE_STATUSES = frozenset({TaskStatus.PLANNED, TaskStatus.RUNNING})
+PAUSABLE_STATUSES = frozenset({TaskStatus.PENDING, TaskStatus.PLANNED, TaskStatus.RUNNING})
 CANCELLABLE_STATUSES = frozenset(
     {
         TaskStatus.PENDING,
@@ -77,13 +77,13 @@ class TaskLifecycleService:
             reason="task_resume_requested",
         )
 
-    def pause(self, task_id: str) -> TaskTransitionResult:
+    def pause(self, task_id: str, *, request_only: bool = False) -> TaskTransitionResult:
         return self._transition(
             task_id=task_id,
             action="pause",
             allowed_statuses=PAUSABLE_STATUSES,
             reason="task_pause_requested",
-            target_status=TaskStatus.PAUSED,
+            target_status=None if request_only else TaskStatus.PAUSED,
         )
 
     def cancel(self, task_id: str) -> TaskTransitionResult:
@@ -107,31 +107,35 @@ class TaskLifecycleService:
         action: str,
         allowed_statuses: frozenset[TaskStatus],
         reason: str,
-        target_status: TaskStatus = TaskStatus.PLANNED,
+        target_status: TaskStatus | None = TaskStatus.PLANNED,
     ) -> TaskTransitionResult:
-        record = self._task_store.get(task_id)
-        if record is None:
-            raise TaskNotFoundError(f"task not found: {task_id}")
+        for _ in range(8):
+            record = self._task_store.get(task_id)
+            if record is None:
+                raise TaskNotFoundError(f"task not found: {task_id}")
 
-        if record.status not in allowed_statuses:
-            raise InvalidTaskTransitionError(
-                f"cannot {action} task {task_id} from status {record.status.value}"
+            if record.status not in allowed_statuses:
+                raise InvalidTaskTransitionError(
+                    f"cannot {action} task {task_id} from status {record.status.value}"
+                )
+
+            desired_control = {
+                "pause": TaskDesiredControl.PAUSE,
+                "cancel": TaskDesiredControl.CANCEL,
+            }.get(action, TaskDesiredControl.RUN)
+            updated = record.transition(
+                status=target_status if target_status is not None else record.status,
+                desired_control=desired_control,
+                metadata={
+                    **record.metadata,
+                    "last_transition": action,
+                    "previous_status": record.status.value,
+                },
             )
-
-        desired_control = {
-            "pause": TaskDesiredControl.PAUSE,
-            "cancel": TaskDesiredControl.CANCEL,
-        }.get(action, TaskDesiredControl.RUN)
-        updated = record.transition(
-            status=target_status,
-            desired_control=desired_control,
-            metadata={
-                **record.metadata,
-                "last_transition": action,
-                "previous_status": record.status.value,
-            },
-        )
-        self._task_store.upsert(updated)
+            if self._task_store.compare_and_swap(updated, expected_revision=record.revision):
+                break
+        else:
+            raise InvalidTaskTransitionError(f"task changed while requesting {action}: {task_id}")
         event = TaskEvent(
             task_id=task_id,
             name="task_transitioned",

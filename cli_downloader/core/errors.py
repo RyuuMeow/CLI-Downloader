@@ -58,3 +58,45 @@ class BatchNotFoundError(CLIDownloaderError):
 
 class BatchConflictError(CLIDownloaderError):
     """Raised when persisted batch identities or relationships conflict."""
+
+
+class OwnerError(CLIDownloaderError):
+    """Base error for cross-process Scheduler-owner coordination."""
+
+    code = "owner_error"
+
+
+class OwnerAlreadyRunningError(OwnerError):
+    """Raised when another process already owns the same data-root scope."""
+
+    code = "owner_busy"
+
+
+class OwnerLockError(OwnerError):
+    """Raised when the owner lock cannot be created or acquired."""
+
+    code = "owner_lock_error"
+
+
+class OwnerDiscoveryError(OwnerError):
+    """Raised when owner discovery metadata is malformed or cannot be persisted."""
+
+    code = "owner_metadata_error"
+
+
+class OwnerScopeMismatchError(OwnerError):
+    """Raised when metadata does not belong to the current owner scope."""
+
+    code = "owner_scope_mismatch"
+
+
+class OwnerLaunchError(OwnerError):
+    """Raised when a visible Shell process cannot be started."""
+
+    code = "owner_launch_error"
+
+
+class OwnerReadyTimeoutError(OwnerError):
+    """Raised when a launched Shell does not advertise readiness in time."""
+
+    code = "owner_ready_timeout"

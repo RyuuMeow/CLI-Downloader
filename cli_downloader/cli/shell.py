@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import UTC, datetime
 import json
 import os
 import re
@@ -17,6 +18,7 @@ from time import monotonic
 from typing import TextIO
 from urllib.parse import urlsplit
 
+from rich.cells import cell_len
 from rich.text import Text
 from textual import events
 from textual.app import App, ComposeResult
@@ -25,6 +27,7 @@ from textual.suggester import Suggester
 from textual.containers import Horizontal, Vertical
 from textual.geometry import Size
 from textual.css.query import NoMatches
+from textual.message import Message
 from textual.widgets import (
     Button,
     DataTable,
@@ -41,6 +44,7 @@ from cli_downloader.application.release_update_service import (
     ReleaseUpdateService,
     ReleaseUpdateStatus,
 )
+from cli_downloader.application.execution_control import ExecutionStopSignal
 from cli_downloader.application.task_hierarchy_service import TaskHierarchyService
 from cli_downloader.config.loader import ConfigLoader
 from cli_downloader.config.schema import ConfigField, SettingsRegistry
@@ -97,8 +101,11 @@ BatchSelectionRunner = Callable[
 ExternalOpener = Callable[[str], None]
 BrowserAuthRunner = Callable[[str, BrowserAuthSchema], str]
 BrowserAuthValidator = Callable[[str, str], bool]
+ShutdownWarning = Callable[[], str | None]
 
-_AUTO_REFRESH_TASK_STATES = frozenset({TaskState.PREPARING, TaskState.QUEUED, TaskState.RUNNING})
+_AUTO_REFRESH_TASK_STATES = frozenset(
+    {TaskState.PREPARING, TaskState.QUEUED, TaskState.RUNNING, TaskState.PAUSING}
+)
 _PLUGIN_STATUS_MIN_WIDTH = 18
 
 
@@ -213,6 +220,7 @@ class InteractiveShell:
         config_loader: ConfigLoader | None = None,
         url_opener: ExternalOpener | None = None,
         folder_opener: ExternalOpener | None = None,
+        file_opener: ExternalOpener | None = None,
         browser_auth_runner: BrowserAuthRunner | None = None,
         browser_auth_validator: BrowserAuthValidator | None = None,
         startup_commands: Sequence[Sequence[str]] = (),
@@ -220,6 +228,8 @@ class InteractiveShell:
         plugins_dir: Path | None = None,
         cache_dir: Path | None = None,
         plugin_catalog_service: PluginCatalogService | None = None,
+        shutdown_warning: ShutdownWarning | None = None,
+        startup_ready_callback: Callable[[], None] | None = None,
     ) -> None:
         self._prompt = prompt
         self._runner = runner
@@ -227,11 +237,13 @@ class InteractiveShell:
         self._task_service_loader = task_service_loader
         self._operation_runner = operation_runner
         self._batch_selection_runner = batch_selection_runner
+        self._external_refresh_callback: Callable[[], None] | None = None
         self._settings_registry = settings_registry or SettingsRegistry()
         self._config_loader = config_loader
         self._translator = TranslationService()
         self._url_opener = url_opener or _open_url
         self._folder_opener = folder_opener or _open_folder
+        self._file_opener = file_opener or _open_file
         self._browser_auth_runner = browser_auth_runner
         self._browser_auth_validator = browser_auth_validator
         self._startup_commands = tuple(tuple(command) for command in startup_commands)
@@ -239,6 +251,9 @@ class InteractiveShell:
         self._plugins_dir = plugins_dir or Path("plugins")
         catalog_cache = cache_dir or Path("~/.cli-downloader/cache").expanduser()
         self._plugin_catalog_service = plugin_catalog_service or PluginCatalogService(catalog_cache)
+        self._shutdown_warning_callback = shutdown_warning
+        self._startup_ready_callback = startup_ready_callback
+        self._startup_ready_notified = False
 
     @property
     def translator(self) -> TranslationService:
@@ -246,6 +261,71 @@ class InteractiveShell:
 
     def set_language(self, language: str) -> None:
         self._translator = TranslationService(language)
+
+    def set_external_refresh_callback(self, callback: Callable[[], None] | None) -> None:
+        self._external_refresh_callback = callback
+
+    def notify_external_tasks(self) -> None:
+        callback = self._external_refresh_callback
+        if callback is not None:
+            callback()
+
+    def shutdown_warning(self) -> str | None:
+        """Return a safe, user-facing warning before the Shell releases ownership."""
+
+        callback = self._shutdown_warning_callback
+        if callback is None:
+            return None
+        try:
+            warning = callback()
+        except Exception:
+            # Shutdown must never be prevented by a best-effort status probe.
+            return None
+        return warning if isinstance(warning, str) and warning.strip() else None
+
+    def _notify_startup_ready(self) -> None:
+        if self._startup_ready_notified:
+            return
+        self._startup_ready_notified = True
+        callback = self._startup_ready_callback
+        if callback is not None:
+            callback()
+
+    def _start_plain_startup_commands(self, output_stream: TextIO) -> None:
+        """Dispatch persisted recovery work before advertising plain-shell readiness.
+
+        The Textual path starts these commands from ``on_mount``.  The
+        non-TTY shell used by redirected/embedded sessions must do the same;
+        otherwise a restart can publish ``READY`` while its recovery command
+        list is silently discarded.  Dispatch is asynchronous so the prompt
+        remains usable, while the owner wiring still tracks these workers for
+        bounded shutdown.
+        """
+
+        for argv in self._startup_commands:
+            command = tuple(argv)
+
+            def run_startup(command: Sequence[str] = command) -> None:
+                try:
+                    self.run_background(
+                        command,
+                        output_stream,
+                        ExecutionStopSignal(),
+                        lambda _reason, _payload: None,
+                    )
+                except Exception as error:
+                    output_stream.write(f"{type(error).__name__}: {error}\n")
+
+            Thread(
+                target=run_startup,
+                name="shell-startup-recovery",
+                daemon=True,
+            ).start()
+
+    def _write_shutdown_warning(self, output_stream: TextIO) -> None:
+        warning = self.shutdown_warning()
+        if warning is not None:
+            output_stream.write(f"Warning: {warning}\n")
 
     def run_batch_selection(
         self,
@@ -279,6 +359,8 @@ class InteractiveShell:
 
         input_stream = input_stream or sys.stdin
         output_stream = output_stream or sys.stdout
+        self._start_plain_startup_commands(output_stream)
+        self._notify_startup_ready()
         output_stream.write(self._translator("shell.welcome") + "\n")
 
         while True:
@@ -286,6 +368,7 @@ class InteractiveShell:
             output_stream.flush()
             line = input_stream.readline()
             if line == "":
+                self._write_shutdown_warning(output_stream)
                 output_stream.write("\n")
                 return 0
 
@@ -325,6 +408,7 @@ class InteractiveShell:
                 output_stream.write("\x1b[2J\x1b[H")
             return True, 0
         if command in {"exit", "quit"}:
+            self._write_shutdown_warning(output_stream)
             return False, 0
         if not _is_allowed_shell_command(argv):
             self._print_error(
@@ -409,6 +493,16 @@ class InteractiveShell:
         )
 
 
+class TaskDataTable(DataTable):
+    """Report the table's own non-bubbling Resize event to the Shell."""
+
+    class ViewportChanged(Message):
+        pass
+
+    def on_resize(self, _event: events.Resize) -> None:
+        self.post_message(self.ViewportChanged())
+
+
 class TextualShellApp(App[int]):
     CSS = SHELL_CSS
 
@@ -431,6 +525,7 @@ class TextualShellApp(App[int]):
         self.register_theme(CLI_DOWNLOADER_THEME)
         self.theme = CLI_DOWNLOADER_THEME.name
         self._shell = shell
+        shell.set_external_refresh_callback(lambda: self.call_from_thread(self._refresh_tasks))
         self._history: list[str] = []
         self._history_index = 0
         self._command_blocks: list[ShellCommandBlock] = []
@@ -440,11 +535,26 @@ class TextualShellApp(App[int]):
         self._task_level = "roots"
         self._task_nodes: dict[str, TaskNode] = {}
         self._task_files: dict[str, TaskFileNode] = {}
+        self._task_page_size = 100
+        self._task_page_offset = 0
+        self._task_root_offset = 0
+        self._task_child_offset = 0
+        self._task_page_total = 0
+        self._task_refresh_thread: Thread | None = None
+        self._task_refresh_generation = 0
+        self._task_refresh_pending = False
+        self._task_focus_pending = True
+        self._task_layout_signature: tuple[object, ...] | None = None
+        self._task_viewport_width: int | None = None
+        self._task_detail_signature: tuple[object, ...] | None = None
+        self._task_action_signature: tuple[object, ...] | None = None
+        self._task_tab_request_pending = False
         self._active_task_id: str | None = None
         self._active_batch_id: str | None = None
         self._active_batch_name: str | None = None
         self._task_source_url: str | None = None
         self._task_folder: str | None = None
+        self._task_file_path: str | None = None
         self._pending_task_delete: str | None = None
         self._operation_thread: Thread | None = None
         self._operation_cancel: Event | None = None
@@ -499,9 +609,10 @@ class TextualShellApp(App[int]):
             with TabPane("Tasks", id="tasks"):
                 yield Horizontal(
                     Static("Tasks", id="task-path"),
+                    Static("", id="task-page-status"),
                     Button("←", id="task-back", disabled=True),
-                    Button("↗", id="task-source", disabled=True),
-                    Button("▤", id="task-folder", disabled=True),
+                    Button("◀", id="task-page-prev", disabled=True),
+                    Button("▶", id="task-page-next", disabled=True),
                     Button("‖", id="task-pause", disabled=True),
                     Button("▶", id="task-resume", disabled=True),
                     Button("■", id="task-cancel", disabled=True),
@@ -510,13 +621,21 @@ class TextualShellApp(App[int]):
                     Button("↻", id="refresh-tasks"),
                     id="task-toolbar",
                 )
-                yield DataTable(id="task-table", classes="activity-table", cursor_type="row")
+                yield TaskDataTable(
+                    id="task-table",
+                    classes="activity-table",
+                    cursor_type="row",
+                )
                 yield DataTable(
                     id="task-file-table",
                     classes="activity-table",
                     cursor_type="row",
                 )
-                yield Static(id="task-detail", classes="activity-detail")
+                with Horizontal(id="task-detail-row", classes="activity-detail"):
+                    yield Static(id="task-detail")
+                    with Vertical(id="task-detail-actions"):
+                        yield Button("Open URL", id="task-source", disabled=True)
+                        yield Button("Open Folder", id="task-folder", disabled=True)
             with TabPane("Settings", id="settings"):
                 yield Horizontal(
                     Static("Settings", id="settings-path"),
@@ -616,11 +735,12 @@ class TextualShellApp(App[int]):
         self.set_interval(2.0, self._refresh_tasks_if_active)
         shell_input = self.query_one("#shell-input", Input)
         shell_input.suggester = CommandSuggester()
-        self.query_one("#shell-tabs", TabbedContent).active = "console"
-        shell_input.focus()
+        if self.query_one("#shell-tabs", TabbedContent).active == "console":
+            shell_input.focus()
         self.query_one("#shell-output", RichLog).write(ASCII_BANNER)
         for argv in self._shell._startup_commands:
             self._start_background(shlex.join(argv), argv)
+        self._shell._notify_startup_ready()
 
     def _apply_translations(self, *, reset_neutral: bool = False) -> None:
         """Refresh static Shell chrome after the configured language is loaded."""
@@ -716,8 +836,12 @@ class TextualShellApp(App[int]):
                 column.label = Text(translator(translation_key))
             table.refresh(layout=True)
 
+        task_primary_is_file = self._task_level == "files"
         for button_id, translation_key in (
-            ("task-source", "tooltip.open_source"),
+            (
+                "task-source",
+                "tooltip.open_file" if task_primary_is_file else "tooltip.open_source",
+            ),
             ("task-folder", "tooltip.open_folder"),
             ("task-back", "tooltip.back"),
             ("task-pause", "tooltip.pause"),
@@ -733,10 +857,17 @@ class TextualShellApp(App[int]):
             ("copy-command", "tooltip.copy_latest"),
         ):
             self.query_one(f"#{button_id}", Button).tooltip = translator(translation_key)
+        self.query_one("#task-source", Button).label = translator(
+            "task.action.open_file" if task_primary_is_file else "task.action.open_url"
+        )
+        self.query_one("#task-folder", Button).label = translator("task.action.open_folder")
 
         self.query_one("#shell-input", Input).placeholder = translator("common.command")
         self.query_one("#settings-editor", Input).placeholder = translator("common.select_setting")
         self.query_one("#settings-select", Select).prompt = translator("common.select_value")
+        self._task_layout_signature = None
+        self._task_detail_signature = None
+        self._task_action_signature = None
         if reset_neutral:
             self.query_one("#operation-status", Static).update(translator("common.ready"))
             self.query_one("#operation-view-status", Static).update(
@@ -759,6 +890,22 @@ class TextualShellApp(App[int]):
     def on_resize(self, _event: events.Resize) -> None:
         self._resize_task_columns()
         self._resize_plugin_columns()
+
+    def on_task_data_table_viewport_changed(
+        self,
+        event: TaskDataTable.ViewportChanged,
+    ) -> None:
+        event.stop()
+        try:
+            table = self.query_one("#task-table", TaskDataTable)
+        except NoMatches:
+            # A queued viewport event can arrive after the screen unmounts.
+            return
+        viewport_width = table.scrollable_content_region.width
+        if viewport_width <= 0 or viewport_width == self._task_viewport_width:
+            return
+        self._task_viewport_width = viewport_width
+        self._resize_task_columns()
 
     def on_input_submitted(self, event: Input.Submitted) -> None:
         if event.input.id == "plugin-install-url":
@@ -848,6 +995,10 @@ class TextualShellApp(App[int]):
             self._refresh_tasks()
         elif event.button.id == "task-back":
             self._task_back()
+        elif event.button.id == "task-page-prev":
+            self._task_previous_page()
+        elif event.button.id == "task-page-next":
+            self._task_next_page()
         elif event.button.id == "task-source":
             self._open_task_source()
         elif event.button.id == "task-folder":
@@ -912,9 +1063,11 @@ class TextualShellApp(App[int]):
             return
         row_id = str(event.row_key.value)
         if event.data_table.id == "task-table":
-            self._select_task(row_id)
+            if self._task_level in {"roots", "items"}:
+                self._select_task(row_id)
         elif event.data_table.id == "task-file-table":
-            self._show_task_file(row_id)
+            if self._task_level == "files":
+                self._show_task_file(row_id)
         elif event.data_table.id == "settings-table":
             self._select_setting(row_id)
         elif event.data_table.id == "plugins-table":
@@ -923,7 +1076,8 @@ class TextualShellApp(App[int]):
     def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
         row_id = str(event.row_key.value)
         if event.data_table.id == "task-table":
-            self._open_task(row_id)
+            if self._task_level in {"roots", "items"}:
+                self._open_task(row_id)
         elif event.data_table.id == "settings-table":
             self._open_setting_row(row_id)
         elif event.data_table.id == "plugins-table":
@@ -932,16 +1086,57 @@ class TextualShellApp(App[int]):
 
     def on_tabbed_content_tab_activated(self, event: TabbedContent.TabActivated) -> None:
         try:
-            active_tab = self.query_one("#shell-tabs", TabbedContent).active
+            pane = getattr(event, "pane", None)
+            active_tab = (
+                getattr(pane, "id", None) or self.query_one("#shell-tabs", TabbedContent).active
+            )
         except Exception:
             return
         if active_tab == "tasks":
-            self.call_after_refresh(self._resize_task_columns)
+            self._task_tab_request_pending = True
+            tabs = self.query_one("#shell-tabs", TabbedContent)
+            if tabs.active != "tasks":
+                tabs.active = "tasks"
+            self._prepare_tasks_tab(clear_request=False)
+            # TabbedContent may emit the pane event before its internal active
+            # id settles (notably during test mounts and fast startup).  Finish
+            # one layout turn after the explicit request.
+            self.call_after_refresh(self._prepare_tasks_tab)
+        elif active_tab == "console" and self._task_tab_request_pending:
+            # A TabbedContent mount can emit a stale Console event after the
+            # caller already requested Tasks.  Keep the explicit request until
+            # the Tasks pane has completed its first refresh turn.
+            self.query_one("#shell-tabs", TabbedContent).active = "tasks"
+            self._prepare_tasks_tab()
         elif active_tab == "plugins":
             self.call_after_refresh(self.call_after_refresh, self._resize_plugin_columns)
             if not self._plugins_fetched:
                 self._plugins_fetched = True
                 self._fetch_remote_plugins()
+        elif active_tab != "tasks":
+            # Invalidate a presentation worker when the user leaves Tasks. The
+            # download itself continues; only its eventual UI snapshot is
+            # discarded until the tab is opened again.
+            self._task_refresh_generation += 1
+
+    def _prepare_tasks_tab(self, *, clear_request: bool = True) -> None:
+        tabs = self.query_one("#shell-tabs", TabbedContent)
+        if tabs.active != "tasks":
+            tabs.active = "tasks"
+        if clear_request:
+            self._task_tab_request_pending = False
+        self.refresh(layout=True)
+        self._resize_task_columns()
+        if self._task_nodes:
+            self._task_focus_pending = True
+            self.query_one("#task-table", DataTable).focus()
+            if self._active_task_id is None:
+                self._select_task(next(iter(self._task_nodes)))
+        if (
+            callable(getattr(self._task_service, "list_root_summaries", None))
+            or not self._task_nodes
+        ):
+            self._refresh_tasks()
 
     @work(thread=True)
     def _fetch_remote_plugins(self, *, force: bool = False) -> None:
@@ -1073,6 +1268,9 @@ class TextualShellApp(App[int]):
         if self._operation_cancel is not None:
             self._cancel_operation()
             return
+        warning = self._shell.shutdown_warning()
+        if warning is not None:
+            self.notify(f"Warning: {warning}", severity="warning")
         self.exit(0)
 
     def action_show_console(self) -> None:
@@ -1209,7 +1407,7 @@ class TextualShellApp(App[int]):
             command_argv.append("--json")
         operation_name = command_argv[0] if command_argv else "command"
         concurrent = bool(selected_items) or operation_name in ("download", "batches")
-        cancellation = Event()
+        cancellation = ExecutionStopSignal()
         job_id = id(cancellation)
         block = block or self._new_command_block(command_line)
         block.status = "running"
@@ -1434,7 +1632,10 @@ class TextualShellApp(App[int]):
 
         registry = load_registry(self._shell._plugins_dir)
         dev_plugins_dir = Path("Plugins")
-        if dev_plugins_dir.is_dir() and dev_plugins_dir.resolve() != self._shell._plugins_dir.resolve():
+        if (
+            dev_plugins_dir.is_dir()
+            and dev_plugins_dir.resolve() != self._shell._plugins_dir.resolve()
+        ):
             dev_reg = load_registry(dev_plugins_dir)
             for p_id, p_info in dev_reg.items():
                 if p_id not in registry:
@@ -2201,6 +2402,7 @@ class TextualShellApp(App[int]):
         )
         self.query_one("#settings-detail", Static).update(
             f"{field.key}\n{_setting_description(field, translator)}{constraints}"
+            + _network_settings_text(field, self._shell._runtime, translator)
         )
 
     def _apply_setting(self) -> None:
@@ -2668,13 +2870,50 @@ class TextualShellApp(App[int]):
         if service is None:
             self._show_task_nodes((), level="roots")
             return
+        # Test doubles and third-party integrations may still expose only the
+        # original synchronous list API.  The production hierarchy service
+        # advertises read-model methods and is refreshed off the Textual loop.
+        if not callable(getattr(service, "list_root_summaries", None)):
+            self._refresh_tasks_sync(service)
+            return
+        if self._task_level == "files" and self._active_task_id is not None:
+            # Files are selected-task detail, not the large Batch root/page
+            # projection.  Keep their existing targeted refresh semantics.
+            self._open_task(self._active_task_id)
+            return
+        self._task_refresh_pending = True
+        if self._task_refresh_thread is not None and self._task_refresh_thread.is_alive():
+            return
+        self._task_refresh_generation += 1
+        generation = self._task_refresh_generation
+        navigation = self._task_navigation_token()
+        self._task_refresh_pending = False
+        thread = Thread(
+            target=self._load_task_projection,
+            args=(service, generation, navigation),
+            daemon=True,
+        )
+        self._task_refresh_thread = thread
+        thread.start()
+
+    def _refresh_tasks_sync(self, service: object) -> None:
         try:
             if self._task_level == "items" and self._active_batch_id is not None:
-                self._show_task_nodes(service.list_children(self._active_batch_id), level="items")
+                nodes = tuple(service.list_children(self._active_batch_id))
+                start = self._task_page_offset
+                self._show_task_nodes(
+                    nodes[start : start + self._task_page_size],
+                    level="items",
+                    page_total=len(nodes),
+                    page_offset=start,
+                )
             elif self._task_level == "files" and self._active_task_id is not None:
                 self._open_task(self._active_task_id)
             else:
-                self._show_task_nodes(tuple(reversed(service.list_roots())), level="roots")
+                self._show_task_nodes(
+                    tuple(reversed(service.list_roots())),
+                    level="roots",
+                )
         except TaskNotFoundError:
             # Auto-delete may remove a completed Task while its detail view is
             # still open.  Drop the stale navigation selection and return to
@@ -2683,7 +2922,159 @@ class TextualShellApp(App[int]):
             self._active_batch_id = None
             self._active_batch_name = None
             self._task_files.clear()
-            self._show_task_nodes(tuple(reversed(service.list_roots())), level="roots")
+            self._task_page_offset = 0
+            self._show_task_nodes(
+                tuple(reversed(service.list_roots())),
+                level="roots",
+            )
+
+    def _task_navigation_token(self) -> tuple[object, ...]:
+        try:
+            active_tab = self.query_one("#shell-tabs", TabbedContent).active
+        except Exception:
+            active_tab = "tasks"
+        return (
+            active_tab,
+            self._task_level,
+            self._active_batch_id,
+            self._active_task_id,
+            self._task_page_offset,
+        )
+
+    def _load_task_projection(
+        self,
+        service: TaskHierarchyService,
+        generation: int,
+        navigation: tuple[object, ...],
+    ) -> None:
+        try:
+            level = navigation[1]
+            active_batch_id = navigation[2]
+            if level == "items" and isinstance(active_batch_id, str):
+                page = service.list_child_summaries(
+                    active_batch_id,
+                    offset=int(navigation[4]),
+                    limit=self._task_page_size,
+                )
+                nodes = tuple(item.to_task_node() for item in page.items)
+                total = page.total_count
+                offset = page.offset
+            elif callable(getattr(service, "list_root_page", None)):
+                page = service.list_root_page(offset=int(navigation[4]), limit=self._task_page_size)
+                nodes = tuple(item.to_task_node() for item in page.items)
+                total = page.total_count
+                offset = page.offset
+            else:
+                summaries = service.list_root_summaries()
+                nodes = tuple(
+                    item.to_task_node() if hasattr(item, "to_task_node") else item
+                    for item in reversed(summaries)
+                )
+                total = None
+                offset = 0
+            try:
+                self.call_from_thread(
+                    self._apply_task_projection,
+                    generation,
+                    navigation,
+                    nodes,
+                    total,
+                    offset,
+                    None,
+                )
+            except Exception:
+                # The Shell may have closed while the worker was reading a
+                # snapshot. Persisted state remains authoritative on restart.
+                return
+        except Exception as error:
+            try:
+                self.call_from_thread(
+                    self._apply_task_projection,
+                    generation,
+                    navigation,
+                    (),
+                    None,
+                    0,
+                    error,
+                )
+            except Exception:
+                return
+
+    def _apply_task_projection(
+        self,
+        generation: int,
+        navigation: tuple[object, ...],
+        nodes: Sequence[TaskNode],
+        page_total: int | None,
+        page_offset: int,
+        error: Exception | None,
+    ) -> None:
+        self._task_refresh_thread = None
+        current_navigation = self._task_navigation_token()
+        if generation != self._task_refresh_generation or navigation != current_navigation:
+            self._task_refresh_pending = False
+            if current_navigation[0] == "tasks":
+                self._refresh_tasks()
+            return
+        if error is not None:
+            if isinstance(error, TaskNotFoundError):
+                self._active_task_id = None
+                self._active_batch_id = None
+                self._active_batch_name = None
+                self._task_page_offset = 0
+                self._show_task_nodes((), level="roots")
+            else:
+                self.query_one("#task-detail", Static).update(f"Could not refresh tasks: {error}")
+        elif page_total is not None and page_offset > 0 and page_offset >= page_total:
+            self._task_page_offset = max(
+                0, ((page_total - 1) // self._task_page_size) * self._task_page_size
+            )
+            self._refresh_tasks()
+            return
+        else:
+            self._show_task_nodes(
+                nodes,
+                level=str(navigation[1]),
+                page_total=page_total,
+                page_offset=page_offset,
+            )
+        self._task_refresh_pending = False
+
+    def _task_previous_page(self) -> None:
+        if self._task_level not in {"items", "roots"} or self._task_page_offset <= 0:
+            return
+        self._task_page_offset = max(0, self._task_page_offset - self._task_page_size)
+        self._task_focus_pending = True
+        self._refresh_tasks()
+
+    def _task_next_page(self) -> None:
+        if self._task_level not in {"items", "roots"}:
+            return
+        if self._task_page_offset + len(self._task_nodes) >= self._task_page_total:
+            return
+        self._task_page_offset += self._task_page_size
+        self._task_focus_pending = True
+        self._refresh_tasks()
+
+    def _update_task_page_controls(self) -> None:
+        status = self.query_one("#task-page-status", Static)
+        previous = self.query_one("#task-page-prev", Button)
+        next_button = self.query_one("#task-page-next", Button)
+        if self._task_level not in {"items", "roots"}:
+            status.update("")
+            previous.display = False
+            next_button.display = False
+            previous.disabled = True
+            next_button.disabled = True
+            return
+        total = self._task_page_total
+        start = self._task_page_offset + 1 if total else 0
+        end = min(self._task_page_offset + len(self._task_nodes), total)
+        status.update(f"{start}-{end} / {total}")
+        previous.display = True
+        next_button.display = True
+        previous.disabled = self._task_page_offset <= 0
+        next_button.disabled = end >= total
 
     def _refresh_tasks_if_active(self) -> None:
         if self.query_one("#shell-tabs", TabbedContent).active == "tasks" and (
@@ -2697,33 +3088,58 @@ class TextualShellApp(App[int]):
             return
         table = self.query_one("#task-table", DataTable)
 
-        # Use screen width since table might not be laid out yet when switching tabs
-        total_width = self.size.width - 2
-        if total_width <= 0:
+        viewport_width = table.scrollable_content_region.width
+        if viewport_width <= 0:
+            # The Tasks pane is mounted lazily. Recalculate from its actual
+            # viewport after activation; this fallback only covers first mount.
+            viewport_width = self.size.width - 2
+        if viewport_width <= 0:
             return
 
-        other_width = 0
-        # DataTable columns have 2 chars padding by default
-        padding = 2 * len(self._task_column_keys)
+        row_label_width = getattr(table, "_row_label_column_width", 0)
+        padding = 2 * table.cell_padding * len(self._task_column_keys)
+        available = max(0, viewport_width - row_label_width - padding)
 
+        nodes = tuple(self._task_nodes.values())
+        fixed_values: dict[str, tuple[object, ...]] = {
+            "number": tuple(_number_cell(index) for index in range(1, len(nodes) + 1)),
+            "type": tuple(_task_kind_label(node.kind, self._shell.translator) for node in nodes),
+            "site": tuple(_display_name(node.site_id or "unknown") for node in nodes),
+            "progress": tuple(_task_progress(node, self._shell.translator) for node in nodes),
+            "status": tuple(_task_status_label(node, self._shell.translator) for node in nodes),
+            "created": tuple(_short_datetime(node.details.get("created_at")) for node in nodes),
+        }
+        fixed_widths: dict[str, int] = {}
         for name, key in self._task_column_keys.items():
             if name == "name":
                 continue
 
             column = table.columns[key]
-            column.auto_width = True
-            column.width = None
-            label_len = (
-                len(column.label.plain)
+            label_width = (
+                column.label.cell_len
                 if hasattr(column.label, "plain")
-                else len(str(column.label))
+                else cell_len(str(column.label))
             )
-            other_width += max(column.content_width, label_len)
+            content_width = max(
+                (_task_cell_width(value) for value in fixed_values[name]),
+                default=0,
+            )
+            # DataTable calculates ``content_width`` lazily after rendering.
+            # Derive it from the current read model so the first Tasks visit
+            # cannot use header-only widths and clip Status/Created/Type.
+            fixed_widths[name] = max(content_width, label_width)
+            column.auto_width = False
+            column.width = fixed_widths[name]
 
         name_col = table.columns[self._task_column_keys["name"]]
         name_col.auto_width = False
-        name_col.width = max(8, total_width - other_width - padding)
+        name_col.width = max(8, available - sum(fixed_widths.values()))
 
+        table.virtual_size = Size(
+            row_label_width
+            + sum(column.get_render_width(table) for column in table.columns.values()),
+            table.virtual_size.height,
+        )
         table.refresh(layout=True)
 
     def _resize_plugin_columns(self) -> None:
@@ -2802,47 +3218,86 @@ class TextualShellApp(App[int]):
         )
         table.refresh(layout=True)
 
-    def _show_task_nodes(self, nodes: Sequence[TaskNode], *, level: str) -> None:
+    def _show_task_nodes(
+        self,
+        nodes: Sequence[TaskNode],
+        *,
+        level: str,
+        page_total: int | None = None,
+        page_offset: int = 0,
+    ) -> None:
+        previous_level = self._task_level
         self._task_level = level
+        if previous_level != level:
+            self._task_focus_pending = True
+        previous_nodes = self._task_nodes
+        same_language = getattr(self, "_task_render_locale", None) == self._shell.translator.locale
+        self._task_render_locale = self._shell.translator.locale
         self._task_nodes = {node.task_id: node for node in nodes}
         self._task_files.clear()
+        self._task_page_offset = page_offset
+        self._task_page_total = max(page_total or 0, len(nodes))
         table = self.query_one("#task-table", DataTable)
 
-        if len(table.rows) != len(nodes):
+        existing_keys = tuple(str(key.value) for key in table.rows)
+        desired_keys = tuple(node.task_id for node in nodes)
+        cursor_key = (
+            existing_keys[table.cursor_row] if 0 <= table.cursor_row < len(existing_keys) else None
+        )
+        if existing_keys != desired_keys:
             table.clear()
             for index, node in enumerate(nodes, start=1):
                 table.add_row(
-                    _number_cell(index),
+                    _number_cell(page_offset + index),
                     _task_kind_label(node.kind, self._shell.translator),
                     Text(node.title, overflow="ellipsis", no_wrap=True),
                     _display_name(node.site_id or "unknown"),
                     _task_progress(node, self._shell.translator),
-                    _display_status(node.state.value, self._shell.translator),
+                    _task_status_label(node, self._shell.translator),
                     _short_datetime(node.details.get("created_at")),
                     key=node.task_id,
                 )
-            if self._active_task_id in self._task_nodes:
-                table.move_cursor(row=tuple(self._task_nodes).index(self._active_task_id))
+            restore_key = self._active_task_id or cursor_key
+            if restore_key in desired_keys:
+                table.move_cursor(row=desired_keys.index(restore_key))
         else:
-            for node in nodes:
-                try:
-                    new_progress = _task_progress(node, self._shell.translator)
-                    if table.get_cell(node.task_id, "progress") != new_progress:
-                        table.update_cell(node.task_id, "progress", new_progress)
-
-                    new_kind = _task_kind_label(node.kind, self._shell.translator)
-                    if table.get_cell(node.task_id, "type") != new_kind:
-                        table.update_cell(node.task_id, "type", new_kind)
-
-                    new_status = _display_status(node.state.value, self._shell.translator)
-                    if table.get_cell(node.task_id, "status") != new_status:
-                        table.update_cell(node.task_id, "status", new_status)
-                except Exception:
-                    pass
+            for index, node in enumerate(nodes, start=1):
+                if same_language and previous_nodes.get(node.task_id) == node:
+                    continue
+                values = {
+                    "number": _number_cell(page_offset + index),
+                    "type": _task_kind_label(node.kind, self._shell.translator),
+                    "name": Text(node.title, overflow="ellipsis", no_wrap=True),
+                    "site": _display_name(node.site_id or "unknown"),
+                    "progress": _task_progress(node, self._shell.translator),
+                    "status": _task_status_label(node, self._shell.translator),
+                    "created": _short_datetime(node.details.get("created_at")),
+                }
+                for column, value in values.items():
+                    try:
+                        if table.get_cell(node.task_id, column) != value:
+                            table.update_cell(node.task_id, column, value)
+                    except Exception:
+                        pass
 
         table.display = True
         self.query_one("#task-file-table", DataTable).display = False
-        self._resize_task_columns()
+        layout_signature = (
+            self.size.width,
+            level,
+            tuple(
+                (
+                    node.kind.value,
+                    len(node.site_id or ""),
+                    len(node.state.value),
+                    len(_short_datetime(node.details.get("created_at"))),
+                )
+                for node in nodes
+            ),
+        )
+        if layout_signature != self._task_layout_signature:
+            self._task_layout_signature = layout_signature
+            self._resize_task_columns()
         if level == "roots":
             self._active_batch_id = None
             self._active_batch_name = None
@@ -2854,20 +3309,33 @@ class TextualShellApp(App[int]):
                 f"{self._active_batch_name or self._shell.translator('task.batch')}"
             )
             empty_text = self._shell.translator("task.empty_batch")
+        self._update_task_page_controls()
         back = self.query_one("#task-back", Button)
         back.disabled = level == "roots"
         back.display = level != "roots"
-        self.query_one("#task-detail", Static).update(
-            empty_text if not nodes else self._shell.translator("task.choose_detail")
-        )
+        if not nodes:
+            detail_text = empty_text
+        elif self._active_task_id is None:
+            detail_text = self._shell.translator("task.choose_detail")
+        else:
+            detail_text = None
+        detail_signature = (None, detail_text) if detail_text is not None else None
+        if detail_signature is not None and detail_signature != self._task_detail_signature:
+            self._task_detail_signature = detail_signature
+            self.query_one("#task-detail", Static).update(detail_text)
         selected = self._task_nodes.get(self._active_task_id or "")
         if selected is not None:
             self._select_task(selected.task_id)
         else:
             self._active_task_id = None
             self._set_task_actions()
-        if nodes and self.query_one("#shell-tabs", TabbedContent).active == "tasks":
+        if (
+            nodes
+            and self._task_focus_pending
+            and self.query_one("#shell-tabs", TabbedContent).active == "tasks"
+        ):
             table.focus()
+            self._task_focus_pending = False
 
     def _select_task(self, task_id: str) -> None:
         node = self._task_nodes.get(task_id)
@@ -2877,7 +3345,7 @@ class TextualShellApp(App[int]):
         lines = [
             f"[N] {self._shell.translator('task.detail.name'):<10} {node.title}",
             f"[S] {self._shell.translator('task.detail.status'):<10} "
-            f"{_display_status(node.state.value, self._shell.translator)}",
+            f"{_task_status_label(node, self._shell.translator)}",
             f"[#] {self._shell.translator('task.detail.progress'):<10} "
             f"{_task_progress(node, self._shell.translator)}",
             f"[W] {self._shell.translator('task.detail.website'):<10} "
@@ -2894,49 +3362,78 @@ class TextualShellApp(App[int]):
                     else ""
                 )
             )
+        if node.details.get("network_wait_reason"):
+            lines.append(
+                f"[HTTP] {node.details.get('network_in_flight', 0)}/{node.details.get('network_limit', '?')} · {node.details.get('network_phase', '')}"
+            )
         failure = node.details.get("failure")
         if isinstance(failure, Mapping):
             lines.extend(_task_failure_lines(failure, self._shell.translator))
-        self.query_one("#task-detail", Static).update("\n".join(lines))
+        rendered = "\n".join(lines)
+        detail_signature = (task_id, rendered)
+        if detail_signature != self._task_detail_signature:
+            self._task_detail_signature = detail_signature
+            self.query_one("#task-detail", Static).update(rendered)
         self._set_task_actions(node)
 
     def _set_task_actions(self, node: TaskNode | None = None) -> None:
-        self._task_source_url = node.source_url if node is not None else None
+        self._task_file_path = None
+        self._task_source_url = (
+            node.source_url if node is not None and self._task_level != "files" else None
+        )
         self._task_folder = _folder_for_task(node)
+        folder_resolver = getattr(self._task_service, "get_available_folder", None)
+        if node is not None and self._task_folder is None and callable(folder_resolver):
+            try:
+                self._task_folder = folder_resolver(node.task_id)
+            except Exception:
+                # Folder discovery is a contextual convenience. A stale Task
+                # or transient read failure must not break row selection.
+                self._task_folder = None
         task_id = node.task_id if node is not None else None
         if self._pending_task_delete != task_id:
             self._pending_task_delete = None
         state = node.state if node is not None else None
-        source = self.query_one("#task-source", Button)
-        source.disabled = self._task_source_url is None
-        source.display = self._task_source_url is not None
-        folder = self.query_one("#task-folder", Button)
-        folder.disabled = self._task_folder is None
-        folder.display = self._task_folder is not None
+        action_signature = (
+            task_id,
+            state,
+            self._task_level,
+            self._task_source_url,
+            self._task_folder,
+            self._task_file_path,
+            self._pending_task_delete,
+        )
+        if action_signature == self._task_action_signature:
+            return
+        self._task_action_signature = action_signature
+        self._update_task_detail_action_buttons(node is not None)
+        allow_lifecycle_control = self._task_level == "roots"
+
         pause = self.query_one("#task-pause", Button)
         pause.disabled = state not in {
             TaskState.PREPARING,
             TaskState.QUEUED,
             TaskState.RUNNING,
         }
-        pause.display = not pause.disabled
+        pause.display = allow_lifecycle_control and not pause.disabled
         resume = self.query_one("#task-resume", Button)
-        resume.disabled = state is not TaskState.PAUSED
-        resume.display = not resume.disabled
+        resume.disabled = state not in {TaskState.PAUSING, TaskState.PAUSED}
+        resume.display = allow_lifecycle_control and not resume.disabled
         cancel = self.query_one("#task-cancel", Button)
         cancel.disabled = state not in {
             TaskState.PREPARING,
             TaskState.QUEUED,
             TaskState.RUNNING,
+            TaskState.PAUSING,
             TaskState.PAUSED,
         }
-        cancel.display = not cancel.disabled
+        cancel.display = allow_lifecycle_control and not cancel.disabled
         retry = self.query_one("#task-retry", Button)
         retry.disabled = state not in {
             TaskState.FAILED,
             TaskState.PARTIALLY_COMPLETED,
         }
-        retry.display = not retry.disabled
+        retry.display = allow_lifecycle_control and not retry.disabled
         delete = self.query_one("#task-delete", Button)
         delete.disabled = state not in {
             TaskState.COMPLETED,
@@ -2945,10 +3442,30 @@ class TextualShellApp(App[int]):
             TaskState.CANCELLED,
             TaskState.SKIPPED,
         }
-        delete.display = not delete.disabled
+        delete.display = allow_lifecycle_control and not delete.disabled
         delete.label = "OK" if self._pending_task_delete == task_id else "×"
+        self.query_one("#refresh-tasks", Button).display = allow_lifecycle_control
+
+    def _update_task_detail_action_buttons(self, visible: bool) -> None:
+        source = self.query_one("#task-source", Button)
+        if self._task_level == "files":
+            source.label = self._shell.translator("task.action.open_file")
+            source.tooltip = self._shell.translator("tooltip.open_file")
+            source.disabled = self._task_file_path is None
+        else:
+            source.label = self._shell.translator("task.action.open_url")
+            source.tooltip = self._shell.translator("tooltip.open_source")
+            source.disabled = self._task_source_url is None
+        source.display = visible
+        folder = self.query_one("#task-folder", Button)
+        folder.disabled = self._task_folder is None
+        folder.display = visible
+        self.query_one("#task-detail-actions", Vertical).display = visible
 
     def _open_task_source(self) -> None:
+        if self._task_level == "files" and self._task_file_path is not None:
+            self._open_external(self._shell._file_opener, self._task_file_path, "file")
+            return
         if self._task_source_url is not None:
             self._open_external(self._shell._url_opener, self._task_source_url, "source")
 
@@ -2972,7 +3489,7 @@ class TextualShellApp(App[int]):
         task_id = self._active_task_id
         if service is None or task_id is None:
             return
-        node = service.get(task_id) if action == "resume" else None
+        node = self._task_nodes.get(task_id) if action == "resume" else None
 
         if (
             action == "resume"
@@ -3033,7 +3550,7 @@ class TextualShellApp(App[int]):
         Thread(target=self._run_task_retry, args=(service, task_id), daemon=True).start()
 
     def _run_task_retry(self, service: TaskHierarchyService, task_id: str) -> None:
-        node = service.get(task_id)
+        node = getattr(service, "get_root_summary", service.get)(task_id)
         try:
             if node.kind is not TaskKind.BATCH:
                 asyncio.run(service.retry(task_id))
@@ -3049,7 +3566,7 @@ class TextualShellApp(App[int]):
         self.query_one("#task-detail", Static).update(message)
 
     def _is_task_running(self, task_id: str) -> bool:
-        return any(
+        return bool(getattr(self._task_service, "is_running", lambda _id: False)(task_id)) or any(
             job_task_id == task_id
             for _thread, _cancel, _block, job_task_id, _concurrent in self._background_jobs.values()
         )
@@ -3097,17 +3614,38 @@ class TextualShellApp(App[int]):
         service = self._task_service
         if node is None or service is None:
             return
+        if self._task_level == "roots":
+            self._task_root_offset = self._task_page_offset
+        elif self._task_level == "items":
+            self._task_child_offset = self._task_page_offset
         self._active_task_id = task_id
         if node.kind is TaskKind.BATCH:
             self._active_batch_id = task_id
             self._active_batch_name = node.title
-            self._show_task_nodes(service.list_children(task_id), level="items")
+            self._task_page_offset = 0
+            self._task_focus_pending = True
+            if callable(getattr(service, "list_child_summaries", None)):
+                self._task_level = "items"
+                self._active_task_id = None
+                self._refresh_tasks()
+            else:
+                self._show_task_nodes(service.list_children(task_id), level="items")
             return
+        detail_node = node
+        get_detail = getattr(service, "get", None)
+        if callable(get_detail):
+            try:
+                detail_node = get_detail(task_id)
+            except TaskNotFoundError:
+                self._refresh_tasks()
+                return
         files = service.list_files(task_id)
         self._task_files = {file.file_id: file for file in files}
         table = self.query_one("#task-file-table", DataTable)
 
-        if len(table.rows) != len(files):
+        existing_keys = tuple(str(key.value) for key in table.rows)
+        desired_keys = tuple(file.file_id for file in files)
+        if existing_keys != desired_keys:
             table.clear()
             for index, file in enumerate(files, start=1):
                 table.add_row(
@@ -3120,31 +3658,30 @@ class TextualShellApp(App[int]):
                     key=file.file_id,
                 )
         else:
-            for file in files:
-                try:
-                    new_progress = _task_file_progress(file)
-                    if table.get_cell(file.file_id, "progress") != new_progress:
-                        table.update_cell(file.file_id, "progress", new_progress)
-
-                    new_status = _display_status(file.state, self._shell.translator)
-                    if table.get_cell(file.file_id, "status") != new_status:
-                        table.update_cell(file.file_id, "status", new_status)
-
-                    new_attempts = str(file.attempts)
-                    if table.get_cell(file.file_id, "attempts") != new_attempts:
-                        table.update_cell(file.file_id, "attempts", new_attempts)
-
-                    new_location = file.location or "-"
-                    if table.get_cell(file.file_id, "location") != new_location:
-                        table.update_cell(file.file_id, "location", new_location)
-                except Exception:
-                    pass
+            for index, file in enumerate(files, start=1):
+                values = {
+                    "index": _number_cell(index),
+                    "name": file.name,
+                    "progress": _task_file_progress(file),
+                    "status": _display_status(file.state, self._shell.translator),
+                    "attempts": str(file.attempts),
+                    "location": file.location or "-",
+                }
+                for column, value in values.items():
+                    try:
+                        if table.get_cell(file.file_id, column) != value:
+                            table.update_cell(file.file_id, column, value)
+                    except Exception:
+                        pass
         self._task_level = "files"
+        self._update_task_page_controls()
         task_label = self._shell.translator("task.path")
         parent_path = (
-            f"{task_label} / {self._active_batch_name} / " if node.parent_id else f"{task_label} / "
+            f"{task_label} / {self._active_batch_name} / "
+            if detail_node.parent_id
+            else f"{task_label} / "
         )
-        self.query_one("#task-path", Static).update(f"{parent_path}{node.title}")
+        self.query_one("#task-path", Static).update(f"{parent_path}{detail_node.title}")
         self.query_one("#task-table", DataTable).display = False
         table.display = True
         back = self.query_one("#task-back", Button)
@@ -3152,16 +3689,16 @@ class TextualShellApp(App[int]):
         back.display = True
         lines = [
             f"[S] {self._shell.translator('task.detail.status'):<10} "
-            f"{_display_status(node.state.value, self._shell.translator)}",
+            f"{_display_status(detail_node.state.value, self._shell.translator)}",
             f"[#] {self._shell.translator('task.detail.progress'):<10} "
-            f"{_task_progress(node, self._shell.translator)}",
+            f"{_task_progress(detail_node, self._shell.translator)}",
             f"[F] {self._shell.translator('task.detail.files'):<10} {len(files)}",
         ]
-        failure = node.details.get("failure")
+        failure = detail_node.details.get("failure")
         if isinstance(failure, Mapping):
             lines.extend(_task_failure_lines(failure, self._shell.translator))
         self.query_one("#task-detail", Static).update("\n".join(lines))
-        self._set_task_actions(node)
+        self._set_task_actions(detail_node)
         if files:
             table.focus()
         else:
@@ -3181,18 +3718,46 @@ class TextualShellApp(App[int]):
         if file.failure is not None:
             lines.extend(_task_failure_lines(file.failure, self._shell.translator))
         self.query_one("#task-detail", Static).update("\n".join(lines))
-        if file.location is not None:
-            self._task_folder = str(Path(file.location).parent)
-            folder = self.query_one("#task-folder", Button)
-            folder.disabled = False
-            folder.display = True
+        self._task_folder = str(Path(file.location).parent) if file.location is not None else None
+        self._task_file_path = file.location
+        self._task_source_url = None
+        self._task_action_signature = None
+        self._update_task_detail_action_buttons(True)
 
     def _task_back(self) -> None:
         service = self._task_service
         if self._task_level == "files" and self._active_batch_id is not None and service:
-            self._show_task_nodes(service.list_children(self._active_batch_id), level="items")
+            self._task_page_offset = self._task_child_offset
+            self._task_focus_pending = True
+            if callable(getattr(service, "list_child_summaries", None)):
+                self._task_level = "items"
+                self._active_task_id = None
+                self._refresh_tasks()
+            else:
+                children = service.list_children(self._active_batch_id)
+                self._show_task_nodes(
+                    children[: self._task_page_size],
+                    level="items",
+                    page_total=len(children),
+                    page_offset=0,
+                )
         elif self._task_level in {"files", "items"} and service:
-            self._show_task_nodes(tuple(reversed(service.list_roots())), level="roots")
+            return_task_id = (
+                self._active_task_id
+                if self._task_level == "files" and self._active_batch_id is None
+                else None
+            )
+            self._active_batch_id = None
+            self._active_batch_name = None
+            self._task_page_offset = self._task_root_offset
+            self._task_focus_pending = True
+            if callable(getattr(service, "list_root_summaries", None)):
+                self._task_level = "roots"
+                self._active_task_id = return_task_id
+                self._refresh_tasks()
+            else:
+                self._active_task_id = return_task_id
+                self._show_task_nodes(tuple(reversed(service.list_roots())), level="roots")
 
 
 def _format_shell_output(output: str) -> str:
@@ -3564,6 +4129,7 @@ def _display_status(value: str, translator: TranslationService | None = None) ->
         "pending_resolution": "status.waiting",
         "resolving": "status.preparing",
         "running": "status.in_progress",
+        "pausing": "status.pausing",
         "queued": "status.queued",
         "downloading": "status.downloading",
         "completed": "status.completed",
@@ -3583,6 +4149,7 @@ def _display_status(value: str, translator: TranslationService | None = None) ->
         "pending_resolution": "Waiting",
         "resolving": "Preparing",
         "running": "In progress",
+        "pausing": "Pausing",
         "queued": "Queued",
         "downloading": "Downloading",
         "completed": "Completed",
@@ -3594,6 +4161,60 @@ def _display_status(value: str, translator: TranslationService | None = None) ->
         "cancelled": "Cancelled",
         "package_ready": "Ready",
     }.get(value, _display_name(value))
+
+
+def _network_settings_text(field, runtime, translator):
+    if not (field.key.startswith("network.") or ".network." in field.key):
+        return ""
+    lines = [translator("settings.network.restart")]
+    if runtime is None or runtime.request_limiter is None:
+        return "\n" + "\n".join(lines)
+    from cli_downloader.core.http import has_managed_http
+
+    for entry in runtime.plugins_by_id.values():
+        if field.key.startswith("plugins.") and not field.key.startswith(
+            f"plugins.{entry.plugin_id}."
+        ):
+            continue
+        policy = runtime.request_limiter.requests.policy(entry.site_id)
+        source = (
+            f"plugins.{entry.plugin_id}.network"
+            if entry.manifest.network is not None
+            else "network"
+        )
+        coverage = translator(
+            "settings.network.request_level"
+            if has_managed_http(entry.instance)
+            else "settings.network.operation_level"
+        )
+        lines.append(
+            translator(
+                "settings.network.effective",
+                site=entry.site_id,
+                limit=policy.max_concurrency,
+                interval=policy.min_interval_seconds,
+                source=source,
+                coverage=coverage,
+            )
+        )
+    return "\n" + "\n".join(lines)
+
+
+def _task_status_label(node, translator):
+    status = _display_status(node.state.value, translator)
+    reason = node.details.get("network_wait_reason")
+    if isinstance(reason, str) and node.state.value in {"preparing", "running", "queued"}:
+        status += " · " + translator(f"task.queue.{reason}")
+        retry_at = node.details.get("network_retry_at")
+        if isinstance(retry_at, str):
+            try:
+                remaining = max(
+                    0, int((datetime.fromisoformat(retry_at) - datetime.now(UTC)).total_seconds())
+                )
+                status += f" ({remaining}s)"
+            except ValueError:
+                pass
+    return status
 
 
 def _scheduler_waiting_label(
@@ -3620,6 +4241,10 @@ def _scheduler_waiting_label(
 
 def _number_cell(index: int) -> Text:
     return Text(str(index), style="#777777")
+
+
+def _task_cell_width(value: object) -> int:
+    return value.cell_len if isinstance(value, Text) else cell_len(str(value))
 
 
 def _plugin_cell(value: object) -> Text:
@@ -3774,4 +4399,11 @@ def _open_folder(folder: str) -> None:
     path = Path(folder).resolve()
     if not path.is_dir():
         raise OSError(f"folder does not exist: {path}")
+    os.startfile(path)
+
+
+def _open_file(file_path: str) -> None:
+    path = Path(file_path).resolve()
+    if not path.is_file():
+        raise OSError(f"file does not exist: {path}")
     os.startfile(path)

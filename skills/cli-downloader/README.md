@@ -9,6 +9,8 @@ It follows the [open Agent Skills specification](https://agentskills.io/specific
 - Inspect persisted tasks and download history through the public CLI.
 - Validate URL routing with `--dry-run` before a live download.
 - Add and verify downloads after explicit user authorization.
+- Submit authorized work to the single visible Shell owner and control the accepted Task.
+- Treat a command-line list URL without `--select` as authorization-sensitive bulk scope.
 - Diagnose unsupported URLs and plugin routing failures.
 - Research a representative website URL before implementing support.
 - Scaffold and document an external CLI-Downloader plugin.
@@ -29,7 +31,7 @@ All commands below assume the current directory is the root of a cloned CLI-Down
 
 Codex discovers personal skills from `$HOME/.agents/skills` and repository skills from `.agents/skills`.
 
-Official reference: [Build skills in Codex](https://learn.chatgpt.com/docs/build-skills.md).
+Official reference: [Build skills in Codex](https://learn.chatgpt.com/docs/build-skills).
 
 ### Personal Installation
 
@@ -61,7 +63,7 @@ Start a new Codex session if the Skill does not appear after installation. Invok
 
 Claude Code discovers personal skills from `$HOME/.claude/skills` and project skills from `.claude/skills`.
 
-Official reference: [Extend Claude Code with skills](https://code.claude.com/docs/en/slash-commands).
+Official reference: [Extend Claude Code with skills](https://code.claude.com/docs/en/skills).
 
 ### Personal Installation
 
@@ -110,6 +112,10 @@ Use the cli-downloader skill to show the current tasks without creating new stat
 ```
 
 The agent should use `clid tasks list --json` when CLI-Downloader is installed, keep Tasks distinct from History, and avoid starting a network request or download.
+
+For a live Batch or list URL, the agent should dry-run first and obtain authorization for all
+items returned by the operation, or pass repeated `--select <item-id>` values for a requested
+subset. The visible Shell keeps its interactive selection page.
 
 ## Update
 

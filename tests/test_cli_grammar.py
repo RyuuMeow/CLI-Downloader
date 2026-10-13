@@ -28,3 +28,22 @@ class CliGrammarTest(TestCase):
             parser.parse_args(["tasks", "show", "--task-id", "task-1"])
         with self.assertRaises(SystemExit):
             parser.parse_args(["history", "--task-id", "history-1"])
+
+    def test_download_response_modes_are_explicit_and_mutually_exclusive(self) -> None:
+        parser = build_parser()
+        detached = parser.parse_args(["download", "https://example.test/item", "--detach"])
+        self.assertTrue(detached.detach)
+        self.assertFalse(detached.wait)
+        self.assertEqual(detached.selection_policy, "all")
+
+        waiting = parser.parse_args(["download", "https://example.test/item", "--wait"])
+        self.assertTrue(waiting.wait)
+        self.assertFalse(waiting.detach)
+
+        with self.assertRaises(SystemExit):
+            parser.parse_args(["download", "https://example.test/item", "--detach", "--wait"])
+
+    def test_task_pause_uses_positional_task_id(self) -> None:
+        args = build_parser().parse_args(["tasks", "pause", "task-1", "--json"])
+        self.assertEqual(args.task_id, "task-1")
+        self.assertTrue(args.json)

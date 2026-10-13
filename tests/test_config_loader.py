@@ -12,6 +12,20 @@ from cli_downloader.sites.manifest import BrowserAuthSchema, SiteManifest
 
 
 class ConfigLoaderTest(TestCase):
+    def test_imports_legacy_download_limit_without_overriding_explicit_scheduler(self) -> None:
+        for canonical in (None, 4):
+            with self.subTest(canonical=canonical), TemporaryDirectory() as directory:
+                paths = _paths(Path(directory))
+                paths.config_dir.mkdir(parents=True)
+                contents = "[download]\nmax_concurrent_galleries = 8\n"
+                if canonical is not None:
+                    contents += f"[scheduler]\nmax_concurrent_downloads = {canonical}\n"
+                (paths.config_dir / "config.toml").write_text(contents, encoding="utf-8")
+                loaded = ConfigLoader(paths=paths).load()
+                self.assertEqual(
+                    loaded.values["scheduler.max_concurrent_downloads"], canonical or 8
+                )
+
     def test_loads_defaults_when_files_are_missing(self) -> None:
         with TemporaryDirectory() as directory:
             paths = _paths(Path(directory))

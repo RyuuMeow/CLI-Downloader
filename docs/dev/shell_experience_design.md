@@ -1,6 +1,6 @@
 # Shell Experience Design
 
-Updated: 2026-07-07
+Updated: 2026-07-15
 
 This document is the authoritative interaction and visual specification for the
 persistent Textual Shell. Core widget and operation contracts are recorded in
@@ -27,6 +27,28 @@ through the existing Plugin routing, confirmation, queue, and Batch UI.
 
 Commands, URLs with surrounding arguments, local paths, unsupported schemes,
 and malformed input are not rewritten.
+
+## External Agent Commands
+
+The visible Shell is the task dashboard and the sole long-lived Scheduler owner.
+An Agent first reads `clid shell status --json`; after authorization it may use
+`clid shell ensure --visible --wait-ready --json` and submit a validated
+`clid download <url> --detach --json`. The Console and Tasks tab then show the
+same accepted Task as a user-submitted download. Detach returns acceptance only,
+so the Agent must query `tasks show` and leave the final status visible in the
+existing Tasks and History views.
+
+Pause, resume, cancel, retry, and Batch controls are owner-routed commands. If
+the IPC owner disappears, the Console reports an uncertain completion with the
+known Task ID; the UI must not silently create another Task. A normal command
+without a Shell remains a foreground owner fallback and may block until its
+terminal result, while `--detach` without a ready Shell is rejected.
+
+When the user exits while persisted work is unfinished, the Shell shows a warning,
+marks active run checkpoints as recoverable planned work, signals in-flight workers
+to stop at their next safe boundary, and stops accepting new owner requests before
+releasing the ownership lock. A later Shell startup reconciles those checkpoints;
+it never creates a replacement Task merely because the previous Shell closed.
 
 ## Console Blocks
 

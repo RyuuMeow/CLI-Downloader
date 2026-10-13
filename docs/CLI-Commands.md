@@ -215,3 +215,18 @@ Check if a new release of `CLI-Downloader` itself is available on GitHub Release
 # Check application version status
 clid check-update --json
 ```
+
+
+## Network diagnostics (`clid network status`)
+
+`clid network status --json` reads the active Shell owner's site request counters,
+limits, waiting counts by phase, cooldown deadlines and plugin coverage. It includes
+no request URLs, cookies or tokens and makes no external site requests. Without a
+ready owner it returns `owner_available: false`; it does not start one or reconstruct
+live counters from SQLite. Older owners must be restarted for this capability.
+
+Networked `clid operation --json <plugin_id> <operation_id> [key=value ...]` commands
+are forwarded to the active Owner. A live older Owner lacking operation forwarding
+is rejected; Core does not execute a second local network operation as a fallback.
+Operation help remains offline. If an accepted operation loses its terminal response,
+its completion is unknown and Core does not automatically replay it.

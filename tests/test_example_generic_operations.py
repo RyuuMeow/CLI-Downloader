@@ -82,6 +82,46 @@ class ExampleGenericOperationTests(unittest.IsolatedAsyncioTestCase):
 
 
 class ExampleGenericCLIFlowTests(unittest.TestCase):
+    def test_unselected_list_downloads_items_from_every_page(self) -> None:
+        stream = StringIO()
+
+        with TemporaryDirectory() as directory:
+            with patch.dict("os.environ", {"CLI_DOWNLOADER_DATA_ROOT": directory}):
+                with redirect_stdout(stream):
+                    exit_code = main(
+                        [
+                            "download",
+                            "https://example.test/list?page=1",
+                            "--json",
+                        ],
+                        runtime=build_example_runtime(),
+                    )
+
+        payload = json.loads(stream.getvalue())
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(payload["status"], "completed")
+        self.assertEqual(payload["batch"]["counts"]["completed"], 4)
+        self.assertEqual(len(payload["output_files"]), 8)
+
+    def test_unselected_list_from_later_page_still_downloads_every_page(self) -> None:
+        stream = StringIO()
+
+        with TemporaryDirectory() as directory:
+            with patch.dict("os.environ", {"CLI_DOWNLOADER_DATA_ROOT": directory}):
+                with redirect_stdout(stream):
+                    exit_code = main(
+                        [
+                            "download",
+                            "https://example.test/list?page=2",
+                            "--json",
+                        ],
+                        runtime=build_example_runtime(),
+                    )
+
+        payload = json.loads(stream.getvalue())
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(payload["batch"]["counts"]["completed"], 4)
+
     def test_list_download_action_reuses_persistent_download_pipeline(self) -> None:
         stream = StringIO()
         outcome = TextualRenderOutcome(
@@ -106,7 +146,12 @@ class ExampleGenericCLIFlowTests(unittest.TestCase):
                     ):
                         with redirect_stdout(stream):
                             exit_code = main(
-                                ["download", "https://example.test/list?page=1"],
+                                [
+                                    "download",
+                                    "https://example.test/list?page=1",
+                                    "--selection-policy",
+                                    "interactive",
+                                ],
                                 runtime=build_example_runtime(),
                             )
             payload = json.loads(stream.getvalue())

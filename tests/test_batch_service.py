@@ -1,6 +1,7 @@
 from tests.state_store_support import StateBatchStore, StateTaskStore
 import asyncio
 from dataclasses import replace
+from hashlib import sha256
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from threading import Event
@@ -32,6 +33,7 @@ from cli_downloader.storage.completion_store import InMemoryCompletionStore
 from cli_downloader.storage.file_writer import AssetFileWriter
 from cli_downloader.storage.state_database import StateDatabase
 from cli_downloader.storage.state_history_store import StateHistoryStore
+from cli_downloader.storage.state_task_store import StateTaskStore as SQLiteTaskStore
 from cli_downloader.storage.task_store import InMemoryTaskStore, TaskRecord, TaskStatus
 
 
@@ -42,6 +44,15 @@ class BatchTorrentFetcher:
     async def fetch(self, _asset):
         self.calls += 1
         return b"descriptor"
+
+
+class BatchDirectFetcher:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def fetch(self, _asset):
+        self.calls += 1
+        return b"complete asset"
 
 
 class BatchTorrentClient:
@@ -63,6 +74,22 @@ class BatchTorrentClient:
     async def add_torrent(self, _torrent, _download_dir):
         self.add_calls += 1
         return TorrentHandle("new", "new.torrent")
+
+
+class ShutdownAwareBatchTorrentClient(BatchTorrentClient):
+    def __init__(self, status: TorrentOutcome) -> None:
+        super().__init__(status)
+        self.shutdown_seen = False
+        self.cancel_called = False
+
+    async def poll_until_complete(self, _handle, **kwargs):
+        self.poll_calls += 1
+        checker = kwargs.get("shutdown_requested")
+        self.shutdown_seen = callable(checker) and bool(checker())
+        return self.poll
+
+    async def cancel(self, _handle):
+        self.cancel_called = True
 
 
 def _batch_torrent_fixture(root: Path, outcome: TorrentOutcome):
@@ -126,6 +153,51 @@ def _batch_torrent_fixture(root: Path, outcome: TorrentOutcome):
     return store, child
 
 
+def _batch_direct_fixture(root: Path):
+    database = StateDatabase(root / "state.sqlite3")
+    store = StateBatchStore(database)
+    asset = DownloadAsset(
+        site_id="example",
+        gallery_id="direct-gallery",
+        plugin_asset_key="direct-1",
+        url="https://example.test/direct/item",
+        filename="item.jpg",
+        index=1,
+    )
+    package = DownloadPackage(
+        package_id="direct-package",
+        version=1,
+        plugin_id="example",
+        site_id="example",
+        gallery_id="direct-gallery",
+        source_operation_id="resolve_gallery",
+        source_url="https://example.test/gallery/direct",
+        strategy=DownloadStrategy.DIRECT,
+        assets=(asset,),
+        title="Direct Gallery",
+        folder_template="{task_id}",
+    )
+    entry = BatchEntry(
+        entry_id="direct-entry",
+        parent_id="direct-parent",
+        plugin_id="example",
+        site_id="example",
+        candidate_id="direct-candidate",
+        source_operation_id="resolve_gallery",
+        source_url="https://example.test/gallery/direct",
+        status=BatchEntryStatus.RESOLVING,
+    )
+    store.create_batch(BatchParent("direct-parent", (entry.entry_id,)), (entry,))
+    child = DownloadChild(
+        child_id="direct-child",
+        parent_id="direct-parent",
+        entry_id=entry.entry_id,
+        package=package,
+    )
+    store.attach_child(entry.entry_id, child)
+    return store, child
+
+
 def _items() -> tuple[ListItemData, ...]:
     return (
         ListItemData(
@@ -142,6 +214,113 @@ def _items() -> tuple[ListItemData, ...]:
 
 
 class BatchServiceTests(unittest.TestCase):
+    def test_provisional_enumeration_is_durable_before_selection_is_finalized(self) -> None:
+        with TemporaryDirectory() as directory:
+            database = StateDatabase(Path(directory) / "state.sqlite3")
+            tasks = SQLiteTaskStore(database)
+            store = StateBatchStore(database)
+            history = StateHistoryStore(database)
+            service = BatchService(store=store, task_store=tasks, history_store=history)
+
+            parent_id = service.begin_enumeration(
+                plugin_id="example",
+                site_id="example",
+                source_operation_id="browse",
+                source_url="https://example.test/list",
+                title="Example list",
+            )
+
+            provisional = tasks.get(parent_id)
+            self.assertIsNotNone(provisional)
+            assert provisional is not None
+            self.assertEqual(provisional.kind, TaskKind.BATCH)
+            self.assertEqual(provisional.metadata["batch_enumeration"]["state"], "enumerating")
+            self.assertEqual(store.get_snapshot(parent_id).parent.entry_ids, ())
+            provisional_history = history.get_record(parent_id)
+            self.assertEqual(provisional_history.status, TaskStatus.PENDING.value)
+
+            result = service.confirm_selection(
+                plugin_id="example",
+                site_id="example",
+                source_operation_id="resolve_gallery",
+                items=_items(),
+                source_url="https://example.test/list",
+                title="Example list",
+                parent_id=parent_id,
+            )
+
+            finalized = tasks.get(parent_id)
+            self.assertEqual(result.snapshot.parent.parent_id, parent_id)
+            self.assertEqual(len(result.entries), len(_items()))
+            self.assertEqual(finalized.metadata["batch_enumeration"]["state"], "completed")
+            self.assertEqual(finalized.created_at, provisional.created_at)
+            self.assertEqual(
+                history.get_record(parent_id).created_at, provisional_history.created_at
+            )
+
+    def test_failed_enumeration_closes_task_and_history_without_deleting_root(self) -> None:
+        with TemporaryDirectory() as directory:
+            database = StateDatabase(Path(directory) / "state.sqlite3")
+            tasks = SQLiteTaskStore(database)
+            store = StateBatchStore(database)
+            history = StateHistoryStore(database)
+            service = BatchService(store=store, task_store=tasks, history_store=history)
+            parent_id = service.begin_enumeration(
+                plugin_id="example",
+                site_id="example",
+                source_operation_id="browse",
+                source_url="https://example.test/list",
+                title="Example list",
+            )
+
+            service.fail_enumeration(parent_id, "page 2 failed")
+
+            task = tasks.get(parent_id)
+            self.assertEqual(task.status, TaskStatus.FAILED)
+            self.assertEqual(task.metadata["failure"]["stage"], "list_enumeration")
+            self.assertEqual(store.get_snapshot(parent_id).parent.entry_ids, ())
+            record = history.get_record(parent_id)
+            self.assertEqual(record.status, TaskStatus.FAILED.value)
+            self.assertIsNotNone(record.finished_at)
+
+    def test_direct_prefix_checkpoint_is_never_promoted_as_complete(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            store, child = _batch_direct_fixture(root)
+            partial = root / child.child_id / "item.jpg.part"
+            partial.parent.mkdir(parents=True, exist_ok=True)
+            partial.write_bytes(b"prefix")
+            record = store.list_assets(child.child_id)[0]
+            store.update_asset(
+                child.child_id,
+                replace(
+                    record,
+                    status=AssetStatus.DOWNLOADING,
+                    partial_path=str(partial),
+                    content_sha256=sha256(b"prefix").hexdigest(),
+                    metadata={"checkpoint_kind": "partial"},
+                ),
+            )
+            fetcher = BatchDirectFetcher()
+            downloader = SystemBatchDownloader(
+                file_writer=AssetFileWriter(root),
+                store=store,
+                fetchers={"example": fetcher},
+            )
+
+            outcomes = asyncio.run(
+                downloader.execute(
+                    child,
+                    (store.list_assets(child.child_id)[0],),
+                    Event(),
+                    lambda _reason, _data: None,
+                )
+            )
+
+            self.assertEqual(fetcher.calls, 1)
+            self.assertEqual(outcomes[0].status, AssetStatus.COMPLETED)
+            self.assertEqual(Path(outcomes[0].final_path).read_bytes(), b"complete asset")
+
     def test_selection_persists_explicit_download_strategy_on_entries(self) -> None:
         with TemporaryDirectory() as directory:
             database = StateDatabase(Path(directory) / "state.sqlite3")
@@ -677,6 +856,52 @@ class BatchServiceTests(unittest.TestCase):
             self.assertEqual(client.add_calls, 0)
             self.assertEqual(client.status_calls, 1)
             self.assertEqual(client.poll_calls, 0)
+
+    def test_batch_torrent_shutdown_does_not_cancel_client_task(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            handle = TorrentHandle("existing", "item.torrent")
+            downloading = TorrentOutcome(
+                handle,
+                "downloading",
+                str(root),
+                found=True,
+                progress=0.5,
+            )
+            store, child = _batch_torrent_fixture(root, downloading)
+            client = ShutdownAwareBatchTorrentClient(downloading)
+            downloader = SystemBatchDownloader(
+                file_writer=AssetFileWriter(root),
+                store=store,
+                fetchers={"example": BatchTorrentFetcher()},
+                torrent_client=client,
+            )
+
+            class ShutdownControl:
+                def is_set(self):
+                    return False
+
+                def is_shutdown_requested(self):
+                    return True
+
+                async def wait_if_paused(self):
+                    return None
+
+            outcomes = asyncio.run(
+                downloader.execute(
+                    child,
+                    (store.list_assets(child.child_id)[0],),
+                    ShutdownControl(),
+                    lambda _reason, _data: None,
+                )
+            )
+
+            self.assertEqual(outcomes[0].status, AssetStatus.DOWNLOADING)
+            self.assertTrue(client.shutdown_seen)
+            self.assertFalse(client.cancel_called)
+            checkpoint = store.list_assets(child.child_id)[0].metadata["torrent_checkpoint"]
+            self.assertEqual(checkpoint["status"], "downloading")
+            self.assertEqual(checkpoint["progress"], 0.5)
 
 
 if __name__ == "__main__":

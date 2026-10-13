@@ -3,6 +3,8 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import sys
+from contextlib import contextmanager, nullcontext
 from collections.abc import Sequence
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
@@ -31,10 +33,15 @@ from cli_downloader.cli._output import (
     _task_summary,
 )
 from cli_downloader.cli._download_ops import (
+    AcceptanceSink,
+    _build_download_limiter,
+    ListSelectionPolicy,
     _batch_details,
     _run_batch_retry,
     _run_generic_download,
 )
+from cli_downloader.cli._owner_operations import forward_operation
+from cli_downloader.storage.site_cooldown_store import SiteCooldownStore
 from cli_downloader.cli import _inspect_ops
 from cli_downloader.cli import _shell_wiring
 from cli_downloader.cli.history import (
@@ -50,7 +57,7 @@ from cli_downloader.cli.textual_renderer import render_interactive_result
 from cli_downloader.config.loader import ConfigLoader
 from cli_downloader.core.environment import diagnose_environment, installed_plugins_root
 from cli_downloader.about import __version__
-from cli_downloader.core.errors import CLIDownloaderError
+from cli_downloader.core.errors import CLIDownloaderError, OwnerError
 from cli_downloader.core.events import TaskEvent
 from cli_downloader.core.history_records import DownloadHistoryRecord
 from cli_downloader.core.batch import (
@@ -58,6 +65,29 @@ from cli_downloader.core.batch import (
     BatchEntryStatus,
 )
 from cli_downloader.core.task_tree import TaskState
+from cli_downloader.core.owner_protocol import (
+    OWNER_PROTOCOL_VERSION,
+    OwnerCommand,
+    OwnerEventKind,
+    OwnerHandshake,
+    OwnerLifecycleState,
+    OwnerMode,
+    OwnerRequest,
+    OwnerResponseMode,
+    OwnerSource,
+)
+from cli_downloader.core.owner_scope import (
+    OwnerDiscoveryMetadata,
+    OwnerManager,
+    OwnerScope,
+    new_owner_session_id,
+)
+from cli_downloader.core.shell_control import (
+    ShellController,
+    ShellStatusKind,
+    ShellStatusSnapshot,
+)
+from cli_downloader.core.owner_transport import OwnerPipeClient, OwnerTransportError
 from cli_downloader.core.operations import (
     ListPageData,
     ResultKind,
@@ -100,6 +130,262 @@ _recover_interrupted_downloads = _shell_wiring._recover_interrupted_downloads
 build_interactive_shell = _shell_wiring.build_interactive_shell
 
 
+@contextmanager
+def _owned_execution(*, owner_claimed: bool, owner_mode: OwnerMode = OwnerMode.FOREGROUND):
+    """Claim the process-wide execution scope for a live foreground action."""
+
+    if owner_claimed:
+        with nullcontext():
+            yield
+        return
+
+    environment = diagnose_environment()
+    scope = OwnerScope.from_app_paths(environment.paths)
+    metadata = OwnerDiscoveryMetadata.for_current_process(
+        scope,
+        application_version=__version__,
+        owner_mode=owner_mode,
+        lifecycle_state=OwnerLifecycleState.BUSY,
+        session_id=new_owner_session_id(),
+        capabilities=("download", "task_control", "task_query", "history_query"),
+    )
+    with OwnerManager(scope).acquire(metadata):
+        yield
+
+
+def _emit_owner_error(error: OwnerError, *, json_output: bool) -> None:
+    payload = {
+        "error": str(error),
+        "code": getattr(error, "code", "owner_error"),
+    }
+    if json_output:
+        print(json.dumps(payload, indent=2))
+    else:
+        print(f"Owner error [{payload['code']}]: {payload['error']}")
+
+
+def _emit_shell_status(snapshot: ShellStatusSnapshot, *, json_output: bool) -> None:
+    if json_output:
+        print(json.dumps(snapshot.to_dict(), indent=2))
+        return
+    print(f"Shell: {snapshot.kind.value}")
+    print(f"Status: {snapshot.message}")
+    metadata = snapshot.metadata
+    if metadata is not None:
+        print(f"Owner mode: {metadata.owner_mode.value}")
+        print(f"PID: {metadata.pid}")
+        print(f"Version: {metadata.application_version}")
+        print(f"Protocol: {metadata.protocol_version}")
+        print(f"Session: {metadata.session_id}")
+        print(f"Recovery: {metadata.lifecycle_state.value}")
+
+
+def _forward_download_to_shell(args: argparse.Namespace) -> int | None:
+    """Forward a live download when this data-root already has a Shell owner.
+
+    ``None`` means no ready Shell was discovered and the caller may claim the
+    foreground owner.  A concrete exit code means the request was handled by
+    the Shell (including a structured IPC failure).
+    """
+
+    environment = diagnose_environment()
+    scope = OwnerScope.from_app_paths(environment.paths)
+    snapshot = ShellController(scope).status()
+    metadata = snapshot.metadata
+    if metadata is None or metadata.owner_mode is not OwnerMode.SHELL:
+        return None
+    if snapshot.kind not in {ShellStatusKind.READY, ShellStatusKind.RECOVERING}:
+        return None
+    if metadata.lifecycle_state not in {OwnerLifecycleState.READY, OwnerLifecycleState.RECOVERING}:
+        return None
+
+    response_mode = OwnerResponseMode.DETACH if args.detach else OwnerResponseMode.WAIT
+    session_id = f"cli-{uuid4().hex}"
+    selection_policy = ListSelectionPolicy.EXPLICIT.value if args.select else args.selection_policy
+    payload: dict[str, object] = {
+        "url": args.url,
+        "force": bool(args.force),
+        "selection_policy": selection_policy,
+    }
+    for name in ("profile", "strategy"):
+        value = getattr(args, name, None)
+        if value is not None:
+            payload[name] = value
+    if args.select:
+        payload["select"] = tuple(args.select)
+    request = OwnerRequest(
+        protocol_version=OWNER_PROTOCOL_VERSION,
+        request_id=uuid4().hex,
+        source=OwnerSource.CLI,
+        command=OwnerCommand.DOWNLOAD,
+        response_mode=response_mode,
+        payload=payload,
+        client_session_id=session_id,
+    )
+    handshake = OwnerHandshake(
+        protocol_version=OWNER_PROTOCOL_VERSION,
+        session_id=session_id,
+        mode=OwnerMode.FOREGROUND,
+        application_version=__version__,
+        capabilities=("download",),
+        required_capabilities=("download",),
+        scope_fingerprint=scope.scope_fingerprint,
+    )
+    try:
+        events = OwnerPipeClient(scope).request(request, handshake=handshake)
+    except OwnerTransportError as error:
+        _emit_owner_error(error, json_output=args.json)
+        return 1
+    if not events:
+        _emit_owner_error(
+            OwnerTransportError("owner returned no response events"),
+            json_output=args.json,
+        )
+        return 1
+    accepted = next((event for event in events if event.kind is OwnerEventKind.ACCEPTED), None)
+    if args.detach and accepted is not None:
+        payload = {"accepted": True, "request_id": request.request_id, **dict(accepted.payload)}
+        if args.json:
+            print(json.dumps(payload, ensure_ascii=False))
+        else:
+            task_id = payload.get("task_id") or "(pending)"
+            print(f"Accepted by Shell: {task_id} ({request.request_id})")
+        return 0
+    terminal = next((event for event in events if event.kind is OwnerEventKind.TERMINAL), None)
+    if terminal is None:
+        error = next(
+            (event for event in events if event.kind is OwnerEventKind.OWNER_DISCONNECTED), None
+        )
+        _emit_owner_error(
+            OwnerTransportError(
+                str(dict(error.payload))
+                if error is not None
+                else "owner disconnected before completion"
+            ),
+            json_output=args.json,
+        )
+        return 1
+    result = terminal.payload.get("result")
+    if isinstance(result, dict) and isinstance(result.get("output"), str):
+        output = result["output"]
+        if output:
+            sys.stdout.write(output)
+            if not output.endswith("\n"):
+                sys.stdout.write("\n")
+    elif args.json:
+        print(json.dumps(dict(terminal.payload), ensure_ascii=False))
+    else:
+        print(f"Shell download {terminal.payload.get('status', 'finished')}")
+    exit_code = terminal.payload.get("exit_code")
+    return int(exit_code) if isinstance(exit_code, int) else 0
+
+
+def _forward_task_control_to_shell(
+    task_id: str,
+    action: str,
+    *,
+    json_output: bool,
+) -> int | None:
+    """Forward one live Task control to the current Shell owner."""
+
+    environment = diagnose_environment()
+    scope = OwnerScope.from_app_paths(environment.paths)
+    snapshot = ShellController(scope).status()
+    metadata = snapshot.metadata
+    if metadata is None or metadata.owner_mode is not OwnerMode.SHELL:
+        return None
+    if snapshot.kind not in {ShellStatusKind.READY, ShellStatusKind.RECOVERING}:
+        return None
+    if metadata.lifecycle_state not in {OwnerLifecycleState.READY, OwnerLifecycleState.RECOVERING}:
+        return None
+    session_id = f"cli-{uuid4().hex}"
+    request = OwnerRequest(
+        protocol_version=OWNER_PROTOCOL_VERSION,
+        request_id=uuid4().hex,
+        source=OwnerSource.CLI,
+        command=OwnerCommand.TASK_CONTROL,
+        response_mode=OwnerResponseMode.WAIT,
+        payload={"task_id": task_id, "action": action},
+        client_session_id=session_id,
+    )
+    handshake = OwnerHandshake(
+        protocol_version=OWNER_PROTOCOL_VERSION,
+        session_id=session_id,
+        mode=OwnerMode.FOREGROUND,
+        application_version=__version__,
+        capabilities=("task_control",),
+        required_capabilities=("task_control",),
+        scope_fingerprint=scope.scope_fingerprint,
+    )
+    try:
+        events = OwnerPipeClient(scope).request(request, handshake=handshake)
+    except OwnerTransportError as error:
+        _emit_owner_error(error, json_output=json_output)
+        return 1
+    terminal = next((event for event in events if event.kind is OwnerEventKind.TERMINAL), None)
+    if terminal is None:
+        _emit_owner_error(
+            OwnerTransportError("owner disconnected before control acknowledgement"),
+            json_output=json_output,
+        )
+        return 1
+    result = terminal.payload.get("result")
+    if json_output:
+        print(
+            json.dumps(
+                dict(result) if isinstance(result, dict) else dict(terminal.payload),
+                ensure_ascii=False,
+            )
+        )
+    elif isinstance(result, dict) and isinstance(result.get("output"), str) and result["output"]:
+        sys.stdout.write(result["output"])
+        if not result["output"].endswith("\n"):
+            sys.stdout.write("\n")
+    else:
+        print(f"Task {task_id}: {action} acknowledged")
+    exit_code = terminal.payload.get("exit_code")
+    return int(exit_code) if isinstance(exit_code, int) else 0
+
+
+def _shell_launch_args(args: argparse.Namespace) -> tuple[str, ...]:
+    values: list[str] = []
+    for plugin_root in getattr(args, "plugin_root", ()):
+        values.extend(("--plugin-root", plugin_root))
+    if getattr(args, "runtime_enable_external_code", False):
+        values.append("--enable-external-code")
+    return tuple(values)
+
+
+def _run_shell_command(args: argparse.Namespace) -> int:
+    environment = diagnose_environment()
+    scope = OwnerScope.from_app_paths(environment.paths)
+    controller = ShellController(scope)
+    command = getattr(args, "shell_command", None)
+    if command == "status":
+        snapshot = controller.status()
+        _emit_shell_status(snapshot, json_output=args.json)
+        return 1 if snapshot.kind is ShellStatusKind.INCOMPATIBLE else 0
+
+    timeout = max(0.01, float(getattr(args, "timeout", 10.0)))
+    if command == "ensure":
+        result = controller.ensure(
+            timeout=timeout,
+            extra_args=_shell_launch_args(args),
+        )
+    else:
+        result = controller.start(
+            wait_ready=bool(getattr(args, "wait_ready", False)),
+            timeout=timeout,
+            extra_args=_shell_launch_args(args),
+        )
+    if getattr(args, "json", False):
+        print(json.dumps(result.to_dict(), indent=2))
+    else:
+        _emit_shell_status(result.status, json_output=False)
+        print(result.message)
+    return result.exit_code
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="clid",
@@ -125,6 +411,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     subparsers = parser.add_subparsers(dest="command")
 
+    network_parser = subparsers.add_parser("network", help="Inspect live owner HTTP admission.")
+    network_parser.add_argument("network_command", choices=("status",))
+    network_parser.add_argument("--json", action="store_true", help="Emit JSON diagnostics.")
+
     doctor_parser = subparsers.add_parser(
         "doctor",
         help="Run actionable local health checks.",
@@ -148,9 +438,74 @@ def build_parser() -> argparse.ArgumentParser:
         "sites",
         help="List registered site adapters.",
     )
-    subparsers.add_parser(
+    shell_parser = subparsers.add_parser(
         "shell",
-        help="Start the interactive shell.",
+        help="Inspect or start the single visible Shell owner.",
+    )
+    shell_subparsers = shell_parser.add_subparsers(dest="shell_command")
+    shell_status_parser = shell_subparsers.add_parser(
+        "status",
+        help="Inspect the current Shell owner without starting one.",
+    )
+    shell_status_parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit stable machine-readable status.",
+    )
+    shell_start_parser = shell_subparsers.add_parser(
+        "start",
+        help="Start a visible Shell when no owner is active.",
+    )
+    shell_start_parser.add_argument(
+        "--visible",
+        action="store_true",
+        required=True,
+        help="Open the Shell in a new visible console window.",
+    )
+    shell_start_parser.add_argument(
+        "--wait-ready",
+        action="store_true",
+        help="Wait until the Shell advertises that it is ready.",
+    )
+    shell_start_parser.add_argument(
+        "--timeout",
+        type=float,
+        default=10.0,
+        metavar="SECONDS",
+        help="Maximum readiness wait (default: 10).",
+    )
+    shell_start_parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit stable machine-readable result.",
+    )
+    shell_ensure_parser = shell_subparsers.add_parser(
+        "ensure",
+        help="Idempotently start a visible Shell and wait until it is ready.",
+    )
+    shell_ensure_parser.add_argument(
+        "--visible",
+        action="store_true",
+        required=True,
+        help="Open the Shell in a new visible console window when needed.",
+    )
+    shell_ensure_parser.add_argument(
+        "--wait-ready",
+        action="store_true",
+        required=True,
+        help="Wait until recovery and plugin loading have completed.",
+    )
+    shell_ensure_parser.add_argument(
+        "--timeout",
+        type=float,
+        default=10.0,
+        metavar="SECONDS",
+        help="Maximum readiness wait (default: 10).",
+    )
+    shell_ensure_parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit stable machine-readable result.",
     )
     plugins_parser = subparsers.add_parser(
         "plugins",
@@ -377,12 +732,29 @@ def build_parser() -> argparse.ArgumentParser:
         action="append",
         default=[],
         metavar="ITEM_ID",
-        help="Confirm a list item for batch download. Can be repeated.",
+        help="Restrict a list Batch to this item ID. Can be repeated; omitted means all returned items.",
+    )
+    download_parser.add_argument(
+        "--selection-policy",
+        choices=tuple(policy.value for policy in ListSelectionPolicy),
+        default=ListSelectionPolicy.ALL.value,
+        help=argparse.SUPPRESS,
     )
     download_parser.add_argument(
         "--force",
         action="store_true",
         help="Create a new batch attempt even when a selected gallery is active or completed.",
+    )
+    response_mode = download_parser.add_mutually_exclusive_group()
+    response_mode.add_argument(
+        "--detach",
+        action="store_true",
+        help="Submit to an active visible Shell owner and return after durable acceptance (not final success).",
+    )
+    response_mode.add_argument(
+        "--wait",
+        action="store_true",
+        help="Wait for the final download result through the Shell owner or a foreground owner (the default).",
     )
 
     operation_parser = subparsers.add_parser(
@@ -483,11 +855,10 @@ def build_parser() -> argparse.ArgumentParser:
     tasks_resume_parser.add_argument("--json", action="store_true")
     tasks_pause_parser = tasks_subparsers.add_parser(
         "pause",
-        help="Pause a planned or running task.",
+        help="Pause an Item or Batch task through the active owner.",
     )
     tasks_pause_parser.add_argument("task_id")
     tasks_pause_parser.add_argument("--json", action="store_true")
-
     tasks_show_parser = tasks_subparsers.add_parser(
         "show",
         help="Show user-facing details for one Item or Batch.",
@@ -632,6 +1003,73 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _run_local_plugin_operation(args, runtime, download_limiter=None) -> int:
+    render_mode = select_render_mode(json_requested=args.json)
+    environment = diagnose_environment()
+    loaded_config = ConfigLoader(
+        paths=environment.paths,
+        registry=runtime.settings_registry,
+    ).load()
+    runtime.configure_plugins(loaded_config.values, loaded_config.secrets)
+
+    if args.operation_id != "help":
+        limiter = download_limiter or _build_download_limiter(runtime, loaded_config.values)
+        runtime.bind_http_services(limiter)
+        limiter.requests.bind_cooldown_store(
+            SiteCooldownStore(
+                StateDatabase(StorageLayout.from_app_paths(environment.paths).state_db)
+            )
+        )
+
+    dispatcher = OperationDispatcher(
+        runtime,
+        config=loaded_config,
+    )
+    params = {}
+    for arg in args.args:
+        if "=" in arg:
+            k, v = arg.split("=", 1)
+            params[k] = v
+
+    result = _dispatch_plugin_operation(
+        dispatcher,
+        args.plugin_id,
+        args.operation_id,
+        params=params,
+        confirmations=_EXPLICIT_DOWNLOAD_CONFIRMATIONS,
+    )
+    if result.result_kind is ResultKind.ERROR:
+        print(
+            serialize_operation_result(
+                result,
+                RenderMode.PLAIN if render_mode is RenderMode.INTERACTIVE else render_mode,
+            )
+        )
+        return 1
+
+    if result.result_kind is not ResultKind.LIST_PAGE:
+        print(
+            serialize_operation_result(
+                result,
+                RenderMode.PLAIN if render_mode is RenderMode.INTERACTIVE else render_mode,
+            )
+        )
+        return 0
+
+    data = result.data
+    if not isinstance(data, ListPageData):
+        print(
+            serialize_operation_result(
+                result,
+                RenderMode.PLAIN if render_mode is RenderMode.INTERACTIVE else render_mode,
+            )
+        )
+        return 1
+
+    print(serialize_operation_result(result, render_mode))
+    return 0
+
+
 def main(
     argv: Sequence[str] | None = None,
     *,
@@ -639,6 +1077,9 @@ def main(
     cancellation: Event | None = None,
     progress: ProgressSink | None = None,
     download_limiter: GalleryDownloadLimiter | None = None,
+    task_service: TaskHierarchyService | None = None,
+    _owner_claimed: bool = False,
+    on_accept: AcceptanceSink | None = None,
 ) -> int:
     if argv is None:
         import sys
@@ -662,6 +1103,11 @@ def main(
                 enable_external_code=args.runtime_enable_external_code,
             )
         return application_runtime
+
+    if args.command == "network":
+        from cli_downloader.cli._network_status import print_network_status
+
+        return print_network_status()
 
     if args.command == "diagnose":
         print(json.dumps(diagnose_environment().to_dict(), indent=2))
@@ -690,18 +1136,29 @@ def main(
         return 0
 
     if args.command == "shell":
+        if getattr(args, "shell_command", None) is not None:
+            return _run_shell_command(args)
         shell_runtime = get_runtime()
         plugins_dir = Path(args.plugin_root[0]) if args.plugin_root else installed_plugins_root()
         return build_interactive_shell(
             runtime=shell_runtime,
             plugins_dir=plugins_dir,
-            runner=lambda shell_argv: main(shell_argv, runtime=shell_runtime),
-            background_runner=lambda shell_argv, cancellation, progress, download_limiter: main(
+            runner=lambda shell_argv: main(
                 shell_argv,
                 runtime=shell_runtime,
-                cancellation=cancellation,
-                progress=progress,
-                download_limiter=download_limiter,
+                _owner_claimed=True,
+            ),
+            background_runner=lambda shell_argv, cancellation, progress, download_limiter, on_accept=None, task_service=None: (
+                main(
+                    shell_argv,
+                    runtime=shell_runtime,
+                    cancellation=cancellation,
+                    progress=progress,
+                    download_limiter=download_limiter,
+                    task_service=task_service,
+                    _owner_claimed=True,
+                    on_accept=on_accept,
+                )
             ),
         )
 
@@ -961,77 +1418,63 @@ def main(
             result["render_mode"] = render_mode.value
             print(json.dumps(result, indent=None if render_mode is RenderMode.JSON else 2))
             return 0 if result["matched"] else 1
-        return _run_generic_download(
-            args.url,
-            runtime=get_runtime(),
-            render_mode=render_mode,
-            profile=args.profile,
-            strategy=args.strategy,
-            selected_item_ids=tuple(args.select),
-            force=args.force,
-            cancellation=cancellation,
-            progress=progress,
-            download_limiter=download_limiter,
-            task_id=None,
-            interactive_renderer=render_interactive_result,
-        )
+        try:
+            if not _owner_claimed:
+                forwarded = _forward_download_to_shell(args)
+                if forwarded is not None:
+                    return forwarded
+                if args.detach:
+                    _emit_owner_error(
+                        OwnerTransportError("--detach requires an active Shell owner"),
+                        json_output=args.json,
+                    )
+                    return 1
+            with _owned_execution(owner_claimed=_owner_claimed):
+                return _run_generic_download(
+                    args.url,
+                    runtime=get_runtime(),
+                    render_mode=render_mode,
+                    profile=args.profile,
+                    strategy=args.strategy,
+                    selected_item_ids=tuple(args.select),
+                    selection_policy=(
+                        ListSelectionPolicy.EXPLICIT
+                        if args.select
+                        else ListSelectionPolicy(args.selection_policy)
+                    ),
+                    force=args.force,
+                    cancellation=cancellation,
+                    progress=progress,
+                    download_limiter=download_limiter,
+                    task_service=task_service,
+                    task_id=None,
+                    interactive_renderer=render_interactive_result,
+                    on_accept=on_accept,
+                )
+        except OwnerError as error:
+            _emit_owner_error(error, json_output=args.json)
+            return 1
 
     if args.command == "operation":
-        render_mode = select_render_mode(json_requested=args.json)
-        environment = diagnose_environment()
-        loaded_config = ConfigLoader(
-            paths=environment.paths,
-            registry=get_runtime().settings_registry,
-        ).load()
-        get_runtime().configure_plugins(loaded_config.values, loaded_config.secrets)
-
-        dispatcher = OperationDispatcher(
-            get_runtime(),
-            config=loaded_config,
-        )
-        params = {}
-        for arg in args.args:
-            if "=" in arg:
-                k, v = arg.split("=", 1)
-                params[k] = v
-
-        result = _dispatch_plugin_operation(
-            dispatcher,
-            args.plugin_id,
-            args.operation_id,
-            params=params,
-            confirmations=_EXPLICIT_DOWNLOAD_CONFIRMATIONS,
-        )
-        if result.result_kind is ResultKind.ERROR:
-            print(
-                serialize_operation_result(
-                    result,
-                    RenderMode.PLAIN if render_mode is RenderMode.INTERACTIVE else render_mode,
+        try:
+            if args.operation_id != "help" and not _owner_claimed:
+                forwarded = forward_operation(
+                    args,
+                    confirmations=_EXPLICIT_DOWNLOAD_CONFIRMATIONS,
+                    emit_error=_emit_owner_error,
                 )
+                if forwarded is not None:
+                    return forwarded
+            ownership = (
+                nullcontext()
+                if args.operation_id == "help"
+                else _owned_execution(owner_claimed=_owner_claimed)
             )
+            with ownership:
+                return _run_local_plugin_operation(args, get_runtime(), download_limiter)
+        except OwnerError as error:
+            _emit_owner_error(error, json_output=args.json)
             return 1
-
-        if result.result_kind is not ResultKind.LIST_PAGE:
-            print(
-                serialize_operation_result(
-                    result,
-                    RenderMode.PLAIN if render_mode is RenderMode.INTERACTIVE else render_mode,
-                )
-            )
-            return 0
-
-        data = result.data
-        if not isinstance(data, ListPageData):
-            print(
-                serialize_operation_result(
-                    result,
-                    RenderMode.PLAIN if render_mode is RenderMode.INTERACTIVE else render_mode,
-                )
-            )
-            return 1
-
-        print(serialize_operation_result(result, render_mode))
-        return 0
 
     if args.command == "batches":
         render_mode = select_render_mode(json_requested=getattr(args, "json", False))
@@ -1043,36 +1486,85 @@ def main(
                 print(json.dumps(_batch_details(store, args.parent_id), indent=2))
                 return 0
             if args.batches_command == "retry":
-                return _run_batch_retry(
-                    args.parent_id,
-                    runtime=get_runtime(),
-                    store=store,
-                    layout=layout,
-                    render_mode=render_mode,
-                    config=ConfigLoader(
-                        paths=environment.paths,
-                        registry=get_runtime().settings_registry,
-                    ).load(),
-                    profile=args.profile,
-                    cancellation=cancellation,
-                    progress=progress,
-                )
+                if not _owner_claimed:
+                    forwarded = _forward_task_control_to_shell(
+                        args.parent_id,
+                        "retry",
+                        json_output=getattr(args, "json", False),
+                    )
+                    if forwarded is not None:
+                        return forwarded
+                with _owned_execution(owner_claimed=_owner_claimed):
+                    return _run_batch_retry(
+                        args.parent_id,
+                        runtime=get_runtime(),
+                        download_limiter=download_limiter,
+                        task_service=task_service,
+                        store=store,
+                        layout=layout,
+                        render_mode=render_mode,
+                        config=ConfigLoader(
+                            paths=environment.paths,
+                            registry=get_runtime().settings_registry,
+                        ).load(),
+                        profile=args.profile,
+                        cancellation=cancellation,
+                        progress=progress,
+                    )
             if args.batches_command == "resume":
-                return _run_batch_retry(
-                    args.parent_id,
-                    runtime=get_runtime(),
-                    store=store,
-                    layout=layout,
-                    render_mode=render_mode,
-                    config=ConfigLoader(
-                        paths=environment.paths,
-                        registry=get_runtime().settings_registry,
-                    ).load(),
-                    profile=args.profile,
-                    cancellation=cancellation,
-                    progress=progress,
-                    resume=True,
-                )
+                if not _owner_claimed:
+                    forwarded = _forward_task_control_to_shell(
+                        args.parent_id,
+                        "resume",
+                        json_output=getattr(args, "json", False),
+                    )
+                    if forwarded is not None:
+                        return forwarded
+                with _owned_execution(owner_claimed=_owner_claimed):
+                    task_record = StateTaskStore(StateDatabase(layout.state_db)).get(args.parent_id)
+                    enumeration = (
+                        task_record.metadata.get("batch_enumeration")
+                        if task_record is not None
+                        else None
+                    )
+                    if (
+                        task_record is not None
+                        and task_record.source_url
+                        and isinstance(enumeration, dict)
+                        and enumeration.get("state") == "enumerating"
+                    ):
+                        return _run_generic_download(
+                            task_record.source_url,
+                            runtime=get_runtime(),
+                            render_mode=render_mode,
+                            profile=args.profile,
+                            selection_policy=ListSelectionPolicy.ALL,
+                            cancellation=cancellation,
+                            progress=progress,
+                            download_limiter=download_limiter,
+                            task_service=task_service,
+                            task_id=args.parent_id,
+                        )
+                    return _run_batch_retry(
+                        args.parent_id,
+                        runtime=get_runtime(),
+                        download_limiter=download_limiter,
+                        task_service=task_service,
+                        store=store,
+                        layout=layout,
+                        render_mode=render_mode,
+                        config=ConfigLoader(
+                            paths=environment.paths,
+                            registry=get_runtime().settings_registry,
+                        ).load(),
+                        profile=args.profile,
+                        cancellation=cancellation,
+                        progress=progress,
+                        resume=True,
+                    )
+        except OwnerError as error:
+            _emit_owner_error(error, json_output=getattr(args, "json", False))
+            return 1
         except CLIDownloaderError as error:
             print(json.dumps({"error": str(error)}, indent=2))
             return 1
@@ -1084,8 +1576,20 @@ def main(
             if not _task_storage_exists():
                 print(current_translator()("cli.no_tasks"))
                 return 0
-        service = _build_task_hierarchy_service()
+        service = task_service or _build_task_hierarchy_service()
         task_id = getattr(args, "task_id", None)
+        if (
+            task_id
+            and args.tasks_command in {"pause", "resume", "retry", "cancel", "hard-retry"}
+            and not _owner_claimed
+        ):
+            forwarded = _forward_task_control_to_shell(
+                task_id,
+                "hard-retry" if args.tasks_command == "hard-retry" else args.tasks_command,
+                json_output=getattr(args, "json", False),
+            )
+            if forwarded is not None:
+                return forwarded
         if args.tasks_command in {None, "list"}:
             nodes = service.list_roots()
             if task_id:
@@ -1126,12 +1630,17 @@ def main(
             if not task_id:
                 print(json.dumps({"error": "positional TASK_ID is required"}))
                 return 2
-            return _hard_retry_task(
-                task_id,
-                site_registry=get_runtime().site_registry,
-                runtime=get_runtime(),
-                json_output=getattr(args, "json", False),
-            )
+            try:
+                with _owned_execution(owner_claimed=_owner_claimed):
+                    return _hard_retry_task(
+                        task_id,
+                        site_registry=get_runtime().site_registry,
+                        runtime=get_runtime(),
+                        json_output=getattr(args, "json", False),
+                    )
+            except OwnerError as error:
+                _emit_owner_error(error, json_output=getattr(args, "json", False))
+                return 1
         if args.tasks_command == "cancel":
             return _cancel_tasks(
                 service,
@@ -1140,39 +1649,78 @@ def main(
                 confirmed=args.yes,
                 json_output=getattr(args, "json", False),
             )
+        if args.tasks_command == "pause":
+            if not task_id:
+                print(json.dumps({"error": "positional TASK_ID is required"}))
+                return 2
+            try:
+                result = service.pause(task_id)
+            except CLIDownloaderError as error:
+                print(json.dumps({"error": str(error)}, indent=2))
+                return 1
+            print(
+                json.dumps(
+                    result.to_dict()
+                    if hasattr(result, "to_dict")
+                    else {"task_id": task_id, "action": "pause"},
+                    indent=2,
+                )
+            )
+            return 0
         if not task_id:
             print(json.dumps({"error": "positional TASK_ID is required"}))
             return 2
-        task_store = _build_task_store()
-        lifecycle = TaskLifecycleService(task_store=task_store)
         try:
-            if args.tasks_command == "retry":
-                result = lifecycle.retry(task_id)
-            elif args.tasks_command == "resume":
-                result = lifecycle.resume(task_id)
-            elif args.tasks_command == "pause":
-                result = lifecycle.pause(task_id)
-            else:
-                parser.print_help()
+            owner_context = (
+                _owned_execution(owner_claimed=_owner_claimed)
+                if args.tasks_command == "resume"
+                else nullcontext()
+            )
+            with owner_context:
+                task_store = _build_task_store()
+                lifecycle = TaskLifecycleService(task_store=task_store)
+                try:
+                    if args.tasks_command == "retry":
+                        result = lifecycle.retry(task_id)
+                    elif args.tasks_command == "resume":
+                        if service.is_running(task_id):
+                            result = service.resume(task_id)
+                            print(
+                                json.dumps(
+                                    result.to_dict()
+                                    if hasattr(result, "to_dict")
+                                    else {"task_id": task_id, "action": "resume"},
+                                    indent=2,
+                                )
+                            )
+                            return 0
+                        result = lifecycle.resume(task_id)
+                    else:
+                        parser.print_help()
+                        return 0
+                except CLIDownloaderError as error:
+                    print(json.dumps({"error": str(error)}, indent=2))
+                    return 1
+                if args.tasks_command == "resume":
+                    record = task_store.get(task_id)
+                    if record is not None and record.kind.value == "item" and record.source_url:
+                        return _run_generic_download(
+                            record.source_url,
+                            runtime=get_runtime(),
+                            render_mode=RenderMode.JSON
+                            if getattr(args, "json", False)
+                            else RenderMode.PLAIN,
+                            cancellation=cancellation,
+                            progress=progress,
+                            download_limiter=download_limiter,
+                            task_service=task_service,
+                            task_id=task_id,
+                        )
+                print(json.dumps(result.to_dict(), indent=2))
                 return 0
-
-        except CLIDownloaderError as error:
-            print(json.dumps({"error": str(error)}, indent=2))
+        except OwnerError as error:
+            _emit_owner_error(error, json_output=getattr(args, "json", False))
             return 1
-        if args.tasks_command == "resume":
-            record = task_store.get(task_id)
-            if record is not None and record.kind.value == "item" and record.source_url:
-                return _run_generic_download(
-                    record.source_url,
-                    runtime=get_runtime(),
-                    render_mode=RenderMode.JSON
-                    if getattr(args, "json", False)
-                    else RenderMode.PLAIN,
-                    download_limiter=download_limiter,
-                    task_id=task_id,
-                )
-        print(json.dumps(result.to_dict(), indent=2))
-        return 0
 
     if args.command == "history":
         env = diagnose_environment()
@@ -1370,7 +1918,13 @@ def _delete_task_records(
     blocked = tuple(
         node.task_id
         for node in candidates
-        if node.state in {TaskState.PREPARING, TaskState.QUEUED, TaskState.RUNNING}
+        if node.state
+        in {
+            TaskState.PREPARING,
+            TaskState.QUEUED,
+            TaskState.RUNNING,
+            TaskState.PAUSING,
+        }
     )
     payload = {
         "matched": len(candidates),

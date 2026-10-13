@@ -42,6 +42,7 @@ from cli_downloader.core.task_tree import (
     TaskKind,
     TaskNode,
     TaskProgress,
+    TaskRootSummary,
     TaskState,
 )
 from tests.example_site import build_example_runtime
@@ -146,6 +147,53 @@ class InteractiveShellTest(TestCase):
         self.assertIn("Commands:", output.getvalue())
         self.assertIn("download <url> --dry-run", output.getvalue())
         self.assertNotIn("confirm-live-network", output.getvalue())
+
+    def test_startup_ready_callback_runs_once_for_plain_shell(self) -> None:
+        output = StringIO()
+        callbacks: list[str] = []
+        shell = InteractiveShell(startup_ready_callback=lambda: callbacks.append("ready"))
+
+        self.assertEqual(
+            shell.run(input_stream=StringIO("exit\n"), output_stream=output),
+            0,
+        )
+        self.assertEqual(callbacks, ["ready"])
+
+    def test_plain_shell_dispatches_startup_recovery_before_ready(self) -> None:
+        output = StringIO()
+        started = Event()
+        commands: list[tuple[str, ...]] = []
+
+        def background(argv, _cancellation, _progress):
+            commands.append(tuple(argv))
+            started.set()
+            return 0
+
+        shell = InteractiveShell(
+            background_runner=background,
+            startup_commands=(("tasks", "resume", "task-1", "--json"),),
+        )
+
+        self.assertEqual(
+            shell.run(input_stream=StringIO("exit\n"), output_stream=output),
+            0,
+        )
+        self.assertTrue(started.wait(1.0))
+        self.assertEqual(commands, [("tasks", "resume", "task-1", "--json")])
+
+    def test_shell_warns_before_releasing_owner_with_unfinished_tasks(self) -> None:
+        output = StringIO()
+        shell = InteractiveShell(
+            shutdown_warning=lambda: "2 unfinished tasks are persisted; resume later."
+        )
+
+        exit_code = shell.run(
+            input_stream=StringIO("exit\n"),
+            output_stream=output,
+        )
+
+        self.assertEqual(exit_code, 0)
+        self.assertIn("Warning: 2 unfinished tasks are persisted; resume later.", output.getvalue())
 
     def test_help_and_errors_follow_the_selected_interface_language(self) -> None:
         output = StringIO()
@@ -729,6 +777,64 @@ class TextualShellAppTest(IsolatedAsyncioTestCase):
                         _PLUGIN_STATUS_MIN_WIDTH,
                     )
 
+    async def test_tasks_table_fills_viewport_and_scrolls_only_when_narrow(self) -> None:
+        tasks = tuple(
+            TaskNode(
+                f"task-{index}",
+                TaskKind.BATCH if index == 0 else TaskKind.ITEM,
+                TaskState.COMPLETED,
+                f"Task {index}",
+                TaskProgress(165, 165) if index == 0 else TaskProgress(1, 1),
+                site_id="example",
+                details={"created_at": "2026-07-16T12:34:56+08:00"},
+            )
+            for index in range(40)
+        )
+        service = SimpleNamespace(list_roots=lambda: tasks)
+        app = TextualShellApp(
+            InteractiveShell(
+                runtime=build_example_runtime(),
+                task_service_loader=lambda: service,
+            )
+        )
+
+        async with app.run_test(size=(120, 30)) as pilot:
+            await pilot.pause()
+            app.query_one(TabbedContent).active = "tasks"
+            await pilot.pause()
+            table = app.query_one("#task-table", DataTable)
+
+            wide_viewport = table.scrollable_content_region.width
+            wide_rendered = sum(column.get_render_width(table) for column in table.columns.values())
+            self.assertEqual(wide_rendered, wide_viewport)
+            self.assertGreaterEqual(
+                table.columns[app._task_column_keys["type"]].width,
+                len("Batch") + 2,
+            )
+            self.assertGreaterEqual(
+                table.columns[app._task_column_keys["progress"]].width,
+                len("165/165 files"),
+            )
+            self.assertGreaterEqual(
+                table.columns[app._task_column_keys["status"]].width,
+                len("Completed"),
+            )
+            self.assertGreaterEqual(
+                table.columns[app._task_column_keys["created"]].width,
+                len("2026-07-16 12:34"),
+            )
+
+            await pilot.resize_terminal(45, 30)
+            await pilot.pause()
+            app._resize_task_columns()
+            await pilot.pause()
+            narrow_viewport = table.scrollable_content_region.width
+            narrow_rendered = sum(
+                column.get_render_width(table) for column in table.columns.values()
+            )
+            self.assertGreater(narrow_rendered, narrow_viewport)
+            self.assertGreater(table.virtual_size.width, narrow_viewport)
+
     async def test_embedded_example_list_retains_state_paginates_and_downloads(self) -> None:
         runtime = build_example_runtime()
         dispatcher = OperationDispatcher(runtime)
@@ -1125,6 +1231,144 @@ class TextualShellAppTest(IsolatedAsyncioTestCase):
             self.assertEqual(app.query_one(TabbedContent).active, "console")
             self.assertTrue(app.query_one("#shell-input", Input).has_focus)
 
+    async def test_task_hierarchy_and_controls_remain_visible_in_narrow_shell(self) -> None:
+        task = TaskNode(
+            "task-visible",
+            TaskKind.BATCH,
+            TaskState.RUNNING,
+            "Visible task",
+            TaskProgress(0, 1),
+            site_id="example",
+            source_url="https://example.test/batch",
+            output_files=("downloads/example/file.jpg",),
+        )
+        child = TaskNode(
+            "child-visible",
+            TaskKind.ITEM,
+            TaskState.QUEUED,
+            "Visible child",
+            TaskProgress(0, 1),
+            parent_id=task.task_id,
+            site_id="example",
+        )
+        service = SimpleNamespace(
+            list_roots=lambda: (task,),
+            list_children=lambda _task_id: (child,),
+        )
+        app = TextualShellApp(InteractiveShell(task_service_loader=lambda: service))
+
+        async with app.run_test(size=(80, 30)) as pilot:
+            app.query_one(TabbedContent).active = "tasks"
+            await pilot.pause()
+
+            toolbar = app.query_one("#task-toolbar")
+            task_path = app.query_one("#task-path", Static)
+            pause = app.query_one("#task-pause", Button)
+            refresh = app.query_one("#refresh-tasks", Button)
+
+            self.assertTrue(toolbar.display)
+            self.assertGreater(toolbar.region.height, 0)
+            self.assertGreater(task_path.region.width, 0)
+            self.assertGreater(pause.region.width, 0)
+            self.assertGreater(refresh.region.width, 0)
+            self.assertLess(refresh.region.right, app.screen.region.right + 1)
+            self.assertEqual(app.query_one("#task-source", Button).label, "Open URL")
+            self.assertEqual(app.query_one("#task-folder", Button).label, "Open Folder")
+            self.assertEqual(
+                app.query_one("#task-source", Button).parent.id,
+                "task-detail-actions",
+            )
+
+            app.query_one("#task-table", DataTable).focus()
+            await pilot.press("enter")
+            await pilot.pause()
+
+            back = app.query_one("#task-back", Button)
+            next_page = app.query_one("#task-page-next", Button)
+            self.assertTrue(back.display)
+            self.assertTrue(next_page.display)
+            self.assertGreater(back.region.width, 0)
+            self.assertLess(next_page.region.right, app.screen.region.right + 1)
+            self.assertFalse(pause.display)
+            self.assertFalse(refresh.display)
+            self.assertFalse(app.query_one("#task-cancel", Button).display)
+            self.assertFalse(app.query_one("#task-delete", Button).display)
+            app._select_task(child.task_id)
+            self.assertTrue(app.query_one("#task-source", Button).disabled)
+            self.assertTrue(app.query_one("#task-folder", Button).disabled)
+            self.assertTrue(app.query_one("#task-detail-actions").display)
+
+    async def test_root_item_folder_and_selection_are_restored_after_back(self) -> None:
+        task = TaskNode(
+            "item-root",
+            TaskKind.ITEM,
+            TaskState.COMPLETED,
+            "Root item",
+            TaskProgress(1, 1),
+            site_id="example",
+            source_url="https://example.test/item-root",
+        )
+
+        class Service:
+            def list_root_summaries(self):
+                return (
+                    TaskRootSummary(
+                        task.task_id,
+                        task.kind,
+                        task.state,
+                        task.title,
+                        task.progress,
+                        site_id=task.site_id,
+                        source_url=task.source_url,
+                    ),
+                )
+
+            def get(self, task_id):
+                self.assert_task(task_id)
+                return task
+
+            def list_files(self, task_id):
+                self.assert_task(task_id)
+                return ()
+
+            def get_available_folder(self, task_id):
+                self.assert_task(task_id)
+                return "downloads/item-root"
+
+            @staticmethod
+            def assert_task(task_id):
+                if task_id != task.task_id:
+                    raise TaskNotFoundError(task_id)
+
+        app = TextualShellApp(InteractiveShell(task_service_loader=Service))
+
+        async with app.run_test(size=(80, 30)) as pilot:
+            app.query_one(TabbedContent).active = "tasks"
+            for _ in range(20):
+                await pilot.pause()
+                if app.query_one("#task-table", DataTable).row_count == 1:
+                    break
+            table = app.query_one("#task-table", DataTable)
+            table.focus()
+            app._select_task(task.task_id)
+            self.assertFalse(app.query_one("#task-folder", Button).disabled)
+
+            await pilot.press("enter")
+            await pilot.pause()
+            self.assertEqual(app._task_level, "files")
+
+            await pilot.press("escape")
+            for _ in range(20):
+                await pilot.pause()
+                if app._task_level == "roots" and app._task_refresh_thread is None:
+                    break
+
+            self.assertEqual(app._active_task_id, task.task_id)
+            self.assertTrue(table.has_focus)
+            selected_key = tuple(str(key.value) for key in table.rows)[table.cursor_row]
+            self.assertEqual(selected_key, task.task_id)
+            self.assertFalse(app.query_one("#task-folder", Button).disabled)
+
     async def test_task_dynamic_labels_follow_selected_language(self) -> None:
         task = TaskNode(
             "task-zh",
@@ -1153,6 +1397,8 @@ class TextualShellAppTest(IsolatedAsyncioTestCase):
             self.assertIn("進度", detail)
             self.assertIn("網站", detail)
             self.assertIn("已完成", detail)
+            self.assertEqual(app.query_one("#task-source", Button).label, "開啟 URL")
+            self.assertEqual(app.query_one("#task-folder", Button).label, "開啟資料夾")
 
     async def test_empty_unified_task_explorer(self) -> None:
         service = SimpleNamespace(list_roots=lambda: ())
@@ -1164,6 +1410,33 @@ class TextualShellAppTest(IsolatedAsyncioTestCase):
                 "No tasks yet.",
                 str(app.query_one("#task-detail", Static).content),
             )
+
+    async def test_external_task_acceptance_refreshes_the_tasks_list(self) -> None:
+        tasks: list[TaskNode] = []
+        service = SimpleNamespace(list_roots=lambda: tuple(tasks))
+        shell = InteractiveShell(task_service_loader=lambda: service)
+        app = TextualShellApp(shell)
+
+        async with app.run_test() as pilot:
+            app.query_one(TabbedContent).active = "tasks"
+            await pilot.pause()
+            table = app.query_one("#task-table", DataTable)
+            self.assertEqual(table.row_count, 0)
+
+            tasks.append(
+                TaskNode(
+                    "external-task",
+                    TaskKind.ITEM,
+                    TaskState.QUEUED,
+                    "Externally submitted",
+                    TaskProgress(0, 1),
+                )
+            )
+            await asyncio.to_thread(shell.notify_external_tasks)
+            await pilot.pause()
+
+            self.assertEqual(table.row_count, 1)
+            self.assertIn("Externally submitted", str(table.get_row_at(0)[2]))
 
     async def test_unified_task_explorer_drills_into_batch_items_and_files(self) -> None:
         batch = TaskNode(
@@ -1225,11 +1498,13 @@ class TextualShellAppTest(IsolatedAsyncioTestCase):
         )
         opened_urls: list[str] = []
         opened_folders: list[str] = []
+        opened_files: list[str] = []
         app = TextualShellApp(
             InteractiveShell(
                 task_service_loader=lambda: service,
                 url_opener=opened_urls.append,
                 folder_opener=opened_folders.append,
+                file_opener=opened_files.append,
             )
         )
 
@@ -1245,10 +1520,14 @@ class TextualShellAppTest(IsolatedAsyncioTestCase):
             folder_button = app.query_one("#task-folder", Button)
             self.assertFalse(source_button.disabled)
             self.assertFalse(folder_button.disabled)
-            source_button.focus()
-            await pilot.press("enter")
-            folder_button.focus()
-            await pilot.press("enter")
+            self.assertTrue(source_button.display)
+            self.assertTrue(source_button.parent.display)
+            self.assertGreater(source_button.region.height, 0)
+            self.assertEqual(source_button.label, "Open URL")
+            self.assertEqual(folder_button.label, "Open Folder")
+            source_button.press()
+            folder_button.press()
+            await pilot.pause()
             self.assertEqual(
                 opened_urls,
                 ["https://example.test/search"],
@@ -1269,6 +1548,13 @@ class TextualShellAppTest(IsolatedAsyncioTestCase):
             self.assertIn("Could not parse gallery", detail)
             self.assertIn("Site extension", detail)
             self.assertIn("[R] Retry    Available", detail)
+            self.assertTrue(app.query_one("#task-back", Button).display)
+            self.assertFalse(app.query_one("#task-page-prev", Button).display)
+            self.assertFalse(app.query_one("#task-pause", Button).display)
+            self.assertFalse(app.query_one("#refresh-tasks", Button).display)
+            self.assertTrue(source_button.disabled)
+            self.assertTrue(folder_button.disabled)
+            self.assertEqual(source_button.label, "Open File")
 
             await pilot.press("escape", "down", "enter")
             await pilot.pause()
@@ -1281,9 +1567,84 @@ class TextualShellAppTest(IsolatedAsyncioTestCase):
             self.assertIn("Downloader", detail)
             self.assertNotIn("Child", detail)
             self.assertNotIn("Asset", detail)
+            # A queued highlight from the now-hidden Items table must not
+            # overwrite the selected file's actions after navigation.
+            app.on_data_table_row_highlighted(
+                DataTable.RowHighlighted(task_table, 1, tuple(task_table.rows)[1])
+            )
+            self.assertEqual(app._task_file_path, "downloads/image-02.part")
+            self.assertFalse(source_button.disabled)
+            self.assertFalse(folder_button.disabled)
+            self.assertEqual(source_button.label, "Open File")
+            source_button.press()
+            folder_button.press()
+            await pilot.pause()
+            self.assertEqual(opened_files, ["downloads/image-02.part"])
+            self.assertEqual(opened_folders, ["downloads", "downloads"])
+            self.assertEqual(opened_urls, ["https://example.test/search"])
 
             await pilot.press("escape", "escape", "escape")
             self.assertEqual(tabs.active, "console")
+
+    async def test_switching_equal_length_items_replaces_file_rows(self) -> None:
+        torrent = TaskNode(
+            "torrent-task",
+            TaskKind.ITEM,
+            TaskState.COMPLETED,
+            "Torrent item",
+            TaskProgress(1, 1),
+            site_id="ehentai",
+        )
+        direct = TaskNode(
+            "direct-task",
+            TaskKind.ITEM,
+            TaskState.COMPLETED,
+            "Direct item",
+            TaskProgress(1, 1),
+            site_id="pixiv",
+        )
+        files = {
+            "torrent-task": (
+                TaskFileNode(
+                    "torrent-file",
+                    "gallery.torrent",
+                    "completed",
+                    location="downloads/ehentai/gallery.torrent",
+                ),
+            ),
+            "direct-task": (
+                TaskFileNode(
+                    "direct-file",
+                    "illustration.png",
+                    "completed",
+                    location="downloads/pixiv/illustration.png",
+                ),
+            ),
+        }
+        service = SimpleNamespace(
+            list_roots=lambda: (direct, torrent),
+            list_files=lambda task_id: files[task_id],
+        )
+        app = TextualShellApp(InteractiveShell(task_service_loader=lambda: service))
+
+        async with app.run_test() as pilot:
+            app.query_one(TabbedContent).active = "tasks"
+            await pilot.pause()
+            table = app.query_one("#task-file-table", DataTable)
+
+            app._open_task("torrent-task")
+            self.assertEqual(str(table.get_row_at(0)[1]), "gallery.torrent")
+            self.assertEqual(tuple(str(key.value) for key in table.rows), ("torrent-file",))
+
+            app._task_back()
+            app._open_task("direct-task")
+            self.assertEqual(table.row_count, 1)
+            self.assertEqual(str(table.get_row_at(0)[1]), "illustration.png")
+            self.assertEqual(
+                str(table.get_row_at(0)[5]),
+                "downloads/pixiv/illustration.png",
+            )
+            self.assertEqual(tuple(str(key.value) for key in table.rows), ("direct-file",))
 
     async def test_task_refresh_returns_to_roots_when_open_batch_is_auto_deleted(self) -> None:
         present = True

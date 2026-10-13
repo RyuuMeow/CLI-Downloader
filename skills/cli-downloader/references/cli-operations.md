@@ -2,6 +2,34 @@
 
 Set `<cli>` to `clid` when installed, otherwise `python -m cli_downloader` from the repository root.
 
+## Shell owner and Agent submissions
+
+```text
+<cli> shell status --json
+<cli> shell ensure --visible --wait-ready --json
+<cli> download <url> --dry-run --json
+<cli> download <url> --detach --json
+<cli> tasks show <task-id>
+<cli> tasks pause <task-id>
+<cli> tasks resume <task-id>
+<cli> tasks cancel <task-id>
+<cli> tasks retry <task-id>
+<cli> tasks hard-retry <task-id>
+<cli> batches resume <batch-id>
+<cli> batches retry <batch-id>
+```
+
+Only use `shell ensure` and `download --detach` after the user authorizes starting a visible
+Shell and creating the requested download. A detached response proves durable acceptance only;
+query the returned Task ID for progress and terminal state. If the owner disconnects, inspect the
+existing Task and History before retrying with the same request ID; never create a replacement Task
+because the final event was lost.
+
+When the user closes the visible Shell, it warns about unfinished Tasks, rejects new owner
+requests, and persists active checkpoints for recovery. Poll `shell status --json` before
+assuming a new owner is available; a missing terminal event is not proof that the download
+failed.
+
 ## Read tasks
 
 ```text
@@ -16,7 +44,7 @@ Set `<cli>` to `clid` when installed, otherwise `python -m cli_downloader` from 
 
 ```text
 <cli> history --json
-<cli> history --task-id <task-id> --json
+<cli> history show <task-id> --json
 <cli> history --query <keyword> --json
 <cli> history --child --json
 ```
@@ -36,8 +64,13 @@ Then, with user authorization:
 ```text
 <cli> download <url> --json
 <cli> download <url> --profile <name> --strategy <auto|direct|torrent> --json
+<cli> download <list-url> --json
 <cli> download <list-url> --select <item-id> --select <item-id> --json
 ```
+
+A list or Batch URL without `--select` submits every item returned by that operation. Repeated
+`--select` values restrict the Batch to an explicit subset. The interactive Shell continues to
+present the plugin-provided selection page instead of applying the command-line default.
 
 Do not use `--force` unless the user intends to create a new attempt despite an active or completed duplicate.
 
