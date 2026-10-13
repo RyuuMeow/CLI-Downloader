@@ -386,8 +386,19 @@ bounded WAIT disconnect, DETACH acceptance, request replay, and a second restart
 
 ### Status And Scope
 
-Proposed design, requested 2026-10-13. Source audit only; no runtime changes or live-site
-validation. The existing d51ece4 Windows packages do not contain this proposal.
+Implemented and verified on `feat/site-request-control` for the 0.1.4 build. The full
+repository gate passed; the final pause-boundary changes additionally passed the 43-test
+Batch/queue/network regression set. The separate Pinterest 0.1.1 migration has three offline tests;
+no live-site validation or external plugin activation has been performed. The earlier
+d51ece4 Windows packages do not contain these changes.
+
+Implementation notes: duplicate site registrations are rejected at runtime rather than
+merging conflicting policies. Diagnostics are available through `clid network status --json`.
+Legacy plugin traffic remains operation-level compatibility coverage. The transport timeout
+bounds ordinary blocked reads; failed response closure retains accounting and ownership
+rather than pretending the request finished. Batch workers waiting for Item/backpressure
+capacity acknowledge pause at a safe boundary; the UI allows Resume during Pausing as
+well as Paused, reusing live workers.
 
 Success means that, for a migrated plugin within one OwnerScope, every site HTTP attempt
 from listing, pagination, preparation, downloads, redirects and retries obeys one shared
@@ -396,7 +407,7 @@ Browser authentication traffic, other applications, other data-root owners and t
 transfers are outside this guarantee. No numeric configuration guarantees that a site will
 never throttle: its quota may also cover other clients sharing the account or IP address.
 
-### Evidence From The Current Implementation
+### Evidence From The Pre-change Implementation
 
 | Path | Current control | Gap |
 | --- | --- | --- |
@@ -427,8 +438,8 @@ combined Prepare + Download slot, or add a Batch-count limit for rate-limit prot
 
 Settings must show the effective site values and their source; changing a fallback must not
 appear to override an existing site policy. Preserve current defaults (2 requests, 0.5 seconds)
-as compatibility values, not a claim about a site's safe quota. Conflicting declarations for
-the same site resolve conservatively: minimum concurrency, maximum interval; report the conflict.
+as compatibility values, not a claim about a site's safe quota. The runtime rejects conflicting registrations for the same site, so ambiguous policies cannot
+silently replace one another.
 Policy changes take effect at the next Owner restart in the first release and are labelled so.
 
 Example only: with a site cap of 2 and interval of 1 second, one download stream plus one
@@ -437,7 +448,7 @@ A preparation operation needing five HTTP requests obtains admission five times.
 does not consume network capacity. The interval is between starts, not a delay after completion.
 Batch preparation workers and bounded queues remain internal backpressure, not site protection.
 
-### Proposed Components And Ownership
+### Components And Ownership
 
 - Extract a `SiteRequestCoordinator` from `GalleryDownloadLimiter`; keep the latter as a
   compatibility facade for Item admission. One coordinator belongs to the live Owner and is
@@ -552,7 +563,8 @@ redirects and retries cannot bypass them. A 429 in any phase delays all new same
 including after Owner restart, while another site proceeds. Additional gates cover cap-1 nested
 calls, concurrent external CLIs, expired/canceled waiters, HTTP-date Retry-After, status preserved
 through streaming errors, old-owner incompatibility, profile credential isolation and unchanged
-bounded Tasks refresh behavior. Runtime implementation is not complete until all four stages pass.
+bounded Tasks refresh behavior. The offline implementation gates passed. Windows artifacts use the repository build and
+smoke scripts; live-site verification remains separately authorized.
 
 HTTP reference semantics: [RFC 6585 section 4 (429)](https://www.rfc-editor.org/rfc/rfc6585.html#section-4)
 and [RFC 9110 section 10.2.3 (Retry-After)](https://www.rfc-editor.org/rfc/rfc9110.html#name-retry-after).

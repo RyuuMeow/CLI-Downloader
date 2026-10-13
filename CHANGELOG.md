@@ -2,9 +2,21 @@
 
 All notable changes to CLI-Downloader will be documented in this file.
 
-## Unreleased
+## Unreleased (0.1.4)
+
+### Added
+
+- Shared site HTTP admission across listing, pagination, preparation and asset downloads through versioned plugin HTTP services; exposed effective policy and coverage in Settings and `network status --json`.
+- Routed external plugin operations through the live Owner with capability negotiation, preserving one shared network budget across CLI processes.
+- Persisted site cooldowns, honored Retry-After across phases and restarts, and counted explicit redirects and safe per-request retries.
+
 
 ### Fixed
+
+- Allowed Batch pause to complete while workers wait for Item admission or a full download queue, releasing pending admission before acknowledging pause.
+- Kept Resume available while a Task is Pausing so users can withdraw a pending pause without starting a duplicate worker.
+
+- Closed managed responses before releasing pause capacity, restarted unfinished assets safely on resume, and fenced HTTP starts during Owner shutdown.
 
 - Kept controls attached to each live Batch and reused active workers on resume, including commands received through owner IPC.
 - Shared Item admission across worker event loops, initial downloads and retries; removed the Batch two-worker ceiling and aligned round-robin queue display with scheduling preference.

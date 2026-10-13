@@ -183,14 +183,46 @@ first-party domains. An expired session or one missing its login-proof Cookie is
 recoverable connection state instead of a fatal configuration error, so the Shell can
 display it as expired and let the user authenticate again.
 
-Network pacing is a system policy shared by every active Task for the same
-Plugin/site identity. Manifest `network` declares request concurrency, minimum
-interval, retryable HTTP statuses, total attempts, and fallback backoff ceiling;
-the settings registry exposes scalar overrides under
-`plugins.<plugin_id>.network`. Plugin resolution and Asset fetch boundaries use
-the same core request gate. `Retry-After` takes precedence over exponential
-backoff with jitter, and exhausted failures persist their attempt count and
-`next_retry_at` so manual Batch retry cannot bypass an active cooldown.
+Network pacing belongs to one `SiteRequestCoordinator` per live Owner. Its budget is
+keyed by site ID and shared across profiles, list/pagination operations, Batch and
+standalone preparation, and downloads. Item admission remains a separate scheduler:
+HTTP concurrency does not count Batch parents or replace the download Item limit.
+Manifest network policies override global fallback settings; changes become effective
+at the next Owner restart. Duplicate site registrations are rejected by the runtime.
+
+Plugins declaring `managed_http_version = 1` receive `PluginServices.http` once through
+`bind_services()`. Every buffered request, stream, redirect and eligible retry gets its
+own permit, including concurrent child tasks. Core's default asset fetcher uses the
+same client. Legacy plugins retain operation-level admission for resolve, strategy and
+listing; their internal traffic cannot be counted or certified by Core. See
+[the plugin HTTP contract](../../Plugins/README.md#managed-http-services-core-014).
+
+Admission combines capacity, monotonic start spacing and cooldown under one lock,
+rotating eligible root IDs and preserving FIFO within a root. There are no burst credits.
+A transport-thread start check handles executor delays without starting two requests at
+once. A new cooldown after admission returns the attempt to the asynchronous queue.
+429 and 503 with Retry-After extend the site's cooldown; server deadlines can exceed the
+local backoff ceiling. Only safe/replayable requests retry automatically. SQLite schema
+12 persists site cooldown changes, never per-request leases or credentials.
+
+Responses retain their permits until EOF or confirmed closure. Cancellation waits for
+blocking I/O to settle; pausing a managed asset closes its response before returning its
+Item slot. Resume restarts the unfinished asset while preserving completed files. During
+cooldown a sequential download returns its Item slot and reacquires Item admission before
+HTTP admission. Managed preparation fan-out has a supervisor that acknowledges pause only
+when all its HTTP responses have closed. Shutdown fences new starts and retains ownership
+until outstanding managed transports settle; a failed close does not falsely free capacity.
+Batch admission waits cancel their pending acquisition before acknowledging pause, and a
+Prepare worker waiting to enqueue an already persisted package counts as quiescent.
+This prevents full queues from leaving a Batch indefinitely Pausing. Resume is available
+during both Pausing and Paused and reuses its existing worker.
+
+External `operation` commands use typed Owner IPC and negotiate the `operation` capability.
+An incompatible owner is rejected, and an accepted operation with an unknown completion
+is never automatically resubmitted. `clid network status --json` reads the live owner's
+compact site counters, wait phases, cooldowns, effective settings and coverage. Tasks uses
+one network snapshot per projection; wait reasons do not change durable lifecycle states.
+Browser authentication and torrent peer traffic are outside this HTTP budget.
 
 The global `download.folder_template` remains the fallback relative Gallery
 folder policy. A Plugin may register additional scalar output fields and a

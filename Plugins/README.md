@@ -144,7 +144,7 @@ The Runtime's Batch retry will re-call `resolve` and `choose_strategy`, and comp
 
 ## Network Throttling
 
-Plugins with actual network requests should declare safe defaults in `manifests/site.json`:
+Plugins with actual network requests should declare conservative starting defaults in `manifests/site.json`:
 
 ```json
 "network": {
@@ -156,7 +156,64 @@ Plugins with actual network requests should declare safe defaults in `manifests/
 }
 ```
 
-The system will register numeric settings as `plugins.<plugin_id>.network.*` overrides, and share the request gate between resolution and downloading for the same website. Plugins do not need to manually retry 429 errors; retain the original `HTTPError` status and headers so the system can respect `Retry-After` and maintain cooldown states.
+The system registers numeric settings as `plugins.<plugin_id>.network.*` overrides.
+They override the global `network.*` fallbacks and take effect on Owner restart. These
+values are not a guarantee against throttling: quotas may also cover other clients on
+the same account or IP address.
+
+## Managed HTTP Services (Core 0.1.4)
+
+Set `"requires_core_api": ">=0.1.4"` in `plugin.json`, declare the capability below,
+and route **all** plugin HTTP traffic through the injected client:
+
+```python
+from cli_downloader.core.http import HttpRequest, PluginServices
+
+class Plugin:
+    managed_http_version = 1
+
+    def bind_services(self, services: PluginServices) -> None:
+        self.http = services.http
+
+    async def fetch_page(self, url, token):
+        response = await self.http.request(HttpRequest(
+            url, headers={"Authorization": f"Bearer {token}"}, timeout=30,
+        ))
+        return response.json()
+
+    async def fetch_stream(self, asset):
+        async with self.http.stream(HttpRequest(asset.url)) as response:
+            size = response.headers.get("content-length")
+            total = int(size) if size and size.isdigit() else None
+            while chunk := await response.read(262144):
+                yield chunk, total
+```
+
+`HttpRequest` supports method, bytes body, immutable copied headers, a finite timeout
+(up to 300 seconds), explicit proxy mapping, TLS context and a per-operation CookieJar.
+Keep credentials in request-local values; never overwrite a shared client/plugin session
+with another profile's credentials. Response headers use lowercase keys; `text()` accepts
+an encoding and `json()` decodes JSON. Always exit the stream context and settle child
+HTTP tasks before returning from an operation. Do not keep detached background requests.
+
+Core counts each request, redirect and retry under the originating site, including CDN
+redirects. Cross-origin redirects strip Authorization, Cookie and other sensitive explicit
+headers; CookieJar applies normal domain/path rules. Do not add hidden transport retries
+or independent request sleeps. 429 and 503 with Retry-After extend a persisted shared
+cooldown. GET/HEAD/OPTIONS retry by default; use `retry_safe=True` for another method only
+when replaying its bytes body is safe. Unsafe requests still establish cooldown but are
+not replayed. Preserve raised errors rather than turning failed pagination into success.
+
+Buffered reads and streams retain capacity until EOF or closure. Pausing a default asset
+stream can restart its unfinished file on resume; it does not promise HTTP range resume.
+Pure parsing uses no request permit. Concurrent HTTP tasks receive separate permits;
+managed operations must not acquire the legacy outer request limiter.
+
+Plugins without this capability remain compatible through coarse operation-level control.
+Their resolve, strategy and listing operations are not automatically replayed, and Core
+cannot guarantee their internal request count, retries or socket lifecycle. Capability
+reporting is a trusted plugin contract, not a Python network sandbox. Use
+`clid network status --json` against a running Shell to inspect effective policy and coverage.
 
 ## Custom Fetching
 
